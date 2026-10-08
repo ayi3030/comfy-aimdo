@@ -1,5 +1,10 @@
 extern "C" {
 #include "gpu_dispatch.h"
+/* set_devctx_for_device 声明在 src/control.h:70，但本文件只 include
+ * gpu_dispatch.h（它自己只含 gpu_abi.h），所以这里按 aimdo_xpu_recorded_usage
+ * 同样的extern "C" 方式补声明——不引入 control.h，避免把 C 头与 SYCL/C++
+ * 混编的依赖链拖进来。 */
+bool set_devctx_for_device(int device_id);
 }
 
 #if __has_include(<level_zero/ze_api.h>)
