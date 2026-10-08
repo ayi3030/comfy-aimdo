@@ -187,6 +187,11 @@ def _install_native_hook_wrappers():
     _torch_xpu_memory_stats_original = torch.xpu.memory_stats
     _torch_xpu_reset_peak_stats_original = torch.xpu.reset_peak_memory_stats
 
+    # 注意：下面三个闭包必须定义在本函数内、且位于 torch.xpu.* 赋值之前。
+    # torch_reserved_stats() 是本模块顶层的独立函数（定义在本函数之后），
+    # 它刻意绕过下面安装的包装器去读 torch 原生口径。不要把它挪进来，
+    # 也不要把下面三段缩进到 torch_reserved_stats 的 return 之后——那会让
+    # 整个包装器安装变成不可达的死代码（曾真实发生过，见 xpu.py 历史）。
     def aimdo_xpu_empty_cache():
         try:
             control.lib.xpu_allocator_empty_cache(False)
@@ -231,6 +236,38 @@ def _install_native_hook_wrappers():
     torch.xpu.memory.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     torch.xpu.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     _wrappers_installed = True
+
+
+def torch_reserved_stats(device=None):
+    """读取 torch **原生**预留统计，绕过本模块安装的 M2 包装器。
+
+    为什么必须绕过：M2 的 aimdo_xpu_memory_stats() 为了让 Book A 成为唯一
+    权威账，把 reserved 与 allocated 双双映射成 Book A 的当前值
+    （见 aimdo_xpu_memory_stats 内 "active = reserved = ..."）。于是任何经由
+    torch.xpu.memory_stats() 计算的「缓存量」恒为 reserved - allocated == 0：
+
+        L3 trim 永不触发、anticipated_growth 恒为 0。
+
+    L3 的判据（reserved - allocated > 32MB）与 growth 前瞻量都必须建立在 torch
+    自己的字节口径上，所以这里显式调用包装前捕获的原始函数。
+
+    返回 (reserved, allocated, peak_reserved)；不可用时返回 None。
+    """
+    fn = _torch_xpu_memory_stats_original
+    if fn is None:
+        return None
+    dev = torch.xpu.current_device() if device is None else device
+    dev = dev if isinstance(dev, int) else getattr(dev, "index", dev)
+    try:
+        stats = fn(dev)
+    except Exception:
+        return None
+    if not stats:
+        return None
+    reserved = int(stats.get("reserved_bytes.all.current", 0))
+    allocated = int(stats.get("allocated_bytes.all.current", 0))
+    peak = int(stats.get("reserved_bytes.all.peak", 0))
+    return reserved, allocated, peak
 
 
 def teardown_backend() -> None:

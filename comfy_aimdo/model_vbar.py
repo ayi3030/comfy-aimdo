@@ -1,10 +1,228 @@
 import ctypes
+import contextvars
+import itertools
+import os
+import sys
+import time
+import weakref
+from contextlib import contextmanager
 
 from . import control
 
 lib = control.lib
 
+_trace_enabled = os.environ.get("AIMDO_XPU_VBAR_TRACE") == "1"
+_boundary_trace_enabled = (
+    os.environ.get("AIMDO_XPU_BOUNDARY_TRACE") == "1"
+)
+_trace_calls = itertools.count(1)
+_inference_memory_budgets = contextvars.ContextVar(
+    "comfy_aimdo_inference_memory_budgets", default=None
+)
+
+# Torch's native XPU allocator keeps freed blocks cached, and that cache holds
+# WDDM local memory that AIMDO cannot reclaim: a tensor that is freed does not
+# reach zeMemFree, so the allocation hook never sees it come back.  Only
+# empty_cache() returns it.  It cannot be called from the allocation hook -
+# Torch holds its allocator lock across the driver call - but a VBAR fault that
+# is about to give up is a queue-safe boundary and a real, measured shortage.
+_native_cache_trim_enabled = (
+    os.environ.get("AIMDO_XPU_NATIVE_CACHE_TRIM", "1") != "0"
+)
+# empty_cache() calls sycl::free(), which can stall in the Level Zero/UMF
+# residency path under pressure, so this stays rate limited rather than
+# becoming a per-weight operation.
+_NATIVE_CACHE_TRIM_INTERVAL_SECONDS = 2.0
+_native_cache_trim_last = 0.0
+
+# --- fail-soft 符号绑定 --------------------------------------------------------
+#
+# 本模块在 import 期就绑定 lib 的符号。aimdo_xpu.dll 可能来自不同的构建
+# 版本，符号并非总是齐全：无条件绑定一个缺失符号会抛 AttributeError，
+# 中断整个 comfy_aimdo 包的导入，让 ComfyUI 的 XPU 后端完全起不来。
+#
+# 因此所有"较新"符号一律先 hasattr 探测再绑定，缺失时降级为能力不可用
+# （走原有逻辑），而不是让插件崩溃。缺失清单记录在 _missing_symbols 里，
+# 供诊断时排查。
+_missing_symbols = []
+
+
+def _bind(symbol, argtypes, restype=None):
+    """按存在性绑定一个 lib 符号，返回是否绑定成功。
+
+    为什么不直接 `lib.<name>.argtypes = ...`：CDLL 对缺失符号是懒解析的，
+    访问属性时才抛 AttributeError。上面几行绑定位于模块顶层，一旦抛出
+    就没有机会回退。本仓库已在 control.py 的 get_vram_capacity 上踩过这个
+    坑，所以这里统一收敛成一个守卫入口。
+    """
+    if lib is None:
+        return False
+    try:
+        target = getattr(lib, symbol)
+    except AttributeError:
+        _missing_symbols.append(symbol)
+        return False
+    try:
+        target.argtypes = argtypes
+        if restype is not None:
+            target.restype = restype
+    except Exception:
+        _missing_symbols.append(symbol)
+        return False
+    return True
+
+
+def _has(symbol):
+    """DLL 是否导出该符号（不触碰 argtypes，纯粹存在性探测）。"""
+    if lib is None:
+        return False
+    try:
+        getattr(lib, symbol)
+        return True
+    except AttributeError:
+        return False
+
+
+_unpin_stream_supported = (
+    _has("vbar_unpin_stream")
+    and sys.platform == "win32"
+    and control.implementation == "xpu"
+)
+_consumer_registration_supported = (
+    _unpin_stream_supported
+    and _has("vbar_register_consumer_stream")
+)
+_consumer_lease_supported = (
+    _consumer_registration_supported
+    and _has("vbar_consumer_acquire")
+    and _has("vbar_consumer_release")
+)
+_page_state_snapshot_supported = (
+    _unpin_stream_supported and _has("vbar_get_page_states")
+)
+_prepare_allocation_supported = _has("vbars_prepare_allocation")
+_linux_consumer_queue_supported = _has("aimdo_xpu_register_consumer_queue")
+
+_live_vbars = weakref.WeakSet()
+_CONSUMER_HOLD_EXTERNAL = 1
+_CONSUMER_HOLD_CAPTURE = 2
+
+if _unpin_stream_supported:
+    _bind(
+        "vbar_unpin_stream",
+        [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+         ctypes.c_uint64],
+    )
+if _consumer_registration_supported:
+    _bind(
+        "vbar_register_consumer_stream",
+        [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+         ctypes.c_uint64],
+        ctypes.c_bool,
+    )
+if _consumer_lease_supported:
+    _bind(
+        "vbar_consumer_acquire",
+        [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+         ctypes.c_uint32],
+        ctypes.c_bool,
+    )
+    _bind(
+        "vbar_consumer_release",
+        [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+         ctypes.c_uint32, ctypes.c_uint64],
+        ctypes.c_int,
+    )
+if _page_state_snapshot_supported:
+    _bind(
+        "vbar_get_page_states",
+        [ctypes.c_void_p, ctypes.c_void_p,
+         ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t],
+    )
+if _linux_consumer_queue_supported:
+    _bind(
+        "aimdo_xpu_register_consumer_queue",
+        [ctypes.c_void_p, ctypes.c_int],
+        ctypes.c_bool,
+    )
+
+
+def _consumer_queue_ptr(device, stream=None):
+    """SYCL queue backing a submitted VBAR consumer.
+
+    Registration is intentionally post-submission.  During graph capture a
+    completion marker cannot prove replay lifetime, so return the explicit
+    unknown token and keep the page non-reclaimable.
+    """
+    try:
+        import torch
+
+        is_capturing = getattr(torch.xpu, "is_current_stream_capturing", None)
+        if callable(is_capturing) and is_capturing():
+            return 0
+        if stream is None:
+            stream = torch.xpu.current_stream(torch.device("xpu", device))
+        return int(getattr(stream, "sycl_queue", stream))
+    except Exception:
+        # 拿不到 queue 就返回"未知"，让 native 侧保持不可回收（fail-closed），
+        # 而不是猜一个默认 queue 导致提前回收踩到仍在飞的工作。
+        return 0
+
+
+def _trace_vbar(operation, phase, alloc, caller, result=None):
+    if not _trace_enabled:
+        return
+    vbar, offset, size = alloc
+    module = caller.f_locals.get("s") or caller.f_locals.get("m")
+    module_name = getattr(module, "seed_key", None)
+    module_type = type(module).__qualname__ if module is not None else None
+    weight = getattr(module, "weight", None)
+    weight_shape = tuple(weight.shape) if weight is not None else None
+    weight_dtype = str(weight.dtype) if weight is not None else None
+    print(
+        "[AIMDO XPU VBAR] "
+        f"call={next(_trace_calls)} op={operation} phase={phase} "
+        f"vbar=0x{vbar.base_addr:x} offset={offset - vbar.base_addr} "
+        f"size={size} module={module_name!r} type={module_type!r} "
+        f"weight_shape={weight_shape!r} weight_dtype={weight_dtype!r} "
+        f"result={result!r}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+@contextmanager
+def inference_memory_budget(memory_required, devices):
+    """Publish a scoped inference allocation budget for model activation."""
+    budget = max(0, int(memory_required))
+    current = _inference_memory_budgets.get()
+    updated = {} if current is None else dict(current)
+    for device in devices:
+        device_index = getattr(device, "index", device)
+        if device_index is not None:
+            device_index = int(device_index)
+            updated[device_index] = max(budget, updated.get(device_index, 0))
+
+    token = _inference_memory_budgets.set(updated)
+    try:
+        yield
+    finally:
+        _inference_memory_budgets.reset(token)
+
+
+def current_inference_memory_budget(device):
+    budgets = _inference_memory_budgets.get()
+    if budgets is None:
+        return 0
+    device_index = getattr(device, "index", device)
+    if device_index is None:
+        return 0
+    return budgets.get(int(device_index), 0)
+
 # Bindings
+#
+# 下面这一组是仓库原有绑定，已在 Arc B580 上验证存在，保持无条件绑定不动
+# （最小侵入：不为证明存在而改变已验证路径）。真正新增的符号一律走 _bind。
 if lib is not None:
     lib.vbar_allocate.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
     lib.vbar_allocate.restype = ctypes.c_void_p
@@ -46,6 +264,133 @@ if lib is not None:
 
     lib.vbar_get_residency.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
 
+# L2 的模型边界预回收：让 native 在新的驻留窗口开始前先腾出空间。
+# 缺失时跳过即可——退回"按需 fault 回收"，只是慢一点，不会出错。
+_bind(
+    "vbars_prepare_allocation",
+    [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64],
+)
+
+_linux_native_cache_trim_signature = {}
+
+# 限流告警：只提醒一次，避免在每权重热路径上刷屏。
+_warned_messages = set()
+
+
+def _warn_once(message):
+    """把一条降级告警只打印一次（进程内去重）。
+
+    为什么需要它：L3 的 trim 判据依赖 torch 原生口径，而那个口径可能被
+    M2 包装器遮蔽或因包装器未安装而拿不到。失败时函数必须返回 False（不能
+    抛错打断采样），但若完全静默，实机上只会表现为「采样极慢」，无从
+    定位。所以这条降级必须可见，又不能在热路径上反复刷。
+    """
+    if message in _warned_messages:
+        return
+    _warned_messages.add(message)
+    print(f"[AIMDO XPU] WARNING: {message}", file=sys.stderr, flush=True)
+
+
+def _release_linux_native_cache(device):
+    """Retry a failed VBAR page only after native reserved storage was returned.
+
+    Native dead bytes may be split or await another stream. Remember an
+    unsuccessful attempt's state so unchanged cache cannot cause repeated
+    flushes. Native physical allocation/free counters distinguish later cache
+    generations with the same byte counts. There is no Windows time/size policy
+    here; the real VBAR miss and actual returned bytes bound recovery.
+    """
+    try:
+        import torch
+        from . import xpu as _xpu
+
+        # 同_release_native_cache：M2 包装器会让 reserved==allocated，
+        # 这里必须读 torch 原生字节口径。
+        raw = _xpu.torch_reserved_stats(device) if _xpu is not None else None
+        if raw is None:
+            return False
+        reserved, allocated, _peak = raw
+        control.publish_torch_cached_bytes(device, max(0, reserved - allocated))
+        if reserved <= allocated:
+            return False
+        hook = control.get_xpu_ur_hook_stats()
+        signature = (reserved, allocated, hook.get("tracked_alloc_calls", 0),
+                     hook.get("tracked_free_calls", 0))
+        if _linux_native_cache_trim_signature.get(device) == signature:
+            return False
+        _linux_native_cache_trim_signature[device] = signature
+        torch.xpu.empty_cache()
+        after_raw = _xpu.torch_reserved_stats(device)
+        after_reserved, after_allocated = (after_raw[:2] if after_raw
+                                           else (reserved, allocated))
+        control.publish_torch_cached_bytes(device, max(0, after_reserved - after_allocated))
+        return after_reserved < reserved
+    except Exception:
+        return False
+
+
+def _release_native_cache(device):
+    """Return Torch's freed-but-cached device memory, if that is the shortage.
+
+    Only worth doing when Torch is actually sitting on dead blocks; a VBAR miss
+    caused by live tensors cannot be helped this way.  Returns True when
+    something was released and a refault is worth attempting.
+    """
+    global _native_cache_trim_last
+
+    if (_native_cache_trim_enabled and sys.platform == "linux"
+            and control.implementation == "xpu"
+            and control.get_xpu_allocator_mode() == "native_hook"):
+        return _release_linux_native_cache(device)
+
+    if (not _native_cache_trim_enabled
+            or sys.platform != "win32"
+            or control.implementation != "xpu"):
+        # 非 Windows / 非 XPU（如 CUDA、ROCm）路径完全保持原样：这里直接
+        # 返回 False，fault() 的行为与改动前逐字节一致。
+        return False
+
+    now = time.monotonic()
+    if now - _native_cache_trim_last < _NATIVE_CACHE_TRIM_INTERVAL_SECONDS:
+        return False
+    # Throttle every attempt, including ones that find no cache or raise, and
+    # time from completion: empty_cache() can itself take seconds under
+    # pressure, and timing from the start would allow back-to-back calls.
+    _native_cache_trim_last = now
+
+    try:
+        import torch
+        from . import xpu as _xpu
+
+        # 必须走 torch 原生口径：M2 包装器把 reserved 与 allocated 双双映射成
+        # Book A 当前值，经它算出的 cached 恒为 0，L3 trim 会永不触发。
+        raw = _xpu.torch_reserved_stats(device) if _xpu is not None else None
+        if raw is None:
+            # 这是热路径上的静默降级点：拿不到 torch 原生口径，L3 就永不
+            # 触发，且不会有任何其他症状。所以必须留一条限流告警 ——
+            # 否则实机出现「采样极慢 / vbar_fault 失败」时根本无从定位。
+            _warn_once(
+                "AIMDO XPU: 无法读取 torch 原生预留统计（torch_reserved_stats "
+                "返回 None），L3 原生缓存回收已停用。若未主动设置 "
+                "AIMDO_XPU_NATIVE_CACHE_TRIM=0，请检查 xpu.py 的 "
+                "_install_native_hook_wrappers 是否已安装。"
+            )
+            return False
+        reserved, allocated, _peak = raw
+        cached = max(0, reserved - allocated)
+        # The allocation hook needs this figure too, and cannot derive it: a
+        # cached block never reaches the driver.
+        control.publish_torch_cached_bytes(device, cached)
+        if cached < 32 * 1024 ** 2:
+            return False
+        torch.xpu.empty_cache()
+    except Exception:
+        return False
+    finally:
+        _native_cache_trim_last = time.monotonic()
+    return True
+
+
 class ModelVBAR:
     def __init__(self, size, device):
         self._devctx = control.get_devctx(device)
@@ -56,11 +401,72 @@ class ModelVBAR:
         self.max_size = size
         self.offset = 0
         self.base_addr = lib.vbar_get(self._devctx, self._ptr)
+        # 登记到弱引用集合，供 vbars_snapshot() 做非侵入式诊断快照。
+        _live_vbars.add(self)
+        self._prioritized_once = False
 
     def prioritize(self, malloc_async_clamp=None):
         if malloc_async_clamp is None:
             malloc_async_clamp = ctypes.c_uint64(-1).value
+        was_prioritized = self._prioritized_once
+        previous_watermark = None
+        if sys.platform == "win32" and self._prioritized_once:
+            # Record the prior working set for boundary diagnosis. It must not
+            # become the next activation's hard ceiling: tiled models revisit
+            # weights above a pressure-reduced watermark and would otherwise
+            # stream those weights from host storage for every tile.
+            previous_watermark = lib.vbar_get_watermark(
+                self._devctx, self._ptr
+            )
         lib.vbar_prioritize(self._devctx, self._ptr, malloc_async_clamp)
+        if (sys.platform == "linux" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"):
+            control.publish_torch_cached_bytes(self.device)
+        if sys.platform == "win32":
+            # anticipated_growth 必须是「本次激活预计新增的驻留」这个前瞻
+            # 增量，且不能与 native 的 Book A 同源 —— native 会把它直接加到
+            # Book A 上算budget_deficit。同源会让 current 被代数抵消，
+            # 使驱逐目标只看历史高水位而与当前压力脱钩，导致每次切模型都
+            # 过度驱逐（详见 control.get_xpu_torch_reserved_growth 的注释）。
+            # 所以这里用 torch 自己的预留历史，而不是 Book A 的峰值。
+            historical_growth = control.get_xpu_torch_reserved_growth(
+                self.device
+            )
+            inference_budget = current_inference_memory_budget(self.device)
+            anticipated_growth = max(historical_growth, inference_budget)
+            prepared_allocation = False
+            # Linux's pluggable allocator can safely grow a newly prioritized
+            # model under exact allocation-time pressure. Windows uses the
+            # historical estimate and any deferred callback pressure while
+            # excluding the active VBAR from speculative reclaim.
+            # Always enter the Windows owner boundary, including when the
+            # historical estimate is zero. The synchronized reference mode
+            # consumes deferred callback pressure only here; skipping this
+            # call would strand it until another model happened to report
+            # anticipated growth.
+            if _prepare_allocation_supported:
+                prepared_allocation = bool(
+                    lib.vbars_prepare_allocation(
+                        self._devctx, self._ptr, anticipated_growth
+                    )
+                )
+            if _boundary_trace_enabled:
+                current_watermark = lib.vbar_get_watermark(
+                    self._devctx, self._ptr
+                )
+                print(
+                    "[AIMDO XPU BOUNDARY] "
+                    f"vbar=0x{self.base_addr:x} "
+                    f"was_prioritized={was_prioritized} "
+                    f"previous_watermark={previous_watermark} "
+                    f"current_watermark={current_watermark} "
+                    f"historical_growth={historical_growth} "
+                    f"inference_budget={inference_budget} "
+                    f"anticipated_growth={anticipated_growth} "
+                    f"prepared_allocation={prepared_allocation}",
+                    flush=True,
+                )
+        self._prioritized_once = True
 
     def deprioritize(self):
         lib.vbar_deprioritize(self._devctx, self._ptr)
@@ -78,14 +484,55 @@ class ModelVBAR:
     #define VBAR_PAGE_SIZE (32 << 20)
 
     #define VBAR_FAULT_SUCCESS      0
+
     #define VBAR_FAULT_OOM          1
+
     #define VBAR_FAULT_ERROR        2
 
     def fault(self, alloc, size):
         offset = alloc - self.base_addr
         # +2, one for misalignment and one for rounding
         signature = (ctypes.c_uint32 * (size // (32 * 1024 ** 2) + 2))()
+        native_watermark = None
+        if (sys.platform == "linux" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"):
+            native_watermark = lib.vbar_get_watermark(self._devctx, self._ptr)
         res = lib.vbar_fault(self._devctx, self._ptr, offset, size, signature)
+        if res == 1:
+            # L3：这是模型 owner 边界，在 native allocator / UR 回调之外，
+            # 因此是第一个可以安全调用 torch.xpu.empty_cache() 的地方
+            # （分配钩子里 torch 持有 allocator 锁，重入会死锁）。
+            # 先归还 torch 自己缓存的死块，再重试一次 fault：这段显存
+            # AIMDO 没有别的办法拿回来。成功后权重不必从主存流式回读。
+            cache_released = _release_native_cache(self.device)
+            if cache_released:
+                if native_watermark is not None:
+                    # The first Linux fault may lower the watermark before
+                    # Python can return native dead cache. Restore only the
+                    # pre-fault range after that real release, then let the
+                    # ordinary fault recheck current pressure. An explicit
+                    # caller watermark is preserved; no range is widened.
+                    lib.vbar_set_watermark(
+                        self._devctx, self._ptr,
+                        native_watermark * (32 * 1024 ** 2))
+                # The shortage was at least partly Torch's own dead cache,
+                # which AIMDO has no other way to reclaim. Retry once now that
+                # it is back, rather than streaming this weight from host.
+                res = lib.vbar_fault(
+                    self._devctx, self._ptr, offset, size, signature)
+            try:
+                control.capture_xpu_oom_snapshot(
+                    self.device,
+                    stage=(
+                        "vbar_fault_recovered_after_native_cache"
+                        if res == 0 else "vbar_fault_host_offload"
+                    ),
+                    request_bytes=size,
+                )
+            except Exception:
+                # Diagnostics must never replace the existing recovered or
+                # host-offload OOM result with a snapshot failure.
+                pass
         if res == 0:
             return signature
         elif res == 1:
@@ -93,8 +540,63 @@ class ModelVBAR:
         else:
             raise RuntimeError(f"Fault failed: {res}")
 
-    def unpin(self, alloc, size):
+    def register_consumer(self, alloc, size, stream=None):
+        if not _consumer_registration_supported:
+            return False
         offset = alloc - self.base_addr
+        queue = _consumer_queue_ptr(self.device, stream)
+        return bool(lib.vbar_register_consumer_stream(
+            self._devctx, self._ptr, offset, size, queue
+        ))
+
+    def acquire_consumer(self, alloc, size, kind):
+        if not _consumer_lease_supported:
+            raise RuntimeError(
+                "explicit VBAR consumer leases are unavailable in this build"
+            )
+        offset = alloc - self.base_addr
+        return bool(lib.vbar_consumer_acquire(
+            self._devctx, self._ptr, offset, size, kind
+        ))
+
+    def release_consumer(self, alloc, size, kind, stream=None):
+        if not _consumer_lease_supported:
+            raise RuntimeError(
+                "explicit VBAR consumer leases are unavailable in this build"
+            )
+        offset = alloc - self.base_addr
+        return int(lib.vbar_consumer_release(
+            self._devctx, self._ptr, offset, size, kind,
+            _consumer_queue_ptr(self.device, stream),
+        ))
+
+    def unpin(self, alloc, size, stream=None):
+        offset = alloc - self.base_addr
+        if (sys.platform == "linux" and control.implementation == "xpu"
+                and control.get_xpu_allocator_mode() == "native_hook"
+                and _linux_consumer_queue_supported):
+            # The pluggable allocator registers allocation queues itself.
+            # Native Torch does not pass its queue through that allocator, so
+            # publish the actual VBAR consumer before dropping the model pin.
+            # Linux reclaim already waits all registered queues; keep that
+            # synchronized policy instead of importing Windows retirement.
+            register = lib.aimdo_xpu_register_consumer_queue
+            queue = _consumer_queue_ptr(self.device, stream)
+            if not queue or not register(queue, self.device):
+                # 队列未知就保留 pin（fail-closed）：宁可这页不回收，
+                # 也不能在没有完成证明的情况下把它交给回收器 —— 那会
+                # 造成 DEVICE_LOST。
+                raise RuntimeError("Linux native VBAR consumer queue is unknown; pin retained")
+        if _unpin_stream_supported:
+            # VBAR map/unmap carry no stream, so this is the only point where
+            # the queue that actually consumed the weight is visible. ComfyUI
+            # may consume weights on a non-default stream, and a retirement
+            # fence submitted only to the default queue does not order that
+            # work: reclaiming on that proof caused DEVICE_LOST.
+            lib.vbar_unpin_stream(
+                self._devctx, self._ptr, offset, size,
+                _consumer_queue_ptr(self.device, stream))
+            return
         lib.vbar_unpin(self._devctx, self._ptr, offset, size)
 
     def loaded_size(self):
@@ -125,21 +627,180 @@ class ModelVBAR:
         lib.vbar_get_residency(self._devctx, self._ptr, buf, nr_pages)
         return list(buf)
 
+    def snapshot(self, include_pages=True):
+        """Return a non-mutating snapshot of this VBAR's ownership state."""
+        states = []
+        nr_pages = self.get_nr_pages()
+        if include_pages and _page_state_snapshot_supported:
+            words = (ctypes.c_uint64 * nr_pages)()
+            lib.vbar_get_page_states(
+                self._devctx, self._ptr, words, nr_pages
+            )
+            for index, raw_value in enumerate(words):
+                value = int(raw_value)
+                states.append({
+                    "page": index,
+                    "mapped": bool(value & 1),
+                    "evicting": bool(value & 2),
+                    "retire_unknown": bool(value & 4),
+                    "mapping_unknown": bool(value & 8),
+                    "pin_count": (value >> 8) & 0xFFFF,
+                    "retire_token_count": (value >> 24) & 0xFF,
+                    "external_consumer_holds": (value >> 32) & 0xFFFF,
+                    "capture_holds": (value >> 48) & 0xFFFF,
+                })
+        elif include_pages:
+            for index, value in enumerate(self.get_residency()):
+                states.append({
+                    "page": index,
+                    "mapped": bool(value & 1),
+                    "pin_count": 1 if value & 2 else 0,
+                })
+        result = {
+            "vbar": int(self._ptr),
+            "device": self.device,
+            "base_addr": self.base_addr,
+            "max_size": self.max_size,
+            "loaded_size": self.loaded_size(),
+            "watermark": self.get_watermark(),
+        }
+        if include_pages:
+            result["pages"] = states
+        return result
+
     def __del__(self):
         ptr = getattr(self, "_ptr", None)
         aimdo_lib = getattr(control, "lib", None)
         if aimdo_lib is not None and ptr:
-            aimdo_lib.vbar_free(self._devctx, ptr)
+            # control.init() may create a new CDLL wrapper after a focused
+            # test calls deinit().  That wrapper has not necessarily inherited
+            # the model-vbar argtypes bound above, so preserve pointer width
+            # explicitly when freeing through the current library handle.
+            aimdo_lib.vbar_free(
+                ctypes.c_void_p(self._devctx), ctypes.c_void_p(ptr)
+            )
             self._ptr = None
 
-def vbar_fault(alloc):
-    vbar, offset, size = alloc
-    return vbar.fault(offset, size)
 
-def vbar_unpin(alloc):
-    if alloc is not None:
+class VBARConsumerLease:
+    """Fail-closed ownership for work that can outlive the model pin.
+
+    ``release()`` must run after the final consumer has been submitted.  A
+    capture lease remains active for the lifetime of the captured graph, not
+    merely until capture construction ends; release it only after the graph
+    can no longer replay and its last replay is ordered on ``stream``.
+    """
+
+    def __init__(self, alloc, kind):
+        if alloc is None:
+            raise ValueError("a VBAR allocation is required")
+        self._alloc = alloc
+        self._kind = kind
+        self._active = False
         vbar, offset, size = alloc
-        vbar.unpin(offset, size)
+        if not vbar.acquire_consumer(offset, size, kind):
+            raise RuntimeError("failed to acquire VBAR consumer ownership")
+        self._active = True
+
+    @property
+    def active(self):
+        return self._active
+
+    def release(self, stream=None):
+        if not self._active:
+            raise RuntimeError("VBAR consumer ownership is already released")
+        vbar, offset, size = self._alloc
+        status = vbar.release_consumer(offset, size, self._kind, stream)
+        if status >= 0:
+            self._active = False
+        if status != 1:
+            raise RuntimeError(
+                "VBAR consumer release failed or has no valid completion "
+                "queue; the mapping was kept fail-closed"
+            )
+
+    def abandon(self):
+        """Release the lease as unknown after a partial/failed submission."""
+        if not self._active:
+            return
+        vbar, offset, size = self._alloc
+        status = vbar.release_consumer(offset, size, self._kind, stream=0)
+        if status >= 0:
+            self._active = False
+
+def vbar_fault(alloc):
+    caller = sys._getframe(1)
+    _trace_vbar("fault", "begin", alloc, caller)
+    vbar, offset, size = alloc
+    result = vbar.fault(offset, size)
+    _trace_vbar(
+        "fault", "end", alloc, caller,
+        "vbar" if result is not None else "fallback",
+    )
+    return result
+
+def vbar_register_consumer(alloc, stream=None):
+    """Register a submitted consumer while the model pin is still active.
+
+    Custom/external work that may outlive the model pin must use
+    :func:`vbar_external_consumer` instead; its pre-submission lease closes the
+    registration race.
+    """
+    if alloc is None:
+        return False
+    vbar, offset, size = alloc
+    return vbar.register_consumer(offset, size, stream)
+
+
+@contextmanager
+def vbar_external_consumer(alloc, stream=None):
+    """Protect a VBAR range around one custom/external kernel submission.
+
+    Enter before submitting work and leave only after every use has been
+    submitted to ``stream``.  Normal exit publishes that queue's completion
+    dependency.  Exceptional exit is deliberately fail-closed because AIMDO
+    cannot know whether the external runtime accepted part of the work.
+    """
+    lease = VBARConsumerLease(alloc, _CONSUMER_HOLD_EXTERNAL)
+    try:
+        yield lease
+    except BaseException:
+        lease.abandon()
+        raise
+    else:
+        lease.release(stream)
+
+
+def vbar_capture_begin(alloc):
+    """Hold a VBAR allocation for a captured graph's complete lifetime.
+
+    The returned lease must remain active across every replay.  Call
+    ``lease.release(stream)`` only after no future replay is possible and the
+    final replay has been submitted to ``stream``.  Ending capture
+    construction alone is not a release boundary.
+    """
+    return VBARConsumerLease(alloc, _CONSUMER_HOLD_CAPTURE)
+
+
+def vbars_snapshot(device=None, include_pages=True):
+    """Snapshot all live VBARs without changing retirement state."""
+    snapshots = []
+    for vbar in list(_live_vbars):
+        if getattr(vbar, "_ptr", None) and (
+            device is None or int(vbar.device) == int(device)
+        ):
+            snapshots.append(vbar.snapshot(include_pages=include_pages))
+    snapshots.sort(key=lambda item: item["base_addr"])
+    return snapshots
+
+
+def vbar_unpin(alloc, stream=None):
+    if alloc is not None:
+        caller = sys._getframe(1)
+        _trace_vbar("unpin", "begin", alloc, caller)
+        vbar, offset, size = alloc
+        vbar.unpin(offset, size, stream)
+        _trace_vbar("unpin", "end", alloc, caller)
 
 def vbar_signature_compare(a, b):
     if a is None or b is None:
@@ -159,3 +820,8 @@ def vbars_analyze(device=None):
     devctx = control.devctxs[0] if device is None else control.get_devctx(device)
 
     return lib.vbars_analyze(devctx, False)
+
+
+def missing_symbols():
+    """返回本次导入时未能绑定的 DLL 符号名（诊断用，通常为空）。"""
+    return list(_missing_symbols)
