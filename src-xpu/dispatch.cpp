@@ -350,6 +350,25 @@ CUresult from_ze(ze_result_t result) {
         result == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY) {
         return CUDA_ERROR_OUT_OF_MEMORY;
     }
+    /* Drivers in the field report VMM/exhaustion conditions with the
+     * SYSTEM_RESOURCE_FAILURE alias rather than the dedicated OOM code, and
+     * the value has moved across Level Zero revisions. Treat every
+     * resource-exhaustion spelling as OOM so callers (model-vbar.c
+     * vbar_fault) take the vbars_free() + retry path instead of failing
+     * closed with VBAR_FAULT_ERROR.
+     *
+     * Observed on Arc B580 / oneAPI 2026 under VRAM pressure:
+     *   zeVirtualMemMap -> 0x70000003 (ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
+     *   zeVirtualMemMap -> 0x78000004 (ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY in
+     *                                  later Level Zero revisions)
+     * Both were previously mapped to kCudaErrorUnknown, so vbar_fault's
+     * `err != CUDA_ERROR_OUT_OF_MEMORY` test classified a genuine OOM as a
+     * hard error and aborted the load. */
+    if (result == static_cast<ze_result_t>(0x70000003u) ||
+        result == static_cast<ze_result_t>(0x70000002u) ||
+        result == static_cast<ze_result_t>(0x78000004u)) {
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
     return kCudaErrorUnknown;
 }
 

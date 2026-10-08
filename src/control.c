@@ -208,6 +208,18 @@ uint64_t get_total_vram_usage(void *devctx) {
     return total_vram_usage;
 }
 
+/* Diagnostic readback for vram_capacity. The VBAR page clamp in
+ * vbar_allocate() is the only thing standing between a model whose weights
+ * exceed physical VRAM and an unbounded accounting overshoot, and on the XPU
+ * path the clamp was observed not to engage while the init log still reported
+ * the expected 11875 MB. Exposing the value lets the Python probe assert the
+ * clamp's precondition instead of inferring it from page counts. */
+SHARED_EXPORT
+uint64_t get_vram_capacity(void *devctx) {
+    set_devctx((AimdoContext *)devctx);
+    return vram_capacity;
+}
+
 SHARED_EXPORT
 void cleanup(void) {
     for (size_t i = 0; i < g_all_devctx_count; i++) {

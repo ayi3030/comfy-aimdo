@@ -257,6 +257,9 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     lib.get_total_vram_usage.argtypes = [ctypes.c_void_p]
     lib.get_total_vram_usage.restype = ctypes.c_uint64
 
+    lib.get_vram_capacity.argtypes = [ctypes.c_void_p]
+    lib.get_vram_capacity.restype = ctypes.c_uint64
+
     lib.aimdo_analyze.argtypes = [ctypes.c_void_p]
 
     lib.set_simple_vram_headroom.argtypes = [ctypes.c_int64]
