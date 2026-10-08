@@ -64,7 +64,7 @@ jobs:
     runs-on: windows-2022
     steps:
       - name: Checkout clean Python integration (this repo)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
           path: aimdo
@@ -78,7 +78,7 @@ jobs:
           echo "Resolved version:"; git describe --tags || echo "(no tag; setuptools-scm falls back to 0.0+<sha>)"
 
       - name: Checkout community fork native tree (compatible src/ + src-win/ + src-xpu/)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           repository: ${{ env.COMMUNITY_FORK_REPO }}
           ref: ${{ env.COMMUNITY_FORK_SHA }}
@@ -153,14 +153,14 @@ jobs:
           ls -l wheelhouse
 
       - name: Upload wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: comfy-aimdo-xpu-wheel
           path: aimdo/wheelhouse/*.whl
           if-no-files-found: error
 
       - name: Upload standalone DLL
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: aimdo_xpu.dll
           path: native/comfy_aimdo/aimdo_xpu.dll

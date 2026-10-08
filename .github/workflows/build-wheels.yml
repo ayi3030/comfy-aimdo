@@ -38,7 +38,7 @@ jobs:
             arch: arm64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
 
@@ -89,7 +89,7 @@ jobs:
 
       - name: Upload Stub Wheel
         if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: wheels-none
           path: ./wheelhouse-none/*.whl
@@ -108,7 +108,7 @@ jobs:
           Write-Host "✅ Downloaded virtualenv.pyz"
 
       - name: Build wheels
-        uses: pypa/cibuildwheel@v2.23.3
+        uses: pypa/cibuildwheel@faf86a6ed7efa889faf6996aa23820831055001a
         env:
           CIBW_MANYLINUX_X86_64_IMAGE: custom-cuda-builder
           CIBW_MANYLINUX_AARCH64_IMAGE: custom-cuda-builder
@@ -117,7 +117,7 @@ jobs:
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: "auditwheel repair --exclude libcuda.so.1 -w {dest_dir} {wheel}"
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: wheels-${{ matrix.platform }}-${{ matrix.arch }}
           path: ./wheelhouse/*.whl
@@ -133,7 +133,7 @@ jobs:
 
     steps:
       - name: Download all wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist
           pattern: wheels-*
@@ -141,7 +141,7 @@ jobs:
 
       - name: Publish to PyPI Test
         if: github.ref == 'refs/heads/master'
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         # No password/token needed with Trusted Publishing!
         with:
           repository-url: https://test.pypi.org/legacy/
@@ -149,4 +149,4 @@ jobs:
 
       - name: Publish to PyPI
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
