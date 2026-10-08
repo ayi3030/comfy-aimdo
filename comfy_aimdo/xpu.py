@@ -483,16 +483,50 @@ def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool
 def _xpu_opt_in() -> bool:
     """Whether XPU dynamic offload should activate.
 
-    Mirrors the community fork's opt-in: explicit env flag, or ComfyUI's
-    --enable-dynamic-vram, or an explicit implementation request from the caller.
+    Opt-in succeeds if any of the following holds:
+      1. the explicit env flag ``AIMDO_XPU_ENABLED=1`` is set; or
+      2. ComfyUI is running with an explicit ``--enable-dynamic-vram`` arg; or
+      3. ComfyUI itself has already decided dynamic VRAM is enabled
+         (``comfy.cli_args.enables_dynamic_vram()``, falling back to
+         ``args.enable_dynamic_vram`` when that helper is absent) *and* the
+         active device is an Intel XPU (``comfy.model_management.is_intel_xpu()``).
+
+    Import-safe when ``comfy.*`` is unavailable (aimdo used standalone): the
+    function then simply returns False and never raises. CUDA/ROCm behavior is
+    untouched — condition 3 only fires for Intel XPU devices.
     """
     if os.environ.get("AIMDO_XPU_ENABLED") == "1":
         return True
+
     comfy_cli = sys.modules.get("comfy.cli_args")
     if comfy_cli is not None:
         args = getattr(comfy_cli, "args", None)
+        # 条件 2：显式 --enable-dynamic-vram
         if args is not None and getattr(args, "enable_dynamic_vram", False):
             return True
+        # 条件 3：ComfyUI 自身已判定 dynamic VRAM 开启，且当前设备是 Intel XPU。
+        # 这样用户在 Intel 卡上直接跑 ComfyUI（不开 --enable-dynamic-vram）也能自动启用。
+        try:
+            enables = getattr(comfy_cli, "enables_dynamic_vram", None)
+            if callable(enables):
+                dynamic_on = bool(enables())
+            else:
+                # 老版本 ComfyUI 无该 helper 时退回原始 arg
+                dynamic_on = bool(
+                    args is not None and getattr(args, "enable_dynamic_vram", False)
+                )
+            if dynamic_on:
+                comfy_mm = sys.modules.get("comfy.model_management")
+                is_intel = (
+                    getattr(comfy_mm, "is_intel_xpu", None)
+                    if comfy_mm is not None
+                    else None
+                )
+                if callable(is_intel) and is_intel():
+                    return True
+        except Exception:
+            # 任何 ComfyUI 侧异常都不应影响 aimdo 的导入与决策
+            pass
     return False
 
 
