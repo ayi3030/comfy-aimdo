@@ -46,6 +46,13 @@ namespace {
 
 constexpr CUresult kCudaErrorUnknown = 999;
 
+/* gpu_abi.h 的 cudaError_enum 只定义了 CUDA_SUCCESS 与
+ * CUDA_ERROR_OUT_OF_MEMORY，没有 INVALID_VALUE。这里用CUDA 的标准值
+ * (cudaErrorInvalidValue = 1) 单独表达「参数非法」这一类，使它既不被
+ * 误当成 OOM 触发无谓的回收重试，也不与 999 的未知错误混为一谈——
+ * vbar_fault 正是用 `err != CUDA_ERROR_OUT_OF_MEMORY` 区分两条路径。 */
+constexpr CUresult kCudaErrorInvalidValue = 1;
+
 struct XpuDeviceState {
     int id;
     sycl::queue *queue;
@@ -346,28 +353,22 @@ CUresult from_ze(ze_result_t result) {
     if (result == ZE_RESULT_SUCCESS) {
         return CUDA_SUCCESS;
     }
-    if (result == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
-        result == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY) {
-        return CUDA_ERROR_OUT_OF_MEMORY;
-    }
-    /* Drivers in the field report VMM/exhaustion conditions with the
-     * SYSTEM_RESOURCE_FAILURE alias rather than the dedicated OOM code, and
-     * the value has moved across Level Zero revisions. Treat every
-     * resource-exhaustion spelling as OOM so callers (model-vbar.c
-     * vbar_fault) take the vbars_free() + retry path instead of failing
-     * closed with VBAR_FAULT_ERROR.
+    /* Verified against LevelZeroSDK 1.32.0 include/level_zero/ze_api.h:
+     *   :210  ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY   = 0x70000002
+     *   :211  ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY = 0x70000003
+     *   :234  ZE_RESULT_ERROR_INVALID_ARGUMENT     = 0x78000004
+     * The two OOM codes are matched by symbolic constant above, so they need
+     * no raw-value duplicates -- spelling the same numbers again would be
+     * unreachable code.
      *
-     * Observed on Arc B580 / oneAPI 2026 under VRAM pressure:
-     *   zeVirtualMemMap -> 0x70000003 (ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
-     *   zeVirtualMemMap -> 0x78000004 (ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY in
-     *                                  later Level Zero revisions)
-     * Both were previously mapped to kCudaErrorUnknown, so vbar_fault's
-     * `err != CUDA_ERROR_OUT_OF_MEMORY` test classified a genuine OOM as a
-     * hard error and aborted the load. */
-    if (result == static_cast<ze_result_t>(0x70000003u) ||
-        result == static_cast<ze_result_t>(0x70000002u) ||
-        result == static_cast<ze_result_t>(0x78000004u)) {
-        return CUDA_ERROR_OUT_OF_MEMORY;
+     * 0x78000004 is INVALID_ARGUMENT (a [Validation] code), NOT an
+     * out-of-memory spelling. It must not be folded into OOM: that would
+     * make vbar_fault() reclaim and retry a mapping whose arguments are
+     * simply invalid, and the retry cannot succeed. It gets its own
+     * translation so the caller can report it as a hard error with the
+     * offending parameters, rather than blaming VRAM pressure. */
+    if (result == ZE_RESULT_ERROR_INVALID_ARGUMENT) {
+        return kCudaErrorInvalidValue;
     }
     return kCudaErrorUnknown;
 }
@@ -682,6 +683,41 @@ CUresult xpu_virtual_map(CUdeviceptr pointer, size_t size, size_t offset,
     if (!state) {
         return kCudaErrorUnknown;
     }
+
+    /* zeVirtualMemMap requires size AND offset to be multiples of the
+     * device page size, and rejects anything else with
+     * ZE_RESULT_ERROR_INVALID_ARGUMENT (0x78000004). xpu_physical_create()
+     * already validates size against the page size before allocating; without
+     * the mirror check here a misaligned request reaches the driver and comes
+     * back as INVALID_ARGUMENT, which callers must not confuse with VRAM
+     * exhaustion -- reclaiming and retrying an invalid request cannot succeed.
+     * VBAR pages are VBAR_PAGE_SIZE (32MB) but the driver's page size is a
+     * device property, so the two are not guaranteed to agree. */
+    size_t page_size = 0;
+    const ze_result_t query_result = zeVirtualMemQueryPageSize(
+        state->context, state->device, size, &page_size);
+    if (query_result != ZE_RESULT_SUCCESS || !page_size) {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zeVirtualMemQueryPageSize failed before map: "
+            "ze_result=0x%x context=%p device=%p size=%zu\n",
+            static_cast<unsigned int>(query_result), state->context,
+            state->device, size);
+        std::fflush(stderr);
+        return from_ze(query_result);
+    }
+    if (size % page_size != 0 || offset % page_size != 0) {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] refusing misaligned zeVirtualMemMap: "
+            "address=%p size=%zu offset=%zu page_size=%zu "
+            "(size%%page_size=%zu offset%%page_size=%zu)\n",
+            reinterpret_cast<void *>(pointer), size, offset, page_size,
+            size % page_size, offset % page_size);
+        std::fflush(stderr);
+        return kCudaErrorInvalidValue;
+    }
+
     const ze_result_t result = zeVirtualMemMap(
         state->context, reinterpret_cast<void *>(pointer), size,
         reinterpret_cast<ze_physical_mem_handle_t>(
@@ -691,18 +727,14 @@ CUresult xpu_virtual_map(CUdeviceptr pointer, size_t size, size_t offset,
         g_stats[kMapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kMapBytes].fetch_add(size, std::memory_order_relaxed);
     } else {
-        size_t page_size = 0;
-        const ze_result_t query_result = zeVirtualMemQueryPageSize(
-            state->context, state->device, size, &page_size);
         std::fprintf(
             stderr,
             "[AIMDO XPU VMM] zeVirtualMemMap failed: ze_result=0x%x "
             "context=%p device=%p handle=%p address=%p size=%zu "
-            "offset=%zu page_size=%zu page_query_result=0x%x\n",
+            "offset=%zu page_size=%zu\n",
             static_cast<unsigned int>(result), state->context, state->device,
             reinterpret_cast<void *>(static_cast<uintptr_t>(handle)),
-            reinterpret_cast<void *>(pointer), size, offset, page_size,
-            static_cast<unsigned int>(query_result));
+            reinterpret_cast<void *>(pointer), size, offset, page_size);
         std::fflush(stderr);
     }
     return from_ze(result);
@@ -1516,11 +1548,17 @@ AIMDO_XPU_EXPORT bool xpu_allocator_get_memory_stats(
 // 会低估可用显存、过度驱逐。M2 以 Book A 为唯一权威账本，故新增以下
 // 两个导出，让 Python 侧直接读 Book A，彻底不再暴露 Book B。
 extern "C" uint64_t aimdo_xpu_recorded_usage(void);  // 返回 g_devctx->_total_vram_usage (Book A)
+extern "C" uint64_t aimdo_xpu_vram_capacity(void);  // 返回 g_devctx->_vram_capacity（物理显存上限）
 static uint64_t g_peak_total_vram_usage = 0;
 
 AIMDO_XPU_EXPORT uint64_t xpu_get_total_vram_usage(int device) {
     (void)device;  // Book A 为进程级单设备账；保留 device 形参以匹配上游签名词典
     return aimdo_xpu_recorded_usage();
+}
+
+AIMDO_XPU_EXPORT uint64_t xpu_get_vram_capacity(int device) {
+    (void)device;
+    return aimdo_xpu_vram_capacity();
 }
 
 AIMDO_XPU_EXPORT uint64_t xpu_get_peak_total_vram_usage(int device) {

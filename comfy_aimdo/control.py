@@ -257,8 +257,23 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     lib.get_total_vram_usage.argtypes = [ctypes.c_void_p]
     lib.get_total_vram_usage.restype = ctypes.c_uint64
 
-    lib.get_vram_capacity.argtypes = [ctypes.c_void_p]
-    lib.get_vram_capacity.restype = ctypes.c_uint64
+    # 诊断导出 get_vram_capacity(devctx)：读回 g_devctx->_vram_capacity，
+    # 即 init 时 cuDeviceTotalMem 写入的物理显存上限（Arc B580 约 11875MB）。
+    # budget_deficit() 用它算预算赤字，排查驻留超限时必须能直接读到真值。
+    #
+    # 刻意按存在性绑定：这些绑定位于 CDLL try 块之外，无条件绑定缺失符号会抛
+    # AttributeError 并中断 init()，让整个 XPU 后端起不来（与 malloc_graph_*
+    # 同理）。src/control.c 来自社区 fork 且不参与本仓库的 XPU 编译，符号可能
+    # 缺失；缺失时降级为不可用，而不是让 ComfyUI 起不来。
+    if hasattr(lib, "get_vram_capacity"):
+        lib.get_vram_capacity.argtypes = [ctypes.c_void_p]
+        lib.get_vram_capacity.restype = ctypes.c_uint64
+    elif hasattr(lib, "xpu_get_vram_capacity"):
+        lib.xpu_get_vram_capacity.argtypes = [ctypes.c_int]
+        lib.xpu_get_vram_capacity.restype = ctypes.c_uint64
+    else:
+        logging.info("NOTE: get_vram_capacity not exported by this backend; "
+                     "VRAM capacity readback unavailable")
 
     lib.aimdo_analyze.argtypes = [ctypes.c_void_p]
 
@@ -540,3 +555,19 @@ def get_total_vram_usage():
     if lib is None:
         return 0
     return sum(lib.get_total_vram_usage(devctx) for devctx in devctxs)
+
+
+def get_vram_capacity(device=0):
+    """读回物理显存上限（g_devctx->_vram_capacity），单位字节。
+
+    Book A 的合理上界就是它：驻留超过该值说明预算回收没跟上，而不是模型
+    真的需要那么多显存。诊断用——后端未导出该符号时返回 0 表示不可用。
+    """
+    if lib is None:
+        return 0
+    if hasattr(lib, "get_vram_capacity"):
+        devctx = get_devctx(device)
+        return int(lib.get_vram_capacity(devctx)) if devctx else 0
+    if hasattr(lib, "xpu_get_vram_capacity"):
+        return int(lib.xpu_get_vram_capacity(int(device)))
+    return 0

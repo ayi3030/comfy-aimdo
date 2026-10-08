@@ -38,6 +38,17 @@ uint64_t aimdo_xpu_recorded_usage(void) {
     return g_devctx ? g_devctx->_total_vram_usage : 0;
 }
 
+/* 诊断读回：g_devctx->_vram_capacity，即 init 时 cuDeviceTotalMem 写入的
+ * 物理显存上限（Arc B580 约 11875MB）。budget_deficit() 用它算预算赤字，
+ * vbar_allocate 在非 XPU 路径也用它钳制 VBAR 页数，所以「运行时到底是多少」
+ * 决定了 Book A 的合理上界——排查驻留超限时必须能直接读到真值。
+ *
+ * 之所以放在 src-xpu/ 而不是 src/control.c：XPU 构建只 overlay src-xpu/，
+ * src/ 来自社区 fork，在 src/control.c 里加导出不会进入 DLL。 */
+uint64_t aimdo_xpu_vram_capacity(void) {
+    return g_devctx ? g_devctx->_vram_capacity : 0;
+}
+
 bool aimdo_xpu_sample_pressure(int device, size_t size) {
     if (!set_devctx_for_device(device)) {
         return false;
