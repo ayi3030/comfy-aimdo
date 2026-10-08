@@ -1557,13 +1557,20 @@ AIMDO_XPU_EXPORT uint64_t xpu_get_total_vram_usage(int device) {
 }
 
 AIMDO_XPU_EXPORT uint64_t xpu_get_vram_capacity(int device) {
-    (void)device;
+    /* g_devctx 是 _Thread_local。Python 在主线程调进来时这里通常是 NULL，
+     * 直接读 g_devctx->_vram_capacity 会拿到 0——必须先按 device 绑定当前
+     * 线程的 devctx。与 aimdo_xpu_sample_pressure 等跨线程入口同一模式。 */
+    if (!set_devctx_for_device(device)) {
+        return 0;
+    }
     return aimdo_xpu_vram_capacity();
 }
 
 AIMDO_XPU_EXPORT uint64_t xpu_get_peak_total_vram_usage(int device) {
-    (void)device;
     std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
+    if (!set_devctx_for_device(device)) {
+        return 0;
+    }
     uint64_t cur = aimdo_xpu_recorded_usage();
     if (cur > g_peak_total_vram_usage) {
         g_peak_total_vram_usage = cur;
@@ -1576,7 +1583,11 @@ AIMDO_XPU_EXPORT void xpu_allocator_reset_peak_stats(
     std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
     g_torch_peak_active_bytes[device] = g_torch_active_bytes[device];
     g_torch_peak_reserved_bytes[device] = g_torch_reserved_bytes[device];
-    g_peak_total_vram_usage = aimdo_xpu_recorded_usage();  // M2: Book A 峰值一并重置
+    /* M2: Book A 峰值一并重置。同样要先绑定本线程 devctx，否则主线程调用时
+     * aimdo_xpu_recorded_usage() 读到 0，会把峰值错误地清成 0。 */
+    if (set_devctx_for_device(device)) {
+        g_peak_total_vram_usage = aimdo_xpu_recorded_usage();
+    }
 }
 
 AIMDO_XPU_EXPORT bool xpu_set_queues(
