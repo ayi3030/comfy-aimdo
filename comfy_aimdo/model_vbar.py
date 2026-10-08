@@ -291,6 +291,36 @@ def _warn_once(message):
     print(f"[AIMDO XPU] WARNING: {message}", file=sys.stderr, flush=True)
 
 
+# 失败原因 -> 排查方向。三种原因若混成一句告警，真机排查会被引向错误方向
+# （最常见的是把「torch 侧异常」误当成「M2 包装器没装」）。
+_TORCH_STATS_REASON_TEXT = {
+    "not_installed": (
+        "M2 包装器未安装（_install_native_hook_wrappers 没跑过），"
+        "拿不到包装前的 torch 原生函数"),
+    "call_failed": (
+        "torch 原生 memory_stats 调用抛异常，请检查 XPU 上下文/驱动是否可用"),
+    "empty_stats": (
+        "torch 原生 memory_stats 返回空读数，torch 侧未给出可用统计"),
+}
+
+
+def _warn_torch_stats_unavailable(reason, consequence):
+    """在拿不到 torch 原生口径时限流告警一次。返回 True 便于调用方直接返回。
+
+    统一走这里而不是各点各写告警，是为了保证「限流一次、按原因区分」这两个
+    语义在所有调用点一致 —— 否则某个点漏了告警，那个点就成了新的静默失效点。
+    """
+    detail = _TORCH_STATS_REASON_TEXT.get(reason)
+    if detail is None:
+        detail = "未知原因（%r）" % (reason,)
+    _warn_once(
+        "AIMDO XPU: 无法读取 torch 原生预留统计（%s），%s。"
+        "若未主动设置 AIMDO_XPU_NATIVE_CACHE_TRIM=0，请排查上述原因。"
+        % (detail, consequence)
+    )
+    return True
+
+
 def _release_linux_native_cache(device):
     """Retry a failed VBAR page only after native reserved storage was returned.
 
@@ -306,8 +336,9 @@ def _release_linux_native_cache(device):
 
         # 同_release_native_cache：M2 包装器会让 reserved==allocated，
         # 这里必须读 torch 原生字节口径。
-        raw = _xpu.torch_reserved_stats(device) if _xpu is not None else None
+        raw, reason = _xpu.torch_reserved_stats_reason(device)
         if raw is None:
+            _warn_torch_stats_unavailable(reason, "Linux 原生缓存回收已停用")
             return False
         reserved, allocated, _peak = raw
         control.publish_torch_cached_bytes(device, max(0, reserved - allocated))
@@ -364,17 +395,12 @@ def _release_native_cache(device):
 
         # 必须走 torch 原生口径：M2 包装器把 reserved 与 allocated 双双映射成
         # Book A 当前值，经它算出的 cached 恒为 0，L3 trim 会永不触发。
-        raw = _xpu.torch_reserved_stats(device) if _xpu is not None else None
+        raw, reason = _xpu.torch_reserved_stats_reason(device)
         if raw is None:
             # 这是热路径上的静默降级点：拿不到 torch 原生口径，L3 就永不
             # 触发，且不会有任何其他症状。所以必须留一条限流告警 ——
             # 否则实机出现「采样极慢 / vbar_fault 失败」时根本无从定位。
-            _warn_once(
-                "AIMDO XPU: 无法读取 torch 原生预留统计（torch_reserved_stats "
-                "返回 None），L3 原生缓存回收已停用。若未主动设置 "
-                "AIMDO_XPU_NATIVE_CACHE_TRIM=0，请检查 xpu.py 的 "
-                "_install_native_hook_wrappers 是否已安装。"
-            )
+            _warn_torch_stats_unavailable(reason, "L3 原生缓存回收已停用")
             return False
         reserved, allocated, _peak = raw
         cached = max(0, reserved - allocated)

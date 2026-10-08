@@ -263,22 +263,38 @@ def torch_reserved_stats(device=None):
     「采样变慢」，不会有任何报错。
 
     返回 (reserved, allocated, peak_reserved)；不可用时返回 None。
+
+    另见 torch_reserved_stats_reason()：需要区分失败原因时用它（排查方向
+    完全不同 ——「包装器未捕获」指向 M2 未装上，「调用抛异常」指向 torch 侧）。
+    """
+    return torch_reserved_stats_reason(device)[0]
+
+
+def torch_reserved_stats_reason(device=None):
+    """同 torch_reserved_stats，但额外返回失败原因，供告警定位。
+
+    返回 (stats, reason)；成功时 reason 为 None。失败原因互斥且排查方向不同：
+        "not_installed" —— M2 包装器没装上（_install_native_hook_wrappers 未跑）
+        "call_failed"   —— torch 侧memory_stats 抛异常（驱动/XPU 上下文问题）
+        "empty_stats"   —— 返回了空/假字典，torch 侧没给出可用读数
+    之所以要区分：这三者若都报同一句 WARNING，真机排查会被引向错误的
+    方向（最常见的是把「torch 侧异常」误当成「M2 没装」）。
     """
     fn = _torch_xpu_memory_stats_original
     if fn is None:
-        return None
+        return None, "not_installed"
     dev = torch.xpu.current_device() if device is None else device
     dev = dev if isinstance(dev, int) else getattr(dev, "index", dev)
     try:
         stats = fn(dev)
     except Exception:
-        return None
+        return None, "call_failed"
     if not stats:
-        return None
+        return None, "empty_stats"
     reserved = int(stats.get("reserved_bytes.all.current", 0))
     allocated = int(stats.get("allocated_bytes.all.current", 0))
     peak = int(stats.get("reserved_bytes.all.peak", 0))
-    return reserved, allocated, peak
+    return (reserved, allocated, peak), None
 
 
 def teardown_backend() -> None:

@@ -657,6 +657,35 @@ def get_xpu_allocator_memory_stats(device=None):
     return tuple(int(value) for value in stats)
 
 
+# 拿不到 torch 原生口径时的失败原因 -> 排查方向。三者若混成一句告警，
+# 真机排查会被引向错误方向（最常见的是把「torch 侧异常」误当成「M2 没装」）。
+_TORCH_STATS_REASON_TEXT = {
+    "not_installed": "M2 包装器未安装（_install_native_hook_wrappers 没跑过）",
+    "call_failed": "torch 原生 memory_stats 调用抛异常，请检查 XPU 上下文/驱动",
+    "empty_stats": "torch 原生 memory_stats 返回空读数",
+}
+_warned_torch_stats = set()
+
+
+def _warn_torch_stats_once(reason, consequence):
+    """拿不到 torch 原生口径时限流告警一次（进程内去重）。
+
+    与 model_vbar._warn_torch_stats_unavailable 刻意各有一份：本模块不能
+    import model_vbar（那是循环导入），而 model_vbar 也不能反过来依赖本模块
+    的实现细节。两份语义保持一致：同一原因只报一次，且都按原因区分。
+    """
+    detail = _TORCH_STATS_REASON_TEXT.get(reason, "未知原因(%r)" % (reason,))
+    key = (reason, consequence)
+    if key in _warned_torch_stats:
+        return
+    _warned_torch_stats.add(key)
+    logging.warning(
+        "comfy-aimdo XPU: 无法读取 torch 原生预留统计（%s），%s。"
+        "若未主动设置 AIMDO_XPU_NATIVE_CACHE_TRIM=0，请排查上述原因。",
+        detail, consequence,
+    )
+
+
 def get_xpu_torch_reserved_growth(device=None):
     """返回「torch 预留峰值超出当前预留的量」，单位字节；不可用时返回 0。
 
@@ -695,8 +724,13 @@ def get_xpu_torch_reserved_growth(device=None):
         # growth 会恒为 0，L2 边界预回收从此拿不到任何前瞻量。
         from . import xpu as _xpu
 
-        raw = _xpu.torch_reserved_stats(device) if _xpu is not None else None
+        raw, reason = _xpu.torch_reserved_stats_reason(device)
         if raw is None:
+            # 这里不能复用 model_vbar._warn_torch_stats_unavailable（会形成
+            # 循环导入），所以直接告警一次。L2 的失效同样静默：growth 恒 0
+            # 时 prepare_allocation 只是少一次预回收，不报错也不崩。
+            _warn_torch_stats_once(
+                reason, "L2 边界预回收拿不到前瞻量（anticipated_growth 恒为 0）")
             return 0
         reserved, _allocated, peak_reserved = raw
         # peak 低于 current 才是畸形：reset_peak_memory_stats() 把峰值清到了
@@ -770,8 +804,10 @@ def publish_torch_cached_bytes(device, cached_bytes=None):
             # 同上：经M2 包装器算出的差恒为 0，必须用 torch 原生口径兜底。
             from . import xpu as _xpu
 
-            raw = _xpu.torch_reserved_stats(device) if _xpu is not None else None
+            raw, reason = _xpu.torch_reserved_stats_reason(device)
             if raw is None:
+                _warn_torch_stats_once(
+                    reason, "无法上报 torch 缓存量，native钩子的 L3 判据将失准")
                 return None
             cached_bytes = max(0, raw[0] - raw[1])
         except Exception:
