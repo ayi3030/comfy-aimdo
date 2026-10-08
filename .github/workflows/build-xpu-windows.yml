@@ -50,14 +50,22 @@ env:
   COMMUNITY_FORK_REPO: xiangyuT/comfy-aimdo-xpu
   # Pinned, mutually-compatible native tree (src/ + src-win/ + src-xpu/).
   COMMUNITY_FORK_SHA: cc3729fc59eeab77bd4c8b28b80e49c9faa855d4
-  # Intel oneAPI Base Toolkit offline installer (DPC++/C++ compiler).
-  # Pinned to 2025.3.1: the community fork's own build-acceptance doc requires
-  # "oneAPI DPC++/C++ Compiler 2025.3 or compatible", and the SYCL device-LUID /
-  # node_mask extensions used by src-xpu/dispatch.cpp were only added in 2025.3.
-  # 2025.0 (the earlier pin) lacks these and fails the DLL compile. Only the DPC++
-  # component is installed (see ONEAPI_COMPONENTS); the rest is skipped.
-  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe
+  # Intel oneAPI Toolkit offline installer (DPC++/C++ compiler).
+  #
+  # WHY 2026.x AND NOT 2025.x: aimdo_xpu.dll links against the Intel SYCL
+  # runtime, whose DLL name is versioned per oneAPI release (sycl7=2024.x,
+  # sycl8=2025.x, sycl9=2026.x). src-xpu/dispatch.cpp receives torch's
+  # `sycl::queue*` directly, so the DLL's SYCL ABI MUST match the runtime that
+  # torch.xpu itself was built against. A 2025.3 build imports sycl8.dll, which
+  # does not exist next to torch 2.14.0+xpu (Arc B580 / 2026 Intel drivers
+  # bundle sycl9.dll) -- the DLL then fails to load with an opaque ctypes
+  # "Could not find module ... (or one of its dependencies)".
+  # The "Verify SYCL runtime ABI" step below turns that class of mistake into a
+  # loud CI failure instead of a broken artifact.
+  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/bae85ab1-cfcd-4251-8d42-a0c27949ea33/intel-oneapi-toolkit-2026.0.0.193_offline.exe
   ONEAPI_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
+  # SYCL runtime the built DLL MUST import (keep in sync with ONEAPI_INSTALLER_URL).
+  EXPECTED_SYCL_DLL: sycl9.dll
   LEVEL_ZERO_TAG: v1.34.0
 
 jobs:
@@ -101,12 +109,18 @@ jobs:
         shell: cmd
         run: |
           curl.exe --output %RUNNER_TEMP%\webimage.exe --url %ONEAPI_INSTALLER_URL% --retry 5 --retry-delay 5
-          %RUNNER_TEMP%\webimage.exe -s -x -f native\build\oneapi_extracted --log native\build\extract.log
-          del /q %RUNNER_TEMP%\webimage.exe
-          native\build\oneapi_extracted\bootstrapper.exe -s --action install --components=%ONEAPI_COMPONENTS% --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir=native\build
+          REM Preferred path (documented for the 2026 toolkit package): direct silent install.
+          %RUNNER_TEMP%\webimage.exe -s -a --silent --eula accept --components=%ONEAPI_COMPONENTS% -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log=native\build\oneapi_install.log
+          if errorlevel 1 (
+            echo direct silent install failed; falling back to extract + bootstrapper 1>&2
+            %RUNNER_TEMP%\webimage.exe -s -x -f native\build\oneapi_extracted --log native\build\extract.log
+            native\build\oneapi_extracted\bootstrapper.exe -s --action install --components=%ONEAPI_COMPONENTS% --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir=native\build
+          )
           if errorlevel 1 exit /b 1
+          del /q %RUNNER_TEMP%\webimage.exe
           if not exist "C:\Program Files (x86)\Intel\oneAPI\compiler" (
             echo oneAPI compiler dir missing after install 1>&2
+            dir /s /b "C:\Program Files (x86)\Intel\oneAPI" 2>&1 | findstr /i "compiler" | more
             exit /b 1
           )
           echo oneAPI installed at C:\Program Files (x86)\Intel\oneAPI
@@ -141,6 +155,57 @@ jobs:
         run: |
           ls -l native/comfy_aimdo/aimdo_xpu.dll
           echo "DLL size bytes: $(stat -c%s native/comfy_aimdo/aimdo_xpu.dll 2>/dev/null || wc -c < native/comfy_aimdo/aimdo_xpu.dll)"
+
+      - name: Verify SYCL runtime ABI matches torch.xpu (import-table gate)
+        shell: bash
+        env:
+          EXPECTED: ${{ env.EXPECTED_SYCL_DLL }}
+        run: |
+          # aimdo_xpu.dll must import the SAME versioned SYCL runtime that the
+          # target torch.*+xpu build uses, because dispatch.cpp exchanges
+          # sycl::queue objects with it. Building against a different oneAPI major
+          # yields a DLL that either fails to load on the user's machine or
+          # marshals sycl::queue across incompatible ABIs. Fail loudly here.
+          python - <<'PY'
+          import os, struct, sys
+          p = "native/comfy_aimdo/aimdo_xpu.dll"
+          want = os.environ["EXPECTED"].lower()
+          d = open(p, "rb").read()
+          e = struct.unpack_from("<I", d, 0x3C)[0]
+          if d[e:e+4] != b"PE\x00\x00":
+              sys.exit("not a PE: %s" % p)
+          opt = e + 4 + 20
+          magic = struct.unpack_from("<H", d, opt)[0]
+          imp_rva = struct.unpack_from("<I", d, opt + (120 if magic == 0x20B else 104))[0]
+          opt_size = struct.unpack_from("<H", d, e + 4 + 16)[0]
+          sec_off = e + 4 + 20 + opt_size
+          nsec = struct.unpack_from("<H", d, e + 4 + 2)[0]
+          def r2(rva):
+              for i in range(nsec):
+                  so = sec_off + i * 40
+                  vs = struct.unpack_from("<I", d, so + 8)[0]
+                  va = struct.unpack_from("<I", d, so + 12)[0]
+                  rp = struct.unpack_from("<I", d, so + 20)[0]
+                  if va <= rva < va + vs:
+                      return rp + (rva - va)
+              return rva
+          tbl = r2(imp_rva); dlls = []; i = 0
+          while struct.unpack_from("<I", d, tbl + i * 20)[0] != 0:
+              nm = struct.unpack_from("<I", d, tbl + i * 20 + 12)[0]; no = r2(nm)
+              dlls.append(d[no:d.index(b"\x00", no)].decode("utf-8", "replace")); i += 1
+          print("DLL imports (%d): %s" % (len(dlls), ", ".join(dlls)))
+          sycl = sorted(x for x in dlls if x.lower().startswith("sycl"))
+          print("SYCL runtime imports:", sycl or "(none)")
+          low = [x.lower() for x in dlls]
+          if want not in low:
+              sys.exit("ABI GATE FAILED: expected import %s (oneAPI 2026.x) so the DLL "
+                       "matches torch 2.14.0+xpu; got %s. Bump ONEAPI_INSTALLER_URL to a "
+                       "toolkit whose DPC++ runtime is %s." % (os.environ["EXPECTED"], sycl or "none", os.environ["EXPECTED"]))
+          stale = [x for x in low if x.startswith("sycl") and x != want]
+          if stale:
+              sys.exit("ABI GATE FAILED: DLL also imports stale SYCL runtime(s) %s" % stale)
+          print("ABI GATE PASSED: imports %s as required." % os.environ["EXPECTED"])
+          PY
 
       - name: Best-effort no-GPU hook unit test
         # Validates the UR/USM interception logic without a device. Non-fatal:

@@ -1,6 +1,8 @@
 import os
 import ctypes
 import platform
+import struct
+import sys
 from pathlib import Path
 import logging
 import importlib.util
@@ -24,6 +26,116 @@ _LOG_LEVELS = {
 def _native_log(level, message):
     logging.log(_LOG_LEVELS.get(level, logging.DEBUG),
                 message.decode("utf-8", errors="replace").rstrip())
+
+
+# --- SYCL runtime ABI diagnostics (Intel XPU) ---------------------------------
+#
+# aimdo_xpu.dll links against the Intel SYCL runtime, whose DLL name is versioned
+# per oneAPI release (sycl7 = 2024.x, sycl8 = 2025.x, sycl9 = 2026.x). Because
+# src-xpu/dispatch.cpp receives torch's `sycl::queue*` directly, the DLL's SYCL
+# ABI MUST match the runtime torch.xpu itself was built against. A mismatch is
+# not cosmetic: the DLL either fails to load (the required syclN.dll is absent)
+# or, worse, silently marshals sycl::queue objects across incompatible ABIs.
+#
+# These helpers turn the opaque ctypes "Could not find module ... (or one of its
+# dependencies)" into an actionable message naming the exact mismatch.
+
+_SYCL_ABI = {7: "2024.x", 8: "2025.x", 9: "2026.x", 10: "2027.x"}
+
+
+def _pe_import_dlls(dll_path):
+    """Return the DLL names in a PE file's import table, or [] if unparsable."""
+    try:
+        data = Path(dll_path).read_bytes()
+        if data[:2] != b"MZ":
+            return []
+        e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
+        if data[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+            return []
+        opt = e_lfanew + 4 + 20
+        magic = struct.unpack_from("<H", data, opt)[0]
+        imp_rva = struct.unpack_from("<I", data, opt + (120 if magic == 0x20B else 104))[0]
+        opt_size = struct.unpack_from("<H", data, e_lfanew + 4 + 16)[0]
+        sec_off = e_lfanew + 4 + 20 + opt_size
+        nsec = struct.unpack_from("<H", data, e_lfanew + 4 + 2)[0]
+
+        def rva_to_off(rva):
+            for i in range(nsec):
+                so = sec_off + i * 40
+                vsize = struct.unpack_from("<I", data, so + 8)[0]
+                vaddr = struct.unpack_from("<I", data, so + 12)[0]
+                rawptr = struct.unpack_from("<I", data, so + 20)[0]
+                if vaddr <= rva < vaddr + vsize:
+                    return rawptr + (rva - vaddr)
+            return rva
+
+        table = rva_to_off(imp_rva)
+        names = []
+        i = 0
+        while struct.unpack_from("<I", data, table + i * 20)[0] != 0:
+            name_rva = struct.unpack_from("<I", data, table + i * 20 + 12)[0]
+            off = rva_to_off(name_rva)
+            names.append(data[off:data.index(b"\x00", off)].decode("utf-8", "replace"))
+            i += 1
+        return names
+    except Exception:
+        return []
+
+
+def _available_sycl_runtimes():
+    """Map lowercased sycl*.dll filenames found on this system to their path."""
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    dirs.append(os.path.join(sys.prefix, "Library", "bin"))
+    try:
+        import torch  # noqa: PLC0415
+        torch_lib = Path(torch.__file__).parent / "lib"
+        dirs.append(str(torch_lib))
+        dirs.append(str(torch_lib.parent.parent / "Library" / "bin"))
+    except Exception:
+        pass
+    found = {}
+    for directory in dirs:
+        try:
+            for name in os.listdir(directory):
+                low = name.lower()
+                if low.startswith("sycl") and low.endswith(".dll"):
+                    found.setdefault(low, os.path.join(directory, name))
+        except Exception:
+            continue
+    return found
+
+
+def _sycl_abi_hint(dll_path):
+    """Explain a likely SYCL runtime ABI mismatch for the given DLL."""
+    required = [n for n in _pe_import_dlls(dll_path) if n.lower().startswith("sycl")]
+    if not required:
+        return []
+    available = _available_sycl_runtimes()
+    lines = []
+    for name in required:
+        if name.lower() in available:
+            continue
+        stem = name.lower()[len("sycl"):].split(".")[0]
+        want = _SYCL_ABI.get(int(stem), "unknown") if stem.isdigit() else "unknown"
+        lines.append(
+            f"  - requires {name} (Intel SYCL runtime, oneAPI {want}) "
+            f"but it was NOT found on this system"
+        )
+    if not lines:
+        return []
+    have = ", ".join(sorted(available)) or "(none)"
+    lines.append(f"  SYCL runtimes present on this system: {have}")
+    lines.append(
+        "  torch+xpu ships its own pinned SYCL runtime; aimdo_xpu.dll must be built "
+        "with the SAME oneAPI major version as that torch build, because "
+        "src-xpu/dispatch.cpp passes sycl::queue objects across that boundary."
+    )
+    lines.append(
+        "  Fix: rebuild aimdo_xpu.dll against the oneAPI version matching your "
+        "torch.*+xpu install (e.g. sycl9.dll = oneAPI 2026.x), or install the "
+        "matching Intel oneAPI DPC++ runtime."
+    )
+    return lines
 
 
 def detect_vendor():
@@ -99,6 +211,16 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
     except Exception as e:
         logging.info(f"comfy-aimdo failed to load: {e}")
+        if implementation == "xpu":
+            hints = _sycl_abi_hint(base_path / f"{impl}.{ext}")
+            if hints:
+                logging.info(
+                    "comfy-aimdo XPU: SYCL runtime ABI mismatch -- the bundled "
+                    "native backend cannot be loaded on this system:"
+                )
+                for line in hints:
+                    logging.info(line)
+                return False
         logging.info(f"NOTE: comfy-aimdo currently only supports Nvidia and AMD GPUs")
         return False
 
