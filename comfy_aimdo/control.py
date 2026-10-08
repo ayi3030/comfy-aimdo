@@ -1,4 +1,5 @@
 import os
+import atexit
 import ctypes
 import platform
 import struct
@@ -351,6 +352,7 @@ def init_devices(device_ids):
     headroom_array = (ctypes.c_uint64 * len(headrooms))(*headrooms)
     if lib.init(device_array, headroom_array, len(requested)):
         devctxs = [get_devctx(device_id) for device_id in requested]
+        _register_atexit()
         return True
 
     devctxs = []
@@ -400,10 +402,43 @@ def get_simple_vram_headroom():
         raise RuntimeError("comfy-aimdo is not initialized")
     return int(lib.get_simple_vram_headroom())
 
+_atexit_registered = False
+
+
+def _register_atexit():
+    """Run deinit() on interpreter shutdown (teardown-review F-06).
+
+    ComfyUI only ever calls init() and init_devices(); nothing in the host ever
+    calls deinit(). Without this hook the Level Zero / Unified Runtime detours
+    and the accounting table simply stay live until the OS reclaims the
+    process, which matters for the prestartup-injection and plugin-reload
+    setups the XPU backend targets.
+
+    Registered only on a successful init_devices(), and wrapped because
+    interpreter shutdown is an hostile place to raise: modules may already be
+    torn down and stdout may be gone.
+    """
+    global _atexit_registered
+    if _atexit_registered:
+        return
+    _atexit_registered = True
+
+    def _safe_deinit():
+        try:
+            if lib is not None:
+                deinit()
+        except Exception:
+            pass  # nothing useful can be reported this late
+
+    atexit.register(_safe_deinit)
+
+
 def deinit():
-    global lib, devctxs, _log_callback
+    global lib, devctxs, _log_callback, _atexit_registered
     if lib is None:
         return
+    # Allow the hook to be re-armed if the backend is loaded again.
+    _atexit_registered = False
 
     # Restore the torch.xpu entry points and reset the backend state BEFORE
     # releasing the native library. The AIMDO wrappers installed by
