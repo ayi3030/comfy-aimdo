@@ -225,6 +225,64 @@ def _install_native_hook_wrappers():
     torch.xpu.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
 
 
+def _publish_queues(lib) -> bool:
+    """Hand PyTorch's SYCL queue pointers to the native backend.
+
+    The native side keeps its device table (g_devices) in xpu_set_queues();
+    every CUDA-shaped shim entry point resolves its device through it. Without
+    this call the table stays empty and every dispatch fails with
+    "CUDA API FAILED (999): Level Zero or SYCL error".
+
+    This was a missing link in the community port: xpu_set_queues had its
+    ctypes signature declared in _declare_argtypes() but no caller anywhere in
+    the tree, so it was never invoked.
+
+    The queue pointer must come from the same oneAPI major as the DLL's import
+    table (dispatch.cpp receives sycl::queue* directly and reads it), which is
+    why this can only run inside a live torch process.
+    """
+    device_ids = []
+    queue_pointers = []
+
+    for index in range(torch.xpu.device_count()):
+        try:
+            stream = torch.xpu.current_stream(index)
+            queue = stream.sycl_queue
+        except Exception as error:  # pragma: no cover - torch internals
+            logging.error(
+                f"comfy-aimdo XPU: could not obtain the SYCL queue for device "
+                f"{index}: {error}"
+            )
+            return False
+        if not queue:
+            logging.error(
+                f"comfy-aimdo XPU: torch reported an empty SYCL queue for "
+                f"device {index}"
+            )
+            return False
+        device_ids.append(index)
+        queue_pointers.append(ctypes.c_uint64(int(queue)))
+
+    if not device_ids:
+        logging.error("comfy-aimdo XPU: torch reports no XPU devices")
+        return False
+
+    ids_array = (ctypes.c_int * len(device_ids))(*device_ids)
+    queues_array = (ctypes.c_uint64 * len(queue_pointers))(*queue_pointers)
+    if not lib.xpu_set_queues(ids_array, queues_array, len(device_ids)):
+        logging.error(
+            "comfy-aimdo XPU: the native backend rejected the SYCL queue "
+            "registry (ABI mismatch between torch and aimdo_xpu.dll?)"
+        )
+        return False
+
+    logging.info(
+        f"comfy-aimdo XPU: published {len(device_ids)} SYCL queue(s) to the "
+        f"native backend"
+    )
+    return True
+
+
 def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool = False) -> bool:
     """Wire up the XPU backend. Returns False (fail-closed) if unusable.
 
@@ -246,6 +304,16 @@ def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool
         return False
 
     _declare_argtypes(lib)
+
+    # Publish PyTorch's SYCL queues before anything else: the native dispatch
+    # table is resolved per call against this registry, so an empty table makes
+    # every allocation path fail. Must run before plat_init()/init_devices().
+    if not _publish_queues(lib):
+        logging.error(
+            "comfy-aimdo XPU: falling back to the native PyTorch XPU allocator "
+            "because the SYCL queue registry could not be published"
+        )
+        return False
 
     # Windows keeps PyTorch's native XPU caching allocator; we arbitrate
     # pressure via the UR-USM hook. The hook must be interposed (the
