@@ -3,19 +3,19 @@
 #
 # Why this shape:
 #   * The native XPU implementation (src-xpu/) lives in the community fork
-#     xiangyuT/comfy-aimdo-xpu, which keeps it mutually compatible with its own
-#     src/ + src-win/. Upstream comfy-aimdo has no src-xpu/ at all. To get a
-#     reliable first build we compile the fork's compatible native tree, then
-#     package ONLY the resulting DLL into THIS repo's clean Python integration
+#     xiangyuT/comfy-aimdo-xpu, kept mutually compatible with its own src/ +
+#     src-win/. Upstream comfy-aimdo has no src-xpu/ at all. To get a reliable
+#     first build we compile the fork's compatible native tree, then package
+#     ONLY the resulting DLL into THIS repo's clean Python integration
 #     (comfy_aimdo/ with our xpu.py + control.py/torch.py edits).
 #   * The DLL is torch-version agnostic at compile time (it talks to Level Zero
 #     and the Unified Runtime at runtime). The torch 2.14.0+xpu / bmg pin is a
 #     RUNTIME contract recorded in provider.json (M4), not baked into the DLL.
 #
-# Local-prerequisites note for contributors (not needed on CI):
-#   The Windows native backend needs VS Build Tools 2022 (x64), Intel oneAPI
-#   DPC++/C++ Compiler 2025.3, Level Zero headers, and Microsoft Detours. The
-#   scripts under scripts/ discover these automatically.
+# oneAPI install note: we use Intel's OWN offline-installer recipe (component
+# intel.oneapi.win.cpp-dpcpp-common, see oneapi-src/oneapi-ci) instead of a
+# third-party Marketplace action, so the build does not depend on an externally
+# hosted action ref that can disappear.
 
 name: Build AIMDO XPU native (Windows, oneAPI/DPC++)
 
@@ -42,12 +42,17 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 env:
   COMMUNITY_FORK_REPO: xiangyuT/comfy-aimdo-xpu
   # Pinned, mutually-compatible native tree (src/ + src-win/ + src-xpu/).
   COMMUNITY_FORK_SHA: cc3729fc59eeab77bd4c8b28b80e49c9faa855d4
-  ONEAPI_COMPONENT: intel.oneapi.win.cpp-compiler:2025.3.0
+  # Intel oneAPI Base Toolkit offline installer (DPC++/C++ compiler). Pinned to a
+  # released, stable URL so the build is reproducible. Only the DPC++ component
+  # is installed (see ONEAPI_COMPONENTS); the rest is skipped during install.
+  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b380d914-366b-4b77-a74a-05e3c38b3514/intel-oneapi-base-toolkit-2025.0.0.882_offline.exe
+  ONEAPI_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
   LEVEL_ZERO_TAG: v1.34.0
 
 jobs:
@@ -77,14 +82,19 @@ jobs:
           fetch-depth: 1
           path: native
 
-      - name: Install Intel oneAPI DPC++/C++ Compiler
-        # Standard oneAPI installer action. If it is unavailable, replace with
-        # the official offline installer or `intel/setup-oneapi`.
-        uses: anton-dolgikh/install-intel-oneapi@v1
-        with:
-          components: ${{ env.ONEAPI_COMPONENT }}
-          recommended: false
-          accept-eula: true
+      - name: Install Intel oneAPI DPC++/C++ Compiler (offline installer)
+        shell: cmd
+        run: |
+          curl.exe --output %RUNNER_TEMP%\webimage.exe --url %ONEAPI_INSTALLER_URL% --retry 5 --retry-delay 5
+          %RUNNER_TEMP%\webimage.exe -s -x -f native\build\oneapi_extracted --log native\build\extract.log
+          del /q %RUNNER_TEMP%\webimage.exe
+          native\build\oneapi_extracted\bootstrapper.exe -s --action install --components=%ONEAPI_COMPONENTS% --eula=accept -p=NEED_VS2017_INTEGRATION=0 -p=NEED_VS2019_INTEGRATION=0 -p=NEED_VS2022_INTEGRATION=0 --log-dir=native\build
+          if errorlevel 1 exit /b 1
+          if not exist "C:\Program Files (x86)\Intel\oneAPI\compiler" (
+            echo oneAPI compiler dir missing after install 1>&2
+            exit /b 1
+          )
+          echo oneAPI installed at C:\Program Files (x86)\Intel\oneAPI
 
       - name: Provision Level Zero headers
         shell: bash
