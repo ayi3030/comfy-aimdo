@@ -1,150 +1,262 @@
 # comfy-aimdo × Intel Arc（XPU）：三层存储卸载 + 免 flag 自动启用
 
-本目录是本机在 **Intel Arc B580** 上适配 comfy-aimdo（ComfyUI 的显存动态卸载器）的完整交付存档，包含补丁、可替换源码、设计与验收文档、自证脚本、原始日志与真实产出。
-
-- **目标机**：Intel Arc B580（驱动 `32.0.101.9034`）· torch `2.14.0+xpu` · ComfyUI `v0.39.0` · RAM ≈ 32 GiB · 模型位于 NVMe
-- **aimdo 基线**：`comfy_aimdo 0.5.6.dev28`（`__commit_id__ = gc2cf98fb9`）
-- **本目录对应分支**：`xpu-3tier-ram-cache`（基于 `ayi3030/comfy-aimdo` main `c2cf98f`）
-
-> ⚠️ 本目录内的日志与文档包含本机路径（`E:\aiwork\...`、`C:\Users\HE\...`）。已扫描确认**不含任何凭据**。
+> **这是一份可被自动化执行（含 AI 智能体）的安装说明。** 每一步都有明确命令与**判据**；遇到不符合判据的情况，按「排错」一节分支处理，不要跳过。
+>
+> 目标机：**Intel Arc 独显（已在 B580 上验证）** · Windows x64 · ComfyUI + `torch+xpu`
 
 ---
 
-## 一、目录里的两部分工作
+## 0. 最短路径（TL;DR）
 
-| 目录 | 主题 | 性质 |
-|---|---|---|
-| `docs/3tier-ram-cache/` + `patch/comfyui-3tier-ram-cache.patch` + `comfy/` | **三层存储卸载**（VRAM → RAM → 磁盘） | **ComfyUI 侧补丁**，本目录的主交付 |
-| `docs/optin-gate/` + `patch/{comfyui-intel-gate, PATCH_xpu_opt_in_alignment, aimdo-xpu}.patch` | **免 flag 自动启用 DynamicVRAM** | 上一阶段（含 comfy-aimdo 侧改动） |
+在 **ComfyUI 根目录**（即含 `main.py` 与 `python_embeded\` 的那一层）依次执行：
 
-⚠️ **两部分性质不同**：三层卸载改的是 **ComfyUI 源码**（不是 aimdo 包），所以以**补丁**形式交付；免 flag 那部分同时含 aimdo 侧改动（已进入 fork 的 `main`）。
+```bat
+:: ① 安装 XPU 版 aimdo 后端
+.\python_embeded\python.exe -m pip install --no-deps --force-reinstall "<本包>\wheel\comfy_aimdo-0.5.6.dev28-cp39-abi3-win_amd64.whl"
 
----
+:: ② 打 ComfyUI 三层卸载补丁
+.\python_embeded\python.exe -c "import comfy_aimdo,sys;print(comfy_aimdo.__version__, comfy_aimdo.__commit_id__)"
+git apply -p0 --directory=. "<本包>\patch\comfyui-3tier-ram-cache.patch"
 
-## 二、主交付：三层存储卸载
-
-### 2.1 问题
-Intel XPU 上 aimdo 的 **RAM 中间层被两处开关联手关掉**，权重只能「磁盘 → 显存」直通 —— 即用户观察到的 *"显存不足直接取硬盘，没有内存这一步"*。
-
-| 环节 | 位置 | 事实 |
-|---|---|---|
-| ① 无预算 | `comfy/model_management.py:1636-1644` | `if is_nvidia() or is_amd():` 内才赋 `MAX_PINNED_MEMORY` → **XPU 恒为 `-1`** |
-| ② 直接判否 | `model_management.py:757-759` | `free_registrations(): if MAX_PINNED_MEMORY <= 0: return False` |
-| ③ RAM pin 建不起来 | `comfy/pinned_memory.py:94-96` | `pin_memory()` 在此短路 |
-| ④ 退化为直通 | `comfy/ops.py:228-237` | pin 为 None → 「文件 → 显存」，跳过 RAM |
-| ⑤ C 侧也刻意关 | fork `src-xpu/dispatch.cpp:606-610` | `xpu_host_register()` 是 no-op（"XPU phase 1" 简化） |
-
-另有一个被掩盖的雷：`torch.cuda.cudart()` 在 XPU 构建下抛 `AssertionError`，只因 ②③ 短路得更早才没炸。
-
-### 2.2 设计原则
-> **「注册不可用」≠「缓存不可用」。**
-把**缓存预算**（字节，参与驱逐决策）与**注册状态**（能否被驱动固定，只影响拷贝性能）解耦。
-
-改 **4 文件 11 处**，全部 XPU 门控，**CUDA / ROCm / CPU / MPS 行为零变化**：
-
-- `model_management.py`：新增 `HOST_PIN_REGISTRATION_SUPPORTED`、独立计数器 `TOTAL_PIN_CACHE_MEMORY`、守卫 helper `host_register_pin`/`host_unregister_pin`、谓词 `xpu_ram_cache_enabled()`；`ensure_pin_registerable` 三分支；新增 XPU 预算分支
-- `pinned_memory.py`、`model_patcher.py`、`ops.py`：见 `docs/3tier-ram-cache/IMPL_3tier_ram_cache.md`
-
-### 2.3 真机验收结论（**通过，含 1 项判据不适用**）
-
-| 项 | 判定 | 实测 |
-|---|---|---|
-| 文件闸 | PASS | 4 个源码 md5 前后一致 |
-| 免 flag 门禁 | PASS | 三正齐 / 两负缺；新增 `Enabled XPU RAM cache 8178` |
-| **计数收敛** | PASS | RAM 缓存 `0 → 8177 MiB`（触顶）→ **触顶后回落**，峰后 drop **270 MiB**（门限 64）、`monotonic=False`；`TOTAL_PINNED_MEMORY` 恒 0（符合设计） |
-| **H1 文件→hostbuf** | PASS | 32 MiB **逐字节一致** |
-| **H2 hostbuf→XPU 显存** | PASS | 32 MiB 写入真机显存后**逐字节一致** → 直接证伪"返回 True 却没真写显存"的静默错误 |
-| 回滚 | PASS | `AIMDO_XPU_RAM_CACHE_GB=0` → `disk passthrough mode`，门禁不退化 |
-| 出图 / 出片 | PASS | PNG **375,001 B**；MP4 **1,120,626 B**（124 帧 / 24fps / 5.1667s，PyAV 校验） |
-| 同 seed 字节对照 | **INCONCLUSIVE** | 同配置两次运行的 sha256 本身就不同 ⇒ 基线不可复现、判据本机不成立；`on×off` 与基线同量级，未发现补丁归因差异。**该条想防的静默错误已由 H1/H2 直接覆盖** |
-
-完整数据见 `docs/3tier-ram-cache/VERIFY_3tier_ram_cache.md` 与 `logs/`。
-
----
-
-## 三、怎么用
-
-### 3.1 部署（二选一）
-```bash
-# 方式 A（推荐）：打补丁。在 ComfyUI 根目录执行，-p0
-cd <ComfyUI>
-git apply -p0 <此目录>/patch/comfyui-3tier-ram-cache.patch
-# 或： patch -p0 --binary -i <此目录>/patch/comfyui-3tier-ram-cache.patch
-
-# 方式 B：直接覆盖
-copy <此目录>\comfy\*.py  <ComfyUI>\comfy\
+:: ③ 校验（必须逐字通过）
+cd comfy && ..\python_embeded\python.exe -c "import hashlib;[print(hashlib.md5(open(f,'rb').read()).hexdigest(),f) for f in ['model_management.py','pinned_memory.py','model_patcher.py','ops.py']]"
 ```
-> ⚠️ 这 4 个文件是 **CRLF** 行尾，补丁内容行也是 CRLF（仅 diff 元数据行为 LF）。
-> **禁止**不带 `--binary` 的 `patch`；**禁止**把文件转成 LF。
 
-### 3.2 文件闸（唯一判据）
-```bash
-cd <ComfyUI>/comfy
-md5sum model_management.py pinned_memory.py model_patcher.py ops.py
+期望输出（必须逐字一致，否则**停下**，见「排错」）：
 ```
-必须逐字等于：
+0f7c056c0d45645f81b4256f3d56703a model_management.py
+c629da9c2089c7c75d3b53386f49fdc9 pinned_memory.py
+d523b099933dad858e3a9e73a567c730 model_patcher.py
+96090a01b13e1b81907152324b6430a0 ops.py
 ```
-0f7c056c0d45645f81b4256f3d56703a  model_management.py
-c629da9c2089c7c75d3b53386f49fdc9  pinned_memory.py
-d523b099933dad858e3a9e73a567c730  model_patcher.py
-96090a01b13e1b81907152324b6430a0  ops.py
-```
-补丁自身：`a517cfa1fc6f2be64fc0a47546494c54`（306 行）
 
-### 3.3 启动与期望日志
-```bash
-cd <portable 根>
-.\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --disable-auto-launch --port 8196
+然后直启（**不要**加任何 dynamic-vram 相关开关）：
+```bat
+.\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build
 ```
-> **不得**用 `run_intel_gpu.bat`；**不得**设 `AIMDO_XPU_ENABLED`（含 `=0`）；**不带** `--enable-dynamic-vram` —— 否则会短路门禁、掩盖真实状态。
 
-应看到：
+启动日志里必须出现这 4 行：
 ```
 [INFO] Enabled XPU RAM cache 8178 (default = min(ram*0.25, 24GiB))
 [INFO] comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend
 [INFO] comfy-aimdo XPU backend ready (mode=native_hook)
 [INFO] DynamicVRAM support detected and enabled
 ```
+且**不得**出现 `XPU backend not requested` 或 `No working comfy-aimdo install detected`。
 
-### 3.4 预算开关
-| 设置 | 效果 |
+---
+
+## 1. 这个包解决什么问题
+
+aimdo 是 ComfyUI 的显存动态卸载器，设计为三级存储：`显存(VRAM) ↔ 内存(RAM) ↔ 磁盘`。
+
+在 Intel XPU 上，**RAM 中间层被两处开关联手关掉了**，权重只能「磁盘 → 显存」直通 —— 即"显存不足直接取硬盘、没有内存这一步"。本包把 RAM 中间层打开：
+
+| 方向 | 修复后的行为 |
 |---|---|
-| 不设 `AIMDO_XPU_RAM_CACHE_GB` | 默认 `min(ram*0.25, 24GiB)`（本机 ≈ 8178 MiB） |
-| `AIMDO_XPU_RAM_CACHE_GB=<N>` | 显式指定 |
-| `AIMDO_XPU_RAM_CACHE_GB=0` | **关闭**，退回"磁盘直通"（可回滚） |
+| 取回（fault） | RAM 命中 → `RAM→VRAM`；未命中 → `磁盘→VRAM` 并按预算填充 RAM |
+| 回收（压力） | VRAM 驱逐后仍可从 RAM 恢复；RAM 预算耗尽才驱逐到磁盘 |
 
-### 3.5 回退
-- **软回退**：`AIMDO_XPU_RAM_CACHE_GB=0`（无需改文件）
-- **硬回退**：用 `patch/comfyui-3tier-ram-cache.patch` 反向应用，或还原你自己的原始 `comfy/*.py`
+**核心设计原则**：*「注册不可用」≠「缓存不可用」* —— 把**缓存预算**（参与驱逐）与**驱动注册状态**（只影响拷贝性能）解耦。
+
+### 包的两部分（**依赖关系不同，别混**）
+
+| 部分 | 内容 | 性质 |
+|---|---|---|
+| **A. aimdo XPU 后端** | `wheel/comfy_aimdo-0.5.6.dev28-*.whl`（内含 `aimdo_xpu.dll`） | **pip 包**。上游 PyPI 的 comfy-aimdo **不含 XPU 支持**，必须用本 wheel |
+| **B. ComfyUI 三层卸载补丁** | `patch/comfyui-3tier-ram-cache.patch` + `comfy/` | **ComfyUI 源码补丁**（4 文件 / 11 处），不是 pip 包 |
+
+> **只装 A 不装 B**：XPU 后端可用，但仍是"磁盘直通"（没有 RAM 中间层）。
+> **只装 B 不装 A**：补丁是空操作（XPU 后端没装，`HOST_PIN_REGISTRATION_SUPPORTED` 分支不参与）。
 
 ---
 
-## 四、自证脚本（`probes/`）
+## 2. 兼容性检查（装之前先跑这个）
 
-| 脚本 | 用途 |
+```bat
+.\python_embeded\python.exe -c "import torch,sys;print('py',sys.version.split()[0]);print('torch',torch.__version__);print('xpu_available',hasattr(torch,'xpu') and torch.xpu.is_available())"
+```
+
+| 判据 | 期望 | 不符合时怎么办 |
+|---|---|---|
+| Python | **≥ 3.9**（wheel 是 `cp39-abi3`） | 低于 3.9 无法使用本 wheel |
+| 平台 | **Windows x64** | 本 wheel **仅 Windows**；Linux 需用 fork 里的构建脚本自行编译 |
+| torch | 含 **XPU 支持**（如 `2.14.0+xpu`；`torch.xpu` 存在） | 若 `torch` 是 CUDA 构建，需先换装 Intel 的 `torch+xpu` |
+| `xpu.is_available()` | `True` | 若 `False`：检查是否为 Intel Arc 独显、驱动是否装了 Level Zero 运行时 |
+
+> **不是 Intel GPU 的机器**：可以装 B（补丁在 CUDA/ROCm/CPU 上**行为零变化**，已验证），但**不要**装 A（无意义）。此时启动日志里不会有 `Enabled XPU RAM cache`，属正常。
+
+---
+
+## 3. 安装
+
+### 3.1 定位 ComfyUI 根目录
+根目录 = 同时包含 `main.py`（或 `ComfyUI\main.py`）与 `python_embeded\` 的那一层。
+- Windows Portable：`<任意路径>\ComfyUI_windows_portable\`
+- 其他安装方式：用你的 ComfyUI 所在 Python 环境的解释器替换下文的 `.\python_embeded\python.exe`
+
+### 3.2 装 A —— aimdo XPU 后端
+```bat
+.\python_embeded\python.exe -m pip install --no-deps --force-reinstall "<本包>\wheel\comfy_aimdo-0.5.6.dev28-cp39-abi3-win_amd64.whl"
+.\python_embeded\python.exe -c "import comfy_aimdo;print(comfy_aimdo.__version__, comfy_aimdo.__commit_id__)"
+```
+**判据**：输出 `0.5.6.dev28 gc2cf98fb9`。
+若输出 `ModuleNotFoundError` 或版本号不是 dev28 → 见「排错」。
+
+> 装前请**关掉正在运行的 ComfyUI**（Windows 上 `.dll` 被占用会导致替换失败）。
+> 建议先备份：把 `python_embeded\Lib\site-packages\comfy_aimdo\` 整个目录拷到别处。
+
+### 3.3 装 B —— ComfyUI 三层卸载补丁
+```bat
+cd <ComfyUI 根>
+git apply -p0 "<本包>\patch\comfyui-3tier-ram-cache.patch"
+```
+若上一步报错（多半是 ComfyUI 版本不同），按顺序试：
+```bat
+git apply -p0 --3way "<本包>\patch\comfyui-3tier-ram-cache.patch"
+:: 或
+patch -p0 --binary -i "<本包>\patch\comfyui-3tier-ram-cache.patch"
+```
+**仍失败** → 说明你的 ComfyUI 与该补丁的基线版本不同，改为**手动落 11 处改动**，逐处清单见 `docs/3tier-ram-cache/IMPL_3tier_ram_cache.md`。宁可手动改，也不要硬套。
+
+> ⚠️ **行尾约束**：这 4 个文件是 **CRLF**，补丁内容行也是 CRLF（仅 diff 元数据行为 LF）。
+> **禁止**不带 `--binary` 的 `patch`；**禁止**把文件转成 LF。若不方便打补丁，可直接用 `comfy\` 里的 4 个文件覆盖（它们是同一份字节）。
+
+**判据**：见 §0 第 ③ 步的 md5 输出。**必须逐字一致**，否则不要启动。
+
+---
+
+## 4. 启动与验收
+
+```bat
+cd <ComfyUI 根>
+.\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build
+```
+
+> ⚠️ **不要**加 `--enable-dynamic-vram`；**不要**设环境变量 `AIMDO_XPU_ENABLED`（含 `=0`）；**不要**用任何"一键启动脚本"。
+> 这三个都会**短路门禁、掩盖真实状态**（其中 `--enable-dynamic-vram` 是修复**之前**的旧用法）。
+
+逐项验收：
+
+| # | 判据 | 不符时 |
+|---|---|---|
+| 1 | 日志出现 `Enabled XPU RAM cache <N>` | 说明 B 未生效 → 回到 §3.3 校验 md5 |
+| 2 | 出现 `published N SYCL queue(s)` / `backend ready (mode=native_hook)` / `DynamicVRAM support detected and enabled` | 出现 `XPU backend not requested` → A 未生效；出现 `No working comfy-aimdo install detected` → A 装错/装到了别的 Python |
+| 3 | 跑一个模型工作流，产物落盘且体积合理（图 >100 KB） | 见「排错」 |
+| 4 | 想确认 RAM 中间层**真的在回收**：观察 `Enabled XPU RAM cache` 的数值被反复触及（大模型场景下预算会被填满并触发驱逐） | 无 |
+
+### RAM 缓存预算怎么调
+| 环境变量 | 效果 |
 |---|---|
-| `yan_h1_ram_fill.py` / `yan_h2_ram_h2d.py` | H1 文件→hostbuf、H2 hostbuf→XPU 显存，**逐字节比对** |
-| `yan_s3b_run.py` / `s3b_*.csv` | 采样 RAM 缓存预算曲线（判"升顶后是否回落"） |
-| `yan_logcheck.py` | 门禁日志断言 |
-| `run_acceptance.py` / `selfcheck_prompts.py` / `PROMPT_*.json` | 端到端验收主门禁（SD1.5 出图 + MiniMax H3 出片） |
+| 不设 | 默认 `min(物理内存 × 0.25, 24GiB)` |
+| `AIMDO_XPU_RAM_CACHE_GB=<N>` | 显式指定 GiB |
+| `AIMDO_XPU_RAM_CACHE_GB=0` | **关闭**，退回"磁盘直通"（即改动前行为） |
 
-> ⚠️ **`probe_h1_hostbuf_fill.py` / `probe_h2_hostbuf_h2d.py` / `probe_s3b_launch.py` 已被真机实测证伪，请勿直接复用**（三个都是探针自身缺陷，非被测功能问题）。详见 `docs/3tier-ram-cache/PHASE5_PROBE_KIT.md` 顶部注记。
->
-> 实测经验：`comfy_aimdo` 的 `hostbuf_*` 依赖 `control.init_devices()`（`main.py:285`）；只调 `control.init()` 就碰 hostbuf 会 access violation。独立 harness 必须走完整初始化路径。
+> 预算吃的是**系统内存**。若机器内存紧张（例如同时跑别的任务），把它调小。
 
 ---
 
-## 五、已知边界（避免误读）
+## 5. 回滚
 
-- **XPU 采样非确定性**：本机 XPU 采样存在与 aimdo 无关的非确定性，未定位根因，**超出本补丁范围**。
-- **H2D 是同步的**：`dispatch.cpp:814` 用 `queue->memcpy(...).wait_and_throw()`，磁盘读与 H2D 无重叠。
-- **宿主内存非 pinned**：`xpu_host_alloc` 用 pageable `std::malloc`（`dispatch.cpp:593-597`），因改 pinned 曾致 `DEVICE_LOST`。故 RAM 层是"pageable 宿主缓存"，拷贝加速有限。
-- **H3 的 MP4 只含视频轨**，音频轨未入容器（muxer 层面，与本补丁无关）。
+| 层级 | 动作 |
+|---|---|
+| **软回滚（首选）** | 启动前设 `AIMDO_XPU_RAM_CACHE_GB=0` → 退回"磁盘直通"，**无需改文件** |
+| **B 回滚** | `git apply -R -p0 "<本包>\patch\comfyui-3tier-ram-cache.patch"`，或还原你自己的原始 `comfy/*.py` |
+| **A 回滚** | `.\python_embeded\python.exe -m pip uninstall comfy-aimdo`，或还原 §3.2 备份的 `site-packages\comfy_aimdo\` |
 
 ---
 
-## 六、许可证与归属
+## 6. 排错
 
-`comfy/` 下的 4 个文件是 **ComfyUI**（`comfyanonymous/ComfyUI`，GPL-3.0）的**修改副本**，此处仅为便于取用而附带；权威来源以上游仓库为准，**规范交付物是 `patch/comfyui-3tier-ram-cache.patch`**。
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| `ModuleNotFoundError: comfy_aimdo` | 装到了别的 Python | 用 **ComfyUI 用的那个**解释器重装（portable 下是 `python_embeded\python.exe`） |
+| 版本号不是 `0.5.6.dev28` | 旧版仍在 | 加 `--force-reinstall`，并确认无并存 dist-info |
+| `pip` 报 dll 被占用 | ComfyUI 还在运行 | 关掉进程（`taskkill /F /IM python.exe`）后重试 |
+| 日志出现 `XPU backend not requested` | A 未生效，或设了 `AIMDO_XPU_ENABLED=0` | 检查环境变量；重装 A |
+| 日志出现 `No working comfy-aimdo install detected` | A 装错位置 / dll 缺失 | 确认 `site-packages\comfy_aimdo\aimdo_xpu.dll` 存在 |
+| 没有 `Enabled XPU RAM cache` 这一行 | B 未生效 | 校验 `model_management.py` 的 md5 |
+| `git apply` 失败 | ComfyUI 版本与补丁基线不同 | 见 §3.3 的 `--3way` / 手动落 11 处 |
+| 大量权重反复读盘、速度慢 | 属正常（磁盘是权威 backing store） | 调大 `AIMDO_XPU_RAM_CACHE_GB` 可减少回读 |
+| 报 `AssertionError: Torch not compiled with CUDA enabled` | 有代码直接调了 `torch.cuda.cudart()` | 说明 B 未完整应用（4 文件必须**全部**替换） |
 
-XPU 原生后端实现位于 `ayi3030/comfy-aimdo` 的 `src-xpu/`（上游 comfy-aimdo 无此目录）。各文件沿用其原许可证。
+---
+
+## 7. 已知边界（请与结论同读）
+
+- **同 seed 结果并非逐字节可复现**：本机 XPU 采样存在与 aimdo 无关的非确定性（已记录、未定位根因，超出本补丁范围）。因此不能用"两次出图哈希相同"作为验收判据。
+- **H2D 是同步拷贝**：`queue->memcpy(...).wait_and_throw()`，磁盘读与显存拷贝无重叠（性能项，未做）。
+- **宿主内存非 pinned**：aimdo 的 XPU 宿主分配用 pageable `malloc`（改 pinned 曾致 `DEVICE_LOST`）。因此 RAM 层的拷贝加速有限。
+- **wheel 仅 Windows x64**（`cp39-abi3-win_amd64`）。Linux 需自行编译。
+- **补丁基线为 ComfyUI v0.39.0**；其他版本可能需要手动适配。
+
+---
+
+## 8. 目录结构
+
+```
+xpu-3tier-ram-cache/
+├── README.md              ← 本文件（安装说明）
+├── SHA256SUMS.txt         ← 全包校验和（sha256sum -c 可验）
+├── wheel/                 ← A：aimdo XPU 后端（pip 安装）
+├── patch/                 ← B：补丁（4 个）
+├── comfy/                 ← B：4 个可直接覆盖的 ComfyUI 文件
+├── docs/3tier-ram-cache/  ← 本主题：设计 / 实现 / 独立审查 / 真机验收 / 调研 / 探针说明
+├── docs/optin-gate/       ← 另一主题存档：免 flag 自动启用 DynamicVRAM
+├── probes/                ← 自证脚本与验收工装
+├── logs/                  ← 原始日志与采样 CSV（真实证据）
+└── artifacts/             ← 真实产出（MiniMax H3 出片 + SD1.5 出图）
+```
+
+**校验全包**：
+```bat
+cd xpu-3tier-ram-cache
+sha256sum -c SHA256SUMS.txt
+```
+
+关键件校验和：
+```
+8f2aba921cc24a420bf1225dde6594b6a4cd20fc71848dd77eb20717982ee3f7  wheel/comfy_aimdo-0.5.6.dev28-cp39-abi3-win_amd64.whl
+a517cfa1fc6f2be64fc0a47546494c54  patch/comfyui-3tier-ram-cache.patch   (306 行)
+0f7c056c0d45645f81b4256f3d56703a  comfy/model_management.py
+c629da9c2089c7c75d3b53386f49fdc9  comfy/pinned_memory.py
+d523b099933dad858e3a9e73a567c730  comfy/model_patcher.py
+96090a01b13e1b81907152324b6430a0  comfy/ops.py
+```
+
+---
+
+## 9. 真机验收结论（Intel Arc B580 / torch 2.14.0+xpu / ComfyUI v0.39.0）
+
+| 项 | 判定 | 实测 |
+|---|---|---|
+| 免 flag 门禁 | PASS | 三正齐 / 两负缺；`Enabled XPU RAM cache 8178` |
+| RAM 中间层启用 | PASS | 缓存 `0 → 8177 MiB` 触顶，**触顶后回落**（峰后 drop 270 MiB，`monotonic=False`）→ 证明**可回收** |
+| 文件→hostbuf | PASS | 32 MiB **逐字节一致** |
+| hostbuf→显存 | PASS | 32 MiB 写入真机显存后**逐字节一致**（排除"拷了却没真写"的静默错误） |
+| 出图 / 出片 | PASS | PNG 375,001 B；MP4 1,120,626 B（h264 864×480，124 帧 @24fps） |
+| 回滚 | PASS | `AIMDO_XPU_RAM_CACHE_GB=0` → 退回直通且门禁不退化 |
+
+细节见 `docs/3tier-ram-cache/VERIFY_3tier_ram_cache.md`、`docs/3tier-ram-cache/DELIVERY_3tier_ram_cache.md`。
+
+---
+
+## 10. 许可证与来源
+
+- **ComfyUI**（`comfyanonymous/ComfyUI`）为 **GPL-3.0**。`comfy/` 下 4 个文件是其**修改副本**，此处仅为便于取用而附带；**规范交付物是 `patch/comfyui-3tier-ram-cache.patch`**。
+- **comfy-aimdo** 为 **GPL-3.0**（作者 rattus）。`wheel/` 内的二进制 wheel 由本仓库（`src/` + `src-xpu/`）构建，**对应源码即本仓库**，满足 GPL-3.0 的分发要求。XPU 原生后端位于 `src-xpu/`（上游 comfy-aimdo 无此目录）。
+
+---
+
+## 附：两部分工作的详细文档索引
+
+**A/B 三层存储卸载（本包主题）**
+- `docs/3tier-ram-cache/PHASE2_3tier_design.md` —— 设计方案（改动清单 `文件→位置→现状→改动→风险`）
+- `docs/3tier-ram-cache/IMPL_3tier_ram_cache.md` —— 逐处实现（含 11 处改动的前后原文、md5、行尾与部署约束）
+- `docs/3tier-ram-cache/REVIEW_3tier_ram_cache.md` —— 独立审查（R1–R6 + 两轮复核）
+- `docs/3tier-ram-cache/VERIFY_3tier_ram_cache.md` —— 真机验收（含各项证据与 1 项判据不适用的说明）
+- `docs/3tier-ram-cache/RESEARCH_3tier_architecture_audit.md`、`RESEARCH_xpu_3tier_capability.md` —— 底层调研
+- `docs/3tier-ram-cache/PHASE5_PROBE_KIT.md` —— 探针说明（**含已证伪的 3 个脚本，勿直接复用**）
+
+**免 flag 自动启用 DynamicVRAM（另一主题存档）**
+见 `docs/optin-gate/`，入口 `docs/optin-gate/交付说明.md`。
