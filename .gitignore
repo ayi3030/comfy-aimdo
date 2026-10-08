@@ -8,3 +8,7 @@ build/
 dist/
 *.egg-info/
 .venv/
+
+# Python 缓存（pre-push 审查钩子的 py_compile 会产生）
+__pycache__/
+*.py[cod]
