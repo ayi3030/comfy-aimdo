@@ -1,0 +1,18 @@
+LIBRARY ze_loader.dll
+EXPORTS
+    zeInit
+    zePhysicalMemCreate
+    zePhysicalMemDestroy
+    zeVirtualMemFree
+    zeVirtualMemMap
+    zeVirtualMemQueryPageSize
+    zeVirtualMemReserve
+    zeVirtualMemUnmap
+    zelDisableTracingLayer
+    zelEnableTracingLayer
+    zelTracerCreate
+    zelTracerDestroy
+    zelTracerMemAllocDeviceRegisterCallback
+    zelTracerMemFreeExtRegisterCallback
+    zelTracerMemFreeRegisterCallback
+    zelTracerSetEnabled

@@ -56,10 +56,12 @@ def detect_vendor():
         return "cuda"
     if '+rocm' in version:
         return "rocm"
+    if '+xpu' in version:
+        return "xpu"
     return None
 
 
-def init(implementation: str | None = None, simple_vram_headroom: int | None = None, nvml_pressure: bool = False):
+def init(implementation: str | None = None, simple_vram_headroom: int | None = None, nvml_pressure: bool = False, xpu_allocator_mode: str | None = None):
     global lib, _log_callback
 
     if lib is not None:
@@ -78,6 +80,7 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     impl = {
         "cuda": "aimdo",
         "rocm": "aimdo_rocm",
+        "xpu": "aimdo_xpu",
     }[implementation]
 
     try:
@@ -151,6 +154,18 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     if simple_vram_headroom is not None:
         lib.set_simple_vram_headroom(int(simple_vram_headroom))
     lib.set_nvml_pressure(bool(nvml_pressure))
+
+    if implementation == "xpu":
+        # Delegate all XPU-specific wiring (argtypes, allocator install,
+        # capability gate) to the dedicated backend. It returns False when the
+        # AIMDO XPU runtime or the UR-USM hook is unusable, which makes
+        # ComfyUI transparently keep PyTorch's native XPU allocator.
+        from . import xpu as _xpu_backend
+        if not _xpu_backend.setup_backend(
+            lib, xpu_allocator_mode, system,
+            explicitly_requested=implementation_was_explicit,
+        ):
+            return False
 
     return True
 

@@ -1,0 +1,154 @@
+# Build the AIMDO XPU native backend (aimdo_xpu.dll) on Windows and package it
+# into the clean comfy_aimdo wheel.
+#
+# Why this shape:
+#   * The native XPU implementation (src-xpu/) lives in the community fork
+#     xiangyuT/comfy-aimdo-xpu, which keeps it mutually compatible with its own
+#     src/ + src-win/. Upstream comfy-aimdo has no src-xpu/ at all. To get a
+#     reliable first build we compile the fork's compatible native tree, then
+#     package ONLY the resulting DLL into THIS repo's clean Python integration
+#     (comfy_aimdo/ with our xpu.py + control.py/torch.py edits).
+#   * The DLL is torch-version agnostic at compile time (it talks to Level Zero
+#     and the Unified Runtime at runtime). The torch 2.14.0+xpu / bmg pin is a
+#     RUNTIME contract recorded in provider.json (M4), not baked into the DLL.
+#
+# Local-prerequisites note for contributors (not needed on CI):
+#   The Windows native backend needs VS Build Tools 2022 (x64), Intel oneAPI
+#   DPC++/C++ Compiler 2025.3, Level Zero headers, and Microsoft Detours. The
+#   scripts under scripts/ discover these automatically.
+
+name: Build AIMDO XPU native (Windows, oneAPI/DPC++)
+
+on:
+  workflow_dispatch:
+    inputs:
+      xpu_target:
+        description: >-
+          XPU silicon target for artifact labeling only (bmg / ptl-h / dg2).
+          Does NOT change the DLL build.
+        required: false
+        default: "bmg"
+      torch_xpu_version:
+        description: >-
+          Target torch+XPU runtime version, recorded in the artifact metadata.
+          The hard pin lands in provider.json at M4.
+        required: false
+        default: "2.14.0+xpu"
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+env:
+  COMMUNITY_FORK_REPO: xiangyuT/comfy-aimdo-xpu
+  # Pinned, mutually-compatible native tree (src/ + src-win/ + src-xpu/).
+  COMMUNITY_FORK_SHA: cc3729fc59eeab77bd4c8b28b80e49c9faa855d4
+  ONEAPI_COMPONENT: intel.oneapi.win.cpp-compiler:2025.3.0
+  LEVEL_ZERO_TAG: v1.34.0
+
+jobs:
+  build-xpu-windows:
+    name: aimdo_xpu.dll + wheel (win2022 / oneAPI DPC++)
+    runs-on: windows-2022
+    steps:
+      - name: Checkout clean Python integration (this repo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          path: aimdo
+
+      - name: Fetch upstream tags for setuptools-scm version
+        shell: bash
+        working-directory: aimdo
+        run: |
+          git fetch --tags --force https://github.com/Comfy-Org/comfy-aimdo.git || true
+          git fetch --tags --force origin || true
+          echo "Resolved version:"; git describe --tags || echo "(no tag; setuptools-scm falls back to 0.0+<sha>)"
+
+      - name: Checkout community fork native tree (compatible src/ + src-win/ + src-xpu/)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.COMMUNITY_FORK_REPO }}
+          ref: ${{ env.COMMUNITY_FORK_SHA }}
+          fetch-depth: 1
+          path: native
+
+      - name: Install Intel oneAPI DPC++/C++ Compiler
+        # Standard oneAPI installer action. If it is unavailable, replace with
+        # the official offline installer or `intel/setup-oneapi`.
+        uses: anton-dolgikh/install-intel-oneapi@v1
+        with:
+          components: ${{ env.ONEAPI_COMPONENT }}
+          recommended: false
+          accept-eula: true
+
+      - name: Provision Level Zero headers
+        shell: bash
+        run: |
+          git clone --depth 1 --branch "$LEVEL_ZERO_TAG" \
+            https://github.com/oneapi-src/level-zero.git native/build/level-zero-src
+          test -f native/build/level-zero-src/include/ze_api.h \
+            && echo "ze_api.h present" \
+            || { echo "ze_api.h MISSING"; exit 1; }
+
+      - name: Provision Microsoft Detours
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/microsoft/Detours.git native/build/detours-src
+          test -f native/build/detours-src/src/detours.cpp \
+            && echo "Detours source present" \
+            || { echo "Detours source MISSING"; exit 1; }
+
+      - name: Build Detours
+        shell: cmd
+        run: cmd /d /c native\scripts\build-windows-detours.cmd
+
+      - name: Build aimdo_xpu.dll
+        shell: cmd
+        run: cmd /d /c native\scripts\build-windows-xpu.cmd
+
+      - name: Verify DLL produced
+        shell: bash
+        run: |
+          ls -l native/comfy_aimdo/aimdo_xpu.dll
+          echo "DLL size bytes: $(stat -c%s native/comfy_aimdo/aimdo_xpu.dll 2>/dev/null || wc -c < native/comfy_aimdo/aimdo_xpu.dll)"
+
+      - name: Best-effort no-GPU hook unit test
+        # Validates the UR/USM interception logic without a device. Non-fatal:
+        # surfaces signal but never blocks the artifact.
+        shell: cmd
+        continue-on-error: true
+        run: cmd /d /c native\scripts\test-windows-xpu-hook.cmd
+
+      - name: Stage DLL into clean Python package
+        shell: bash
+        run: |
+          mkdir -p aimdo/comfy_aimdo
+          cp native/comfy_aimdo/aimdo_xpu.dll aimdo/comfy_aimdo/aimdo_xpu.dll
+          ls -l aimdo/comfy_aimdo/aimdo_xpu.dll
+
+      - name: Build wheel (setuptools-scm derives version from upstream tags)
+        shell: bash
+        working-directory: aimdo
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir wheelhouse
+          ls -l wheelhouse
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: comfy-aimdo-xpu-wheel
+          path: aimdo/wheelhouse/*.whl
+          if-no-files-found: error
+
+      - name: Upload standalone DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: aimdo_xpu.dll
+          path: native/comfy_aimdo/aimdo_xpu.dll
+          if-no-files-found: error
