@@ -73,7 +73,10 @@ class XPUPluggableAllocator(torch.xpu.memory.XPUPluggableAllocator):
         self._allocator = torch._C._xpu_customAllocator(alloc_fn, free_fn)
 
 def get_torch_allocator():
-    if control.implementation == "xpu":
+    # getattr with a default rather than a bare attribute access: a missing
+    # module attribute would raise AttributeError here, and the only caller
+    # swallows exceptions -- turning a wiring bug into a silent fallback.
+    if getattr(control, "implementation", None) == "xpu":
         if control.lib is None:
             return None
         if (not hasattr(control.lib, "xpu_alloc_fn")

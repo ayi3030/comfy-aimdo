@@ -11,6 +11,13 @@ lib = None
 devctxs = []
 _log_callback = None
 
+# Backend actually in use ("cuda" / "rocm" / "xpu"), resolved by init().
+# This must be module-level: torch.get_torch_allocator() and xpu.py read it
+# through the module. When it lived only as an init() local, every such read
+# raised AttributeError -- which xpu.py swallowed, silently degrading the
+# "global" allocator mode instead of reporting the failure.
+implementation = None
+
 _LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
 _LOG_LEVELS = {
     1: logging.CRITICAL,
@@ -175,6 +182,9 @@ def detect_vendor():
 
 def init(implementation: str | None = None, simple_vram_headroom: int | None = None, nvml_pressure: bool = False, xpu_allocator_mode: str | None = None):
     global lib, _log_callback
+    # NOTE: `implementation` is intentionally absent here -- it is a parameter
+    # of this function, and Python forbids a parameter from also being declared
+    # global. It is published to the module via globals() further down.
 
     if lib is not None:
         if simple_vram_headroom is not None:
@@ -194,6 +204,11 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     if implementation is None:
         logging.warning("Could not autodetect AIMDO implementation, assuming Nvidia")
         implementation = "cuda"
+
+    # Publish the resolved backend at module scope. The parameter shadows the
+    # module-level name inside this function, so globals() is required for the
+    # assignment to actually stick -- torch.py and xpu.py read it off the module.
+    globals()["implementation"] = implementation
 
     impl = {
         "cuda": "aimdo",
