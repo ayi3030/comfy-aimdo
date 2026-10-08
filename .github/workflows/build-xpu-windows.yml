@@ -48,10 +48,13 @@ env:
   COMMUNITY_FORK_REPO: xiangyuT/comfy-aimdo-xpu
   # Pinned, mutually-compatible native tree (src/ + src-win/ + src-xpu/).
   COMMUNITY_FORK_SHA: cc3729fc59eeab77bd4c8b28b80e49c9faa855d4
-  # Intel oneAPI Base Toolkit offline installer (DPC++/C++ compiler). Pinned to a
-  # released, stable URL so the build is reproducible. Only the DPC++ component
-  # is installed (see ONEAPI_COMPONENTS); the rest is skipped during install.
-  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/b380d914-366b-4b77-a74a-05e3c38b3514/intel-oneapi-base-toolkit-2025.0.0.882_offline.exe
+  # Intel oneAPI Base Toolkit offline installer (DPC++/C++ compiler).
+  # Pinned to 2025.3.1: the community fork's own build-acceptance doc requires
+  # "oneAPI DPC++/C++ Compiler 2025.3 or compatible", and the SYCL device-LUID /
+  # node_mask extensions used by src-xpu/dispatch.cpp were only added in 2025.3.
+  # 2025.0 (the earlier pin) lacks these and fails the DLL compile. Only the DPC++
+  # component is installed (see ONEAPI_COMPONENTS); the rest is skipped.
+  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/076e961b-2c29-48a8-9203-c96f00e7051b/intel-oneapi-base-toolkit-2025.3.1.35_offline.exe
   ONEAPI_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
   LEVEL_ZERO_TAG: v1.34.0
 
