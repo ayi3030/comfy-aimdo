@@ -217,6 +217,9 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         "xpu": "aimdo_xpu",
     }[implementation]
 
+    if implementation == "xpu":
+        _preload_torch_runtime()
+
     try:
         base_path = Path(__file__).parent.resolve()
         system = platform.system()
@@ -403,6 +406,46 @@ def get_simple_vram_headroom():
     return int(lib.get_simple_vram_headroom())
 
 _atexit_registered = False
+
+
+def _preload_torch_runtime():
+    """Make aimdo_xpu.dll loadable before torch is imported.
+
+    aimdo_xpu.dll imports the SYCL runtime directly (syclN.dll), and Windows
+    resolves a DLL's imports against modules already present in the process.
+    ComfyUI calls comfy_aimdo.control.init() from main.py long before it
+    imports torch, so on a real launch the load fails with
+
+        Could not find module 'aimdo_xpu.dll' (or one of its dependencies)
+
+    even though the file sits right there -- measured on Arc B580, this is
+    exactly what stock ComfyUI did before this was added.
+
+    Only `import torch` reliably fixes it. Loading torch/lib/torch_xpu.dll on
+    its own was measured and does NOT work: it depends on the same oneAPI
+    runtime that is not set up yet, so the load fails and aimdo_xpu.dll stays
+    unloadable. Importing torch performs that runtime setup.
+
+    Consequence: ComfyUI logs, at main.py:249,
+        WARNING: Potential Error in code: Torch already imported,
+                 torch should never be imported before this point.
+    That warning is advisory, and the alternative is the XPU backend silently
+    not loading at all. torch is imported by ComfyUI a few lines later anyway
+    and the module is cached, so this only moves the import earlier; no XPU
+    context is created and nothing is allocated until init_devices().
+
+    Failure is silent: if torch is genuinely unavailable, the CDLL() call
+    immediately after reports it with full detail.
+    """
+    if "torch" in sys.modules:
+        return  # already imported; the runtime is present
+    try:
+        import torch  # noqa: F401
+    except Exception as _error:
+        logging.info(
+            f"comfy-aimdo XPU: could not preload the torch runtime "
+            f"({_error!r}); the SYCL runtime may be missing"
+        )
 
 
 def _register_atexit():
