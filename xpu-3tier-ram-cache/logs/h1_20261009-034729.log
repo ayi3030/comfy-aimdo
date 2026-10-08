@@ -1,0 +1,6 @@
+== H1 32MiB 20261009-034729 ==
+H1_ENV: init_devices([0]) -> True
+H1_ENV: control.lib=set host_buffer.lib=set
+H1_PAYLOAD: 33554432B sha256=f7c98a9302904b06d67845ffa2313faab909f164d13b38cdd4cab257ffe0215c
+H1_OK (size=33554432B, hostbuf.size=33554432B) -> file->hostbuf(RAM) writes exact bytes
+H1_EXIT=0

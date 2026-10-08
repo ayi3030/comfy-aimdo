@@ -1,0 +1,59 @@
+== P3 acceptance run 20261009-015132  (port 8196) ==
+>> deployed _version.py: version=0.5.6.dev28 commit=gc2cf98fb9
+>> launching: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --disable-auto-launch --port 8196
+>> ready in 23.2s via /system_stats
+>> runtime log reports: comfy-aimdo version=0.5.6.dev28
+   deploy guard: version/commit MATCH expected
+
+== gate markers ==
+  [PASS] required:  'comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend'
+  [PASS] required:  'comfy-aimdo XPU backend ready (mode=native_hook)'
+  [PASS] required:  'DynamicVRAM support detected and enabled'
+  [PASS] forbidden: 'XPU backend not requested' present=False
+  [PASS] forbidden: 'No working comfy-aimdo install detected' present=False
+   gate markers: ALL GREEN
+>> preflight PROMPT_small.json vs live /object_info:
+   [PASS] node 1:CheckpointLoaderSimple
+   [PASS] node 2:CLIPTextEncode
+   [PASS] node 3:CLIPTextEncode
+   [PASS] node 4:EmptyLatentImage
+   [PASS] node 5:KSampler
+   [PASS] node 6:VAEDecode
+   [PASS] node 7:SaveImage
+>> preflight PROMPT_h3.json vs live /object_info:
+   [PASS] node 1:UNETLoader
+   [PASS] node 2:CLIPLoader
+   [PASS] node 3:VAELoader
+   [PASS] node 4:VAELoader
+   [PASS] node 5:MiniMaxH3ImageToVideo
+   [PASS] node 6:RandomNoise
+   [PASS] node 7:KSamplerSelect
+   [PASS] node 8:BasicScheduler
+   [PASS] node 9:BasicGuider
+   [PASS] node 10:SamplerCustomAdvanced
+   [PASS] node 11:VAEDecode
+   [PASS] node 12:VAEDecodeAudio
+   [PASS] node 13:CreateVideo
+   [PASS] node 14:SaveVideo
+
+>> submitting small (PROMPT_small.json) timeout=300s
+>> small: prompt_id=9ab0e2e7-3153-4498-bdbc-3bdfdd23bbf4
+>> small: history -> C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\acc_20261009-015132_small_hist.json
+>> small: status=success
+>> small: artifact check (need a image >= 102,400B):
+  [PASS] image       375,016B exists=True  E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\output\p3_small\p3_small_00001_.png
+
+>> submitting h3 (PROMPT_h3.json) timeout=1800s
+!! h3: submit failed: HTTP 400: {"error": {"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation", "details": "", "extra_info": {}}, "node_errors": {"3": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "vae_name: 'MiniMax H3/minimax_h3_video_vae_fp16.safetensors' not in ['MiniMax H3\\\\minimax_h3_audio_vae_fp32.safetensors', 'MiniMax H3\\\\minimax_h3_video_vae_fp16.safetensors', 'Z-Image\\\\ae.safetensors', 'taesdxl', 'taef1', 'taesd', 'pixel_space']", "extra_info": {"input_name": "vae_name", "input_config": [["MiniMax H3\\minimax_h3_audio_vae_fp32.safetensors", "MiniMax H3\\minimax_h3_video_vae_fp16.safetensors", "Z-Image\\ae.safetensors", "taesdxl", "taef1", "taesd", "pixel_space"], {}], "received_value": "MiniMax H3/minimax_h3_video_vae_fp16.safetensors"}}], "dependent_outputs": ["14"], "class_type": "VAELoader"}, "2": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "clip_name: 'MiniMax H3/qwen3vl_32b_minimax_h3_int4_convrot.safetensors' not in ['MiniMax H3\\\\qwen3vl_32b_minimax_h3_int4_convrot.safetensors', 'Z-Image\\\\qwen_3_4b_fp8_mixed.safetensors']", "extra_info": {"input_name": "clip_name", "input_config": [["MiniMax H3\\qwen3vl_32b_minimax_h3_int4_convrot.safetensors", "Z-Image\\qwen_3_4b_fp8_mixed.safetensors"], {}], "received_value": "MiniMax H3/qwen3vl_32b_minimax_h3_int4_convrot.safetensors"}}], "dependent_outputs": ["14"], "class_type": "CLIPLoader"}, "1": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "unet_name: 'MiniMax H3/minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors' not in ['MiniMax H3\\\\minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors', 'MiniMax H3\\\\minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors', 'MiniMax H3\\\\minimax_h3_ref2va_pruned_int8_convrot.safetensors', 'Z-Image\\\\z_image_turbo_int8_convrot.safetensors']", "extra_info": {"input_name": "unet_name", "input_config": [["MiniMax H3\\minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors", "MiniMax H3\\minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors", "MiniMax H3\\minimax_h3_ref2va_pruned_int8_convrot.safetensors", "Z-Image\\z_image_turbo_int8_convrot.safetensors"], {}], "received_value": "MiniMax H3/minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors"}}], "dependent_outputs": ["14"], "class_type": "UNETLoader"}, "4": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "vae_name: 'MiniMax H3/minimax_h3_audio_vae_fp32.safetensors' not in ['MiniMax H3\\\\minimax_h3_audio_vae_fp32.safetensors', 'MiniMax H3\\\\minimax_h3_video_vae_fp16.safetensors', 'Z-Image\\\\ae.safetensors', 'taesdxl', 'taef1', 'taesd', 'pixel_space']", "extra_info": {"input_name": "vae_name", "input_config": [["MiniMax H3\\minimax_h3_audio_vae_fp32.safetensors", "MiniMax H3\\minimax_h3_video_vae_fp16.safetensors", "Z-Image\\ae.safetensors", "taesdxl", "taef1", "taesd", "pixel_space"], {}], "received_value": "MiniMax H3/minimax_h3_audio_vae_fp32.safetensors"}}], "dependent_outputs": ["14"], "class_type": "VAELoader"}}}
+
+>> H3 failure classification: MODEL  (no aimdo gate/backend signal in log or history)
+>> H3 failed at model/graph/sampling level -> ONE bounded fallback: hybrid model + steps=20 (PROMPT_h3_fallback.json)
+
+>> submitting h3retry (PROMPT_h3_fallback.json) timeout=1800s
+!! h3retry: submit failed: HTTP 400: {"error": {"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation", "details": "", "extra_info": {}}, "node_errors": {"3": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "vae_name: 'MiniMax H3/minimax_h3_video_vae_fp16.safetensors' not in ['MiniMax H3\\\\minimax_h3_audio_vae_fp32.safetensors', 'MiniMax H3\\\\minimax_h3_video_vae_fp16.safetensors', 'Z-Image\\\\ae.safetensors', 'taesdxl', 'taef1', 'taesd', 'pixel_space']", "extra_info": {"input_name": "vae_name", "input_config": [["MiniMax H3\\minimax_h3_audio_vae_fp32.safetensors", "MiniMax H3\\minimax_h3_video_vae_fp16.safetensors", "Z-Image\\ae.safetensors", "taesdxl", "taef1", "taesd", "pixel_space"], {}], "received_value": "MiniMax H3/minimax_h3_video_vae_fp16.safetensors"}}], "dependent_outputs": ["14"], "class_type": "VAELoader"}, "2": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "clip_name: 'MiniMax H3/qwen3vl_32b_minimax_h3_int4_convrot.safetensors' not in ['MiniMax H3\\\\qwen3vl_32b_minimax_h3_int4_convrot.safetensors', 'Z-Image\\\\qwen_3_4b_fp8_mixed.safetensors']", "extra_info": {"input_name": "clip_name", "input_config": [["MiniMax H3\\qwen3vl_32b_minimax_h3_int4_convrot.safetensors", "Z-Image\\qwen_3_4b_fp8_mixed.safetensors"], {}], "received_value": "MiniMax H3/qwen3vl_32b_minimax_h3_int4_convrot.safetensors"}}], "dependent_outputs": ["14"], "class_type": "CLIPLoader"}, "1": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "unet_name: 'MiniMax H3/minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors' not in ['MiniMax H3\\\\minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors', 'MiniMax H3\\\\minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors', 'MiniMax H3\\\\minimax_h3_ref2va_pruned_int8_convrot.safetensors', 'Z-Image\\\\z_image_turbo_int8_convrot.safetensors']", "extra_info": {"input_name": "unet_name", "input_config": [["MiniMax H3\\minimax_h3_fused_refdelta_r1024_turbo8_mystic07_int8_convrot.safetensors", "MiniMax H3\\minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors", "MiniMax H3\\minimax_h3_ref2va_pruned_int8_convrot.safetensors", "Z-Image\\z_image_turbo_int8_convrot.safetensors"], {}], "received_value": "MiniMax H3/minimax_h3_hybrid_fl2va_ref2va_b25-49-int8.safetensors"}}], "dependent_outputs": ["14"], "class_type": "UNETLoader"}, "4": {"errors": [{"type": "value_not_in_list", "message": "Value not in list", "details": "vae_name: 'MiniMax H3/minimax_h3_audio_vae_fp32.safetensors' not in ['MiniMax H3\\\\minimax_h3_audio_vae_fp32.safetensors', 'MiniMax H3\\\\minimax_h3_video_vae_fp16.safetensors', 'Z-Image\\\\ae.safetensors', 'taesdxl', 'taef1', 'taesd', 'pixel_space']", "extra_info": {"input_name": "vae_name", "input_config": [["MiniMax H3\\minimax_h3_audio_vae_fp32.safetensors", "MiniMax H3\\minimax_h3_video_vae_fp16.safetensors", "Z-Image\\ae.safetensors", "taesdxl", "taef1", "taesd", "pixel_space"], {}], "received_value": "MiniMax H3/minimax_h3_audio_vae_fp32.safetensors"}}], "dependent_outputs": ["14"], "class_type": "VAELoader"}}}
+!! H3 PRIMARY AND FALLBACK BOTH FAILED -> exit 4
+
+== aimdo lines: 14 (of 155) -> C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\acc_20261009-015132_aimdo_lines.txt
+   pressure/offload-keyword lines: 2; sample:
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=81.9MiB
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=1089.0MiB

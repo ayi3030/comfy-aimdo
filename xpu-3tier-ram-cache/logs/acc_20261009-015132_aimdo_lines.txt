@@ -1,0 +1,16 @@
+# every 'comfy-aimdo' / native set_log_callback line from acc_20261009-015132.log
+# total lines: 155 ; aimdo-related: 14
+[32m[INFO][0m comfy-aimdo: native backend does not provide malloc-graph capture (malloc_graph_create, malloc_graph_push, malloc_graph_pause, malloc_graph_set_stream, malloc_graph_pop, malloc_graph_abort, malloc_graph_stat, malloc_graph_destroy); continuing without graph capture
+[32m[INFO][0m comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-xpu\ur-usm-detour.c:847:INFO:aimdo_xpu_ur_hook_install: arbitrating Unified Runtime USM allocations; PyTorch caching allocator retained
+[32m[INFO][0m comfy-aimdo XPU backend ready (mode=native_hook)
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-xpu\ze-detour.c:316:INFO:aimdo_setup_hooks: native Torch XPU allocator retained; arbitrating Unified Runtime USM allocations
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-win\shmem-detect.c:88:INFO:comfy-aimdo WDDM adapter match: Intel(R) Arc(TM) B580 Graphics runtime_luid=00000000:00009846 dxgi_luid=00000000:00009846
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src\control.c:289:INFO:comfy-aimdo inited for GPU: Intel(R) Arc(TM) B580 Graphics (VRAM: 11875 MB)
+[32m[INFO][0m comfy-aimdo version: 0.5.6.dev28
+[32m[INFO][0m comfy-aimdo version: 0.5.6.dev28
+[aimdo_diag] routes registered, snapshots -> C:\Users\HE\WorkBuddy\2026-10-08-05-10-30\outputs\aimdo_stats_snapshots.jsonl
+[1m[33m[WARNING][0m comfy_entrypoint in E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\aimdo_diag.py did not return a ComfyExtension, skipping.
+[32m[INFO][0m    0.0 seconds (IMPORT FAILED): E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\aimdo_diag.py
+[32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=81.9MiB
+[32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=1089.0MiB

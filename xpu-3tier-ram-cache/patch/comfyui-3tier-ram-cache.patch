@@ -1,0 +1,306 @@
+--- comfy/model_management.py
++++ comfy/model_management.py
+@@ -754,6 +754,14 @@
+     to_free = shortfall + PIN_PRESSURE_HYSTERESIS
+     return free_pins(to_free, evict_active=evict_active, loaded=loaded) >= shortfall
+ 
++def total_pin_memory_used():
++    """宿主 pin 的预算口径 = 已注册字节 + 已缓存未注册字节。
++
++    CUDA/ROCm 上所有活跃 pin 都已注册，TOTAL_PIN_CACHE_MEMORY 恒为 0，与改前等价；
++    XPU 上注册不可用，缓存字节记入 TOTAL_PIN_CACHE_MEMORY。
++    """
++    return TOTAL_PINNED_MEMORY + TOTAL_PIN_CACHE_MEMORY
++
+ def free_registrations(shortfall, evict_active=True):
+     if MAX_PINNED_MEMORY <= 0:
+         return False
+@@ -766,7 +774,20 @@
+     return shortfall <= REGISTERABLE_PIN_HYSTERESIS
+ 
+ def ensure_pin_registerable(size, evict_active=True):
+-    return free_registrations(TOTAL_PINNED_MEMORY + size - MAX_PINNED_MEMORY, evict_active=evict_active)
++    if MAX_PINNED_MEMORY <= 0:
++        # 无预算（含 XPU 缓存被显式关闭）＝不可建立 pin，与原行为一致。
++        return False
++    if HOST_PIN_REGISTRATION_SUPPORTED:
++        # 原语义不变：仅按"已注册"字节做预算，并借 free_registrations 触发解注册驱逐。
++        return free_registrations(TOTAL_PINNED_MEMORY + size - MAX_PINNED_MEMORY, evict_active=evict_active)
++
++    # 注册不可用（如 Intel XPU）：MAX_PINNED_MEMORY 退化为"纯宿主缓存预算"。
++    # 此时 unregister 路径对从未注册的 pin 是空操作（model_patcher.py:2091 以 registered 为键），
++    # 所以超预算必须真正销毁 hostbuf 缓存，走 free_pins（→ partially_unload_ram）。
++    shortfall = total_pin_memory_used() + size - MAX_PINNED_MEMORY
++    if shortfall <= 0:
++        return True
++    return free_pins(shortfall + PIN_PRESSURE_HYSTERESIS, evict_active=evict_active) >= shortfall
+ 
+ class LoadedModel:
+     def __init__(self, model: ModelPatcher):
+@@ -1605,8 +1626,19 @@
+ 
+ PINNED_MEMORY = {}
+ TOTAL_PINNED_MEMORY = 0
++# XPU 三层存储：对"无驱动 host 注册能力"的后端（如 Intel XPU）单独维护"已缓存但未注册"
++# 的宿主字节数。为什么不复用 TOTAL_PINNED_MEMORY：那个计数器表示"已向驱动成功注册"的字节，
++# 注册不可用的后端上它恒为 0，若拿它当缓存预算记账，预算只会永远是 0、缓存将无界增长；
++# 反之 CUDA/ROCm 上本计数器恒为 0，保证行为与改前逐字节等价。
++TOTAL_PIN_CACHE_MEMORY = 0
+ MAX_PINNED_MEMORY = -1
+ 
++# 驱动级 host 注册（cudaHostRegister）能力开关。
++# CUDA/ROCm 可用；Intel XPU 构建下 torch.cuda.cudart() 会抛
++# AssertionError('Torch not compiled with CUDA enabled')（真机实测），故为 False。
++# 关键语义：注册能力只影响拷贝性能，不代表宿主缓存不可用——"注册不可用 ≠ 缓存不可用"。
++HOST_PIN_REGISTRATION_SUPPORTED = is_nvidia() or is_amd()
++
+ def get_disk_swap_total():
+     if not os.path.exists("/proc/swaps"):
+         return 0
+@@ -1633,6 +1665,20 @@
+     # Integrated GPU VRAM is carved out of system RAM, so pinning host memory only takes RAM from the GPU.
+     DISABLE_PINNED_MEMORY = True
+ 
++def _xpu_ram_cache_gb_from_env():
++    """读取环境变量 AIMDO_XPU_RAM_CACHE_GB。
++
++    未设置返回 None（走默认预算）；非法值也返回 None 并告警（不让拼错的变量静默改变行为）。
++    """
++    raw = os.environ.get("AIMDO_XPU_RAM_CACHE_GB", None)
++    if raw is None or raw == "":
++        return None
++    try:
++        return float(raw)
++    except (TypeError, ValueError):
++        logging.warning("Invalid AIMDO_XPU_RAM_CACHE_GB=%r; using default XPU RAM cache budget", raw)
++        return None
++
+ if not DISABLE_PINNED_MEMORY:
+     if is_nvidia() or is_amd():
+         ram = get_total_memory(torch.device("cpu"))
+@@ -1642,6 +1688,24 @@
+             swap = 0 if comfy.system_memory.cgroup_memory_limit() is not None else get_disk_swap_total()
+             MAX_PINNED_MEMORY = max(ram * 0.40, min(ram * 0.90, ram - 4 * 1024 ** 3, ram + swap - 16 * 1024 ** 3))
+         logging.info("Enabled pinned memory {}".format(MAX_PINNED_MEMORY // (1024 * 1024)))
++    elif is_intel_xpu():
++        # Intel XPU 无驱动级 host 注册能力，但 HostBuffer 仍是有效的宿主内存缓存。
++        # 这里给一个有界的"纯缓存预算"（字节），让三层里的 RAM 中间层成立：
++        # 取回时 文件→hostbuf(RAM)→显存；被驱逐后可从 hostbuf 恢复，而不是每次回读磁盘。
++        _xpu_cache_gb = _xpu_ram_cache_gb_from_env()
++        if _xpu_cache_gb is None:
++            ram = get_total_memory(torch.device("cpu"))
++            _xpu_cache_bytes = int(min(ram * 0.25, 24 * 1024 ** 3))
++            logging.info("Enabled XPU RAM cache {} (default = min(ram*0.25, 24GiB))".format(_xpu_cache_bytes // (1024 * 1024)))
++        elif _xpu_cache_gb > 0:
++            _xpu_cache_bytes = int(_xpu_cache_gb * 1024 ** 3)
++            logging.info("Enabled XPU RAM cache {} (AIMDO_XPU_RAM_CACHE_GB={})".format(_xpu_cache_bytes // (1024 * 1024), _xpu_cache_gb))
++        else:
++            # 显式设 0 = 关闭：MAX_PINNED_MEMORY 保持 -1，退回"磁盘直通"（保证可回滚）。
++            _xpu_cache_bytes = 0
++            logging.info("XPU RAM cache disabled (AIMDO_XPU_RAM_CACHE_GB=0); disk passthrough mode")
++        if _xpu_cache_bytes > 0:
++            MAX_PINNED_MEMORY = _xpu_cache_bytes
+ 
+ PINNING_ALLOWED_TYPES = set(["Tensor", "Parameter", "QuantizedTensor"])
+ 
+@@ -1660,8 +1724,41 @@
+         #Dump it! We already know about it from the synchronous return
+         pass
+ 
++def host_register_pin(ptr, size):
++    """守卫式 host 注册：把宿主内存固定给驱动（仅供拷贝加速，不影响正确性）。
++
++    返回 True=已注册；False=该后端无注册能力或注册失败。
++    注册不可用时（如 Intel XPU）直接返回 False，绝不触碰 torch.cuda.cudart()——
++    该调用在 XPU 构建下会抛 AssertionError。
++    """
++    if not HOST_PIN_REGISTRATION_SUPPORTED:
++        return False
++    return torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0
++
++def host_unregister_pin(ptr):
++    """守卫式 host 解注册：与 host_register_pin 对称。返回 True=已成功解除注册。"""
++    if not HOST_PIN_REGISTRATION_SUPPORTED:
++        return False
++    return torch.cuda.cudart().cudaHostUnregister(ptr) == 0
++
++def xpu_ram_cache_enabled():
++    """XPU 三层存储：RAM 中间缓存是否启用（当前计算设备是 XPU 且预算 > 0）。
++
++    供 ops.py 的 handle_pin 使用——让"快盘 fast_disk"场景也能建立 RAM pin。
++
++    必须判"当前选中的计算设备"而非"XPU 是否可用"：
++    is_intel_xpu() 只反映 XPU 可用性；而 get_torch_device() 里 directml 分支
++    （model_management.py:198-200）是它的最前置短路——在 --directml 下即使 XPU 可用，
++    实际计算设备也不是 XPU（:206 的 is_intel_xpu() 分支根本轮不到）。
++    若用 is_intel_xpu()，就会在 DirectML 上因 MAX_PINNED_MEMORY>0 而误触发 ops.py:232 的 or，
++    去建 RAM pin，破坏"CUDA/DirectML 零变化"铁律。
++    故此处一律以 get_torch_device().type 为准。请勿"简化"回 is_intel_xpu()。
++    """
++    return get_torch_device().type == "xpu" and MAX_PINNED_MEMORY > 0
++
+ def pin_memory(tensor, evict_active=True):
+     global TOTAL_PINNED_MEMORY
++    global TOTAL_PIN_CACHE_MEMORY
+     if MAX_PINNED_MEMORY <= 0:
+         return False
+ 
+@@ -1689,18 +1786,26 @@
+     if ptr == 0:
+         return False
+ 
+-    if torch.cuda.cudart().cudaHostRegister(ptr, size, 1) == 0:
++    if host_register_pin(ptr, size):
+         PINNED_MEMORY[ptr] = size
+         TOTAL_PINNED_MEMORY += size
+         return True
+-    else:
++
++    if HOST_PIN_REGISTRATION_SUPPORTED:
++        # CUDA/ROCm：注册失败即放弃，与原行为一致（告警 + 吞掉异步错误）。
+         logging.warning("Pin error.")
+         discard_cuda_async_error()
++        return False
+ 
+-    return False
++    # 注册不可用（XPU）：不放弃缓存，仅按"已缓存未注册"记账（独立计数器）。
++    # 这正是"注册不可用 ≠ 缓存不可用"：数据仍进宿主缓存，只是没有驱动固定。
++    PINNED_MEMORY[ptr] = size
++    TOTAL_PIN_CACHE_MEMORY += size
++    return True
+ 
+ def unpin_memory(tensor):
+     global TOTAL_PINNED_MEMORY
++    global TOTAL_PIN_CACHE_MEMORY
+     if MAX_PINNED_MEMORY <= 0:
+         return False
+ 
+@@ -1719,15 +1824,20 @@
+         logging.warning("Size of pinned tensor changed")
+         return False
+ 
+-    if torch.cuda.cudart().cudaHostUnregister(ptr) == 0:
++    if host_unregister_pin(ptr):
+         size = PINNED_MEMORY.pop(ptr)
+         TOTAL_PINNED_MEMORY -= size
+         return True
+-    else:
++
++    if HOST_PIN_REGISTRATION_SUPPORTED:
+         logging.warning("Unpin error.")
+         discard_cuda_async_error()
++        return False
+ 
+-    return False
++    # 注册不可用：没有驱动状态可撤销，仅清理缓存记账。
++    size = PINNED_MEMORY.pop(ptr)
++    TOTAL_PIN_CACHE_MEMORY = max(0, TOTAL_PIN_CACHE_MEMORY - size)
++    return True
+ 
+ def sage_attention_enabled():
+     return args.use_sage_attention
+--- comfy/pinned_memory.py
++++ comfy/pinned_memory.py
+@@ -49,14 +49,18 @@
+     pins = module.__dict__.get("_pins")
+     module_pin = None if pins is None else pins.get(subset)
+     pin = None if module_pin is None else module_pin.get("pin")
+-    if pin is None or module_pin["registered"] or comfy.model_management.DISABLE_PINNED_MEMORY:
++    if (pin is None or module_pin["registered"] or comfy.model_management.DISABLE_PINNED_MEMORY
++            or not comfy.model_management.HOST_PIN_REGISTRATION_SUPPORTED):
++        # 注册不可用的后端（如 XPU）：pin 一旦建立即可直接使用，无需也无法做驱动注册。
++        # 早退可避免走到下面的 cudaHostRegister（XPU 上会抛 AssertionError）；
++        # 此类后端上 registered 恒为 False，故这里按"未注册"语义返回可用 pin。
+         return pin
+ 
+     _, _, stack_split, pinned_size, *_ = module._pin_state[subset]
+     size = pin.nbytes
+     comfy.model_management.ensure_pin_registerable(size)
+ 
+-    if torch.cuda.cudart().cudaHostRegister(pin.data_ptr(), size, 1) != 0:
++    if not comfy.model_management.host_register_pin(pin.data_ptr(), size):
+         comfy.model_management.discard_cuda_async_error()
+         return pin
+ 
+@@ -102,14 +106,17 @@
+         extended = True
+         pin = comfy_aimdo.torch.hostbuf_to_tensor(hostbuf)[offset:offset + size]
+         pin.untyped_storage()._comfy_hostbuf = hostbuf
+-        if torch.cuda.cudart().cudaHostRegister(pin.data_ptr(), size, 1) != 0:
+-            comfy.model_management.discard_cuda_async_error()
+-            comfy.model_management.free_registrations(size, evict_active=not fast)
+-            if torch.cuda.cudart().cudaHostRegister(pin.data_ptr(), size, 1) != 0:
++        if comfy.model_management.HOST_PIN_REGISTRATION_SUPPORTED:
++            # 仅在有驱动注册能力的后端（CUDA/ROCm）才尝试注册；
++            # XPU 上注册不可用，跳过注册与两次重试，直接进入下面的记账分支。
++            if not comfy.model_management.host_register_pin(pin.data_ptr(), size):
+                 comfy.model_management.discard_cuda_async_error()
+-                del pin
+-                hostbuf.truncate(offset, do_unregister=False)
+-                return _steal_pin(module, stack, buckets, size, priority, subset)
++                comfy.model_management.free_registrations(size, evict_active=not fast)
++                if not comfy.model_management.host_register_pin(pin.data_ptr(), size):
++                    comfy.model_management.discard_cuda_async_error()
++                    del pin
++                    hostbuf.truncate(offset, do_unregister=False)
++                    return _steal_pin(module, stack, buckets, size, priority, subset)
+     except RuntimeError:
+         if extended:
+             hostbuf.truncate(offset, do_unregister=False)
+@@ -117,10 +124,16 @@
+ 
+     module_pin["pin"] = pin
+     stack.append((module, offset))
+-    module_pin["registered"] = True
++    if comfy.model_management.HOST_PIN_REGISTRATION_SUPPORTED:
++        module_pin["registered"] = True
++        comfy.model_management.TOTAL_PINNED_MEMORY += size
++    else:
++        # 注册不可用：registered 忠实保持 False（XPU 恒未注册），
++        # 预算占用记到独立的"已缓存未注册"计数器，避免与"已注册字节"语义混淆。
++        module_pin["registered"] = False
++        comfy.model_management.TOTAL_PIN_CACHE_MEMORY += size
+     module_pin["stack_index"] = len(stack) - 1
+     stack_split[0] = max(stack_split[0], module_pin["stack_index"])
+-    comfy.model_management.TOTAL_PINNED_MEMORY += size
+     pinned_size[0] += size
+     _add_to_bucket(module, module_pin, buckets, size, priority)
+     return True
+--- comfy/model_patcher.py
++++ comfy/model_patcher.py
+@@ -2092,7 +2092,7 @@
+                     continue
+                 pin = module_pin["pin"]
+                 size = pin.numel() * pin.element_size()
+-                if torch.cuda.cudart().cudaHostUnregister(pin.data_ptr()) != 0:
++                if not comfy.model_management.host_unregister_pin(pin.data_ptr()):
+                     comfy.model_management.discard_cuda_async_error()
+                     continue
+                 module_pin["registered"] = False
+@@ -2123,6 +2123,10 @@
+                 if registered:
+                     comfy.model_management.TOTAL_PINNED_MEMORY = max(0, comfy.model_management.TOTAL_PINNED_MEMORY - size)
+                     pinned_size[0] = max(0, pinned_size[0] - size)
++                elif not comfy.model_management.HOST_PIN_REGISTRATION_SUPPORTED:
++                    # 注册不可用（XPU）：hostbuf 已释放，需同步扣减"已缓存未注册"预算计数，
++                    # 否则 RAM 预算只增不减、缓存层会退化为无界。
++                    comfy.model_management.TOTAL_PIN_CACHE_MEMORY = max(0, comfy.model_management.TOTAL_PIN_CACHE_MEMORY - size)
+                 freed += size
+                 ram_to_unload -= size
+                 if ram_to_unload <= 0:
+--- comfy/ops.py
++++ comfy/ops.py
+@@ -229,7 +229,12 @@
+             if pin is not None:
+                 cast_maybe_lowvram_patch([pin], dest, offload_stream)
+                 return
+-            if signature is None or not fast_disk or args.high_ram:
++            if (signature is None or not fast_disk or args.high_ram
++                    or comfy.model_management.xpu_ram_cache_enabled()):
++                # XPU 三层存储：即使判定为快盘（fast_disk）也要建立 RAM pin，
++                # 从而形成 VRAM 驱逐后仍可从 RAM 恢复的中间层。
++                # 该条件在 CUDA/ROCm/CPU 上恒为 False（xpu_ram_cache_enabled 内部门控），
++                # 故不改变其既有的"快盘直通"行为。
+                 comfy.pinned_memory.pin_memory(m, subset=subset, size=size)
+                 pin = comfy.pinned_memory.get_pin(m, subset=subset)
+             cast_maybe_lowvram_patch(source, pin, offload_stream, xfer_dest2=dest)

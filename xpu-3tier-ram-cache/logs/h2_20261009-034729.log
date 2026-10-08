@@ -1,0 +1,6 @@
+== H2 32MiB 20261009-034729 ==
+H2_ENV: init_devices([0]) -> True
+H2_ENV: torch=2.14.0+xpu xpu_avail=True device=Intel(R) Arc(TM) B580 Graphics
+H2_PAYLOAD: 33554432B sha256=68bf90fe972e595e0721b1c20a386275a4c0e90c1e085f03776104057aedbdaf
+H2D_OK (size=33554432B, device=xpu:0) -> hostbuf(RAM)->XPU 显存 writes exact bytes
+H2_EXIT=0

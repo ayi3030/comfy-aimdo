@@ -1,0 +1,92 @@
+[32m[INFO][0m setup plugin alembic.autogenerate.schemas
+[32m[INFO][0m setup plugin alembic.autogenerate.tables
+[32m[INFO][0m setup plugin alembic.autogenerate.types
+[32m[INFO][0m setup plugin alembic.autogenerate.constraints
+[32m[INFO][0m setup plugin alembic.autogenerate.defaults
+[32m[INFO][0m setup plugin alembic.autogenerate.comments
+[32m[INFO][0m setup plugin alembic.ext.checkconstraint_byname
+[1m[33m[WARNING][0m On windows we are currently forcing single GPU mode in ComfyUI due to a Nvidia related issue, if you want to disable this use: --cuda-device all
+[32m[INFO][0m comfy-aimdo: native backend does not provide malloc-graph capture (malloc_graph_create, malloc_graph_push, malloc_graph_pause, malloc_graph_set_stream, malloc_graph_pop, malloc_graph_abort, malloc_graph_stat, malloc_graph_destroy); continuing without graph capture
+[32m[INFO][0m comfy-aimdo XPU backend not requested; using native PyTorch XPU allocator
+[32m[INFO][0m Adding extra search path diffusion_models E:\HE\ComfyUI模型库\diffusion_models
+[32m[INFO][0m Adding extra search path text_encoders E:\HE\ComfyUI模型库\text_encoders
+[32m[INFO][0m Adding extra search path vae E:\HE\ComfyUI模型库\vae
+[32m[INFO][0m Adding extra search path latent_upscale_models E:\HE\ComfyUI模型库\latent_upscale_models
+[32m[INFO][0m Adding extra search path loras E:\HE\ComfyUI模型库\loras
+[32m[INFO][0m Adding extra search path checkpoints E:\HE\ComfyUI模型库\checkpoints
+[32m[INFO][0m Adding extra search path upscale_models E:\HE\ComfyUI模型库\upscale_models
+[32m[INFO][0m Adding extra search path controlnet E:\HE\ComfyUI模型库\controlnet
+[32m[INFO][0m Adding extra search path clip E:\HE\ComfyUI模型库\clip
+[32m[INFO][0m Adding extra search path clip_vision E:\HE\ComfyUI模型库\clip_vision
+[32m[INFO][0m Adding extra search path audio_encoders E:\HE\ComfyUI模型库\audio_encoders
+[32m[INFO][0m [OmniXPU] XPU allocator memory fraction applied during prestartup: requested=0.99 actual=0.989999999958 source=Windows default
+[32m[INFO][0m 
+Prestartup times for custom nodes:
+[32m[INFO][0m    0.4 seconds: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\ComfyUI-OmniXPU
+[32m[INFO][0m 
+[1m[33m[WARNING][0m WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.
+[32m[INFO][0m Found comfy_kitchen backend hip: {'available': False, 'disabled': False, 'unavailable_reason': 'PyTorch ROCm/HIP runtime not available', 'capabilities': []}
+[32m[INFO][0m Found comfy_kitchen backend xpu: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'convrot_w4a4_linear', 'dequantize_convrot_w4a4_weight', 'dequantize_gguf', 'dequantize_int8_convrot_weight', 'dequantize_int8_convrot_weight_dtype', 'dequantize_int8_simple', 'dequantize_int8_simple_dtype', 'dequantize_per_tensor_fp8', 'fp16_conv3d', 'fp16_conv3d_out', 'fp16_linear', 'gemv_awq_w4a16', 'group_norm_silu_pad3d', 'group_norm_silu_pad3d_out', 'int8_linear', 'mm_int8', 'prepare_int4_weight_for_int8_linear', 'quantize_and_rotate_rowwise', 'quantize_convrot_w4a4_weight', 'quantize_int8_convrot_weight', 'quantize_int8_rowwise', 'quantize_int8_tensorwise', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'rms_adaln', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'scaled_mm_svdquant_w4a4', 'sol_attn', 'stochastic_rounding_fp8', 'svdquant_w4a16_linear']}
+[32m[INFO][0m Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'convrot_w4a4_linear', 'dequantize_convrot_w4a4_weight', 'dequantize_gguf', 'dequantize_int8_convrot_weight', 'dequantize_int8_convrot_weight_dtype', 'dequantize_int8_embedding', 'dequantize_int8_simple', 'dequantize_int8_simple_dtype', 'dequantize_mxfp8', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'dequantize_w4a8_int8_weight', 'fp16_conv3d', 'fp16_conv3d_out', 'fp16_linear', 'gemv_awq_w4a16', 'group_norm_silu_pad3d', 'group_norm_silu_pad3d_out', 'int8_linear', 'mm_int8', 'na3d', 'prepare_int4_weight_for_int8_linear', 'quantize_and_rotate_rowwise', 'quantize_convrot_w4a4_weight', 'quantize_int8_convrot_weight', 'quantize_int8_rowwise', 'quantize_int8_tensorwise', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'quantize_w4a8_int8_weight', 'rms_adaln', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'rotate_int8_convrot_weight', 'scaled_mm_mxfp8', 'scaled_mm_nvfp4', 'scaled_mm_svdquant_w4a4', 'sol_attn', 'stochastic_rounding_fp8', 'svdquant_w4a16_linear', 'w4a8_int8_linear']}
+[32m[INFO][0m Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'unavailable_reason': 'Triton is unavailable by default on Windows; set COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1 before importing comfy_kitchen to enable it', 'capabilities': []}
+[32m[INFO][0m Checkpoint files will always be loaded safely.
+[32m[INFO][0m Total VRAM 11876 MB, total RAM 32712 MB
+[32m[INFO][0m pytorch version: 2.14.0+xpu
+[32m[INFO][0m Set vram state to: NORMAL_VRAM
+[32m[INFO][0m Device: xpu:0 Intel(R) Arc(TM) B580 Graphics
+[32m[INFO][0m Using pytorch attention
+[aimdo] aimdo_cuda_runtime_init: no XPU device published yet; deferring dispatch table wiring until xpu_set_queues()
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-xpu\ur-usm-detour.c:847:INFO:aimdo_xpu_ur_hook_install: arbitrating Unified Runtime USM allocations; PyTorch caching allocator retained
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-xpu\ze-detour.c:316:INFO:aimdo_setup_hooks: native Torch XPU allocator retained; arbitrating Unified Runtime USM allocations
+[1m[33m[WARNING][0m No working comfy-aimdo install detected. DynamicVRAM support disabled. Falling back to legacy ModelPatcher. VRAM estimates may be unreliable especially on Windows
+[32m[INFO][0m Python version: 3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]
+[32m[INFO][0m ComfyUI version: 0.39.0
+[32m[INFO][0m comfy-aimdo version: 0.5.6.dev25
+[32m[INFO][0m comfy-kitchen version: 0.2.37
+[32m[INFO][0m comfyui-frontend-package version: 1.53.10
+[32m[INFO][0m comfyui-workflow-templates version: 0.11.76
+[32m[INFO][0m comfyui-embedded-docs version: 0.5.13
+[32m[INFO][0m comfy-kitchen version: 0.2.37
+[32m[INFO][0m comfy-aimdo version: 0.5.6.dev25
+[32m[INFO][0m [Prompt Server] web root: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\Lib\site-packages\comfyui_frontend_package\static
+[32m[INFO][0m Asset seeder disabled
+E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\Lib\site-packages\torch\jit\_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+[32m[INFO][0m No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[aimdo_diag] routes registered, snapshots -> C:\Users\HE\WorkBuddy\2026-10-08-05-10-30\outputs\aimdo_stats_snapshots.jsonl
+[1m[33m[WARNING][0m comfy_entrypoint in E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\aimdo_diag.py did not return a ComfyExtension, skipping.
+[32m[INFO][0m [OmniXPU] omni_xpu_kernel 0.2.0b2+torch214.bmg - available: sdp, norm, rotary, linear_fp8, int8, layout
+[32m[INFO][0m [OmniXPU] quantized_matmul_adapter: applied
+[32m[INFO][0m [OmniXPU] sparse_attention_adapter: applied
+[32m[INFO][0m [OmniXPU] attention_adapter: skipped (OMNI_ATTN_BACKEND=torch (using PyTorch SDPA, no patch))
+[32m[INFO][0m [OmniXPU] rotary_adapter: skipped (LTX split-half RoPE function not available)
+[32m[INFO][0m [OmniXPU] norm: H120 FP16 native route enabled (target=bmg)
+[32m[INFO][0m [OmniXPU] norm: BMG GroupNorm route enabled (target=bmg)
+[32m[INFO][0m [OmniXPU] norm: SeedVR BMG GroupNorm route enabled (target=bmg)
+[32m[INFO][0m [OmniXPU] norm: rebound 2 by-value imports of rms_norm
+[32m[INFO][0m [OmniXPU] norm: patched Krea2 local RMSNorm.forward
+[32m[INFO][0m [OmniXPU] norm_adapter: applied
+[32m[INFO][0m [OmniXPU] norm: patched MiniMax H3 segmented RMS modulation
+[32m[INFO][0m [OmniXPU] h3_rms_modulation_adapter: applied
+[32m[INFO][0m [OmniXPU] fp8_model_adapter: applied
+[32m[INFO][0m [OmniXPU] INT8 FFN: routed eligible lumina.FeedForward, omnigen2.LuminaFeedForward, krea2.SwiGLU through fused kernels
+[32m[INFO][0m [OmniXPU] int8_ffn_adapter: applied
+[32m[INFO][0m [OmniXPU] dynamic_vram_boundary_trim: applied
+[32m[INFO][0m [OmniXPU] lora_memory_adapter: applied
+[32m[INFO][0m [OmniXPU] qwen_image21_cache_adapter: skipped (unsupported put cache contract)
+[32m[INFO][0m [OmniXPU] seedvr_ada_reshape_patch: applied
+[32m[INFO][0m [OmniXPU] seedvr_capacity_adapter: skipped (unsupported SwiGLUMLP.forward contract)
+[32m[INFO][0m [OmniXPU] seedvr_cat_pad_adapter: skipped (unsupported SeedVR2 memory_limit_conv contract)
+[32m[INFO][0m [OmniXPU] large_video_preprocess_adapter: applied
+[32m[INFO][0m [OmniXPU] legacy_interpolate_fix: skipped (disabled by env)
+[32m[INFO][0m [OmniXPU] legacy_median_fix: skipped (disabled by env)
+[32m[INFO][0m 
+Import times for custom nodes:
+[32m[INFO][0m    0.0 seconds: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\websocket_image_save.py
+[32m[INFO][0m    0.0 seconds (IMPORT FAILED): E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\aimdo_diag.py
+[32m[INFO][0m    2.2 seconds: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\ComfyUI-OmniXPU
+[32m[INFO][0m 
+[32m[INFO][0m Using RAM pressure cache.
+[32m[INFO][0m Starting server
+
+[32m[INFO][0m To see the GUI go to: http://127.0.0.1:8188

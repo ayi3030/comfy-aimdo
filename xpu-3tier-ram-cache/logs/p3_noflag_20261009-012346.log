@@ -1,0 +1,92 @@
+[32m[INFO][0m setup plugin alembic.autogenerate.schemas
+[32m[INFO][0m setup plugin alembic.autogenerate.tables
+[32m[INFO][0m setup plugin alembic.autogenerate.types
+[32m[INFO][0m setup plugin alembic.autogenerate.constraints
+[32m[INFO][0m setup plugin alembic.autogenerate.defaults
+[32m[INFO][0m setup plugin alembic.autogenerate.comments
+[32m[INFO][0m setup plugin alembic.ext.checkconstraint_byname
+[1m[33m[WARNING][0m On windows we are currently forcing single GPU mode in ComfyUI due to a Nvidia related issue, if you want to disable this use: --cuda-device all
+[32m[INFO][0m comfy-aimdo: native backend does not provide malloc-graph capture (malloc_graph_create, malloc_graph_push, malloc_graph_pause, malloc_graph_set_stream, malloc_graph_pop, malloc_graph_abort, malloc_graph_stat, malloc_graph_destroy); continuing without graph capture
+[32m[INFO][0m comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-xpu\ur-usm-detour.c:847:INFO:aimdo_xpu_ur_hook_install: arbitrating Unified Runtime USM allocations; PyTorch caching allocator retained
+[32m[INFO][0m comfy-aimdo XPU backend ready (mode=native_hook)
+[32m[INFO][0m Adding extra search path diffusion_models E:\HE\ComfyUI模型库\diffusion_models
+[32m[INFO][0m Adding extra search path text_encoders E:\HE\ComfyUI模型库\text_encoders
+[32m[INFO][0m Adding extra search path vae E:\HE\ComfyUI模型库\vae
+[32m[INFO][0m Adding extra search path latent_upscale_models E:\HE\ComfyUI模型库\latent_upscale_models
+[32m[INFO][0m Adding extra search path loras E:\HE\ComfyUI模型库\loras
+[32m[INFO][0m Adding extra search path checkpoints E:\HE\ComfyUI模型库\checkpoints
+[32m[INFO][0m Adding extra search path upscale_models E:\HE\ComfyUI模型库\upscale_models
+[32m[INFO][0m Adding extra search path controlnet E:\HE\ComfyUI模型库\controlnet
+[32m[INFO][0m Adding extra search path clip E:\HE\ComfyUI模型库\clip
+[32m[INFO][0m Adding extra search path clip_vision E:\HE\ComfyUI模型库\clip_vision
+[32m[INFO][0m Adding extra search path audio_encoders E:\HE\ComfyUI模型库\audio_encoders
+[32m[INFO][0m [OmniXPU] XPU allocator memory fraction applied during prestartup: requested=0.99 actual=0.989999999958 source=Windows default
+[32m[INFO][0m 
+Prestartup times for custom nodes:
+[32m[INFO][0m    0.1 seconds: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\custom_nodes\ComfyUI-OmniXPU
+[32m[INFO][0m 
+[1m[33m[WARNING][0m WARNING: Potential Error in code: Torch already imported, torch should never be imported before this point.
+[32m[INFO][0m Found comfy_kitchen backend hip: {'available': False, 'disabled': False, 'unavailable_reason': 'PyTorch ROCm/HIP runtime not available', 'capabilities': []}
+[32m[INFO][0m Found comfy_kitchen backend eager: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'convrot_w4a4_linear', 'dequantize_convrot_w4a4_weight', 'dequantize_gguf', 'dequantize_int8_convrot_weight', 'dequantize_int8_convrot_weight_dtype', 'dequantize_int8_embedding', 'dequantize_int8_simple', 'dequantize_int8_simple_dtype', 'dequantize_mxfp8', 'dequantize_nvfp4', 'dequantize_per_tensor_fp8', 'dequantize_w4a8_int8_weight', 'fp16_conv3d', 'fp16_conv3d_out', 'fp16_linear', 'gemv_awq_w4a16', 'group_norm_silu_pad3d', 'group_norm_silu_pad3d_out', 'int8_linear', 'mm_int8', 'na3d', 'prepare_int4_weight_for_int8_linear', 'quantize_and_rotate_rowwise', 'quantize_convrot_w4a4_weight', 'quantize_int8_convrot_weight', 'quantize_int8_rowwise', 'quantize_int8_tensorwise', 'quantize_mxfp8', 'quantize_nvfp4', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'quantize_w4a8_int8_weight', 'rms_adaln', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'rotate_int8_convrot_weight', 'scaled_mm_mxfp8', 'scaled_mm_nvfp4', 'scaled_mm_svdquant_w4a4', 'sol_attn', 'stochastic_rounding_fp8', 'svdquant_w4a16_linear', 'w4a8_int8_linear']}
+[32m[INFO][0m Found comfy_kitchen backend triton: {'available': False, 'disabled': True, 'unavailable_reason': 'Triton is unavailable by default on Windows; set COMFY_KITCHEN_ENABLE_TRITON_WINDOWS=1 before importing comfy_kitchen to enable it', 'capabilities': []}
+[32m[INFO][0m Found comfy_kitchen backend xpu: {'available': True, 'disabled': False, 'unavailable_reason': None, 'capabilities': ['adaln', 'apply_rope', 'apply_rope1', 'apply_rope1_', 'apply_rope_', 'apply_rope_split_half', 'apply_rope_split_half1', 'apply_rope_split_half1_', 'apply_rope_split_half_', 'convrot_w4a4_linear', 'dequantize_convrot_w4a4_weight', 'dequantize_gguf', 'dequantize_int8_convrot_weight', 'dequantize_int8_convrot_weight_dtype', 'dequantize_int8_simple', 'dequantize_int8_simple_dtype', 'dequantize_per_tensor_fp8', 'fp16_conv3d', 'fp16_conv3d_out', 'fp16_linear', 'gemv_awq_w4a16', 'group_norm_silu_pad3d', 'group_norm_silu_pad3d_out', 'int8_linear', 'mm_int8', 'prepare_int4_weight_for_int8_linear', 'quantize_and_rotate_rowwise', 'quantize_convrot_w4a4_weight', 'quantize_int8_convrot_weight', 'quantize_int8_rowwise', 'quantize_int8_tensorwise', 'quantize_per_tensor_fp8', 'quantize_svdquant_w4a4', 'rms_adaln', 'rms_rope', 'rms_rope1', 'rms_rope1_', 'rms_rope_', 'rms_rope_split_half', 'rms_rope_split_half1', 'rms_rope_split_half1_', 'rms_rope_split_half_', 'scaled_mm_svdquant_w4a4', 'sol_attn', 'stochastic_rounding_fp8', 'svdquant_w4a16_linear']}
+[32m[INFO][0m Checkpoint files will always be loaded safely.
+[32m[INFO][0m Total VRAM 11876 MB, total RAM 32712 MB
+[32m[INFO][0m pytorch version: 2.14.0+xpu
+[32m[INFO][0m Set vram state to: NORMAL_VRAM
+[32m[INFO][0m Device: xpu:0 Intel(R) Arc(TM) B580 Graphics
+[32m[INFO][0m Using pytorch attention
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-xpu\ze-detour.c:316:INFO:aimdo_setup_hooks: native Torch XPU allocator retained; arbitrating Unified Runtime USM allocations
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src-win\shmem-detect.c:88:INFO:comfy-aimdo WDDM adapter match: Intel(R) Arc(TM) B580 Graphics runtime_luid=00000000:00009846 dxgi_luid=00000000:00009846
+[32m[INFO][0m aimdo: D:\a\comfy-aimdo\comfy-aimdo\native\src\control.c:289:INFO:comfy-aimdo inited for GPU: Intel(R) Arc(TM) B580 Graphics (VRAM: 11875 MB)
+[32m[INFO][0m DynamicVRAM support detected and enabled
+[32m[INFO][0m Python version: 3.13.14 (tags/v3.13.14:fd17997, Jun 10 2026, 13:03:48) [MSC v.1944 64 bit (AMD64)]
+[32m[INFO][0m ComfyUI version: 0.39.0
+[32m[INFO][0m comfy-aimdo version: 0.5.6.dev25
+[32m[INFO][0m comfy-kitchen version: 0.2.37
+[32m[INFO][0m comfyui-frontend-package version: 1.53.10
+[32m[INFO][0m comfyui-workflow-templates version: 0.11.76
+[32m[INFO][0m comfyui-embedded-docs version: 0.5.13
+[32m[INFO][0m comfy-kitchen version: 0.2.37
+[32m[INFO][0m comfy-aimdo version: 0.5.6.dev25
+[32m[INFO][0m [Prompt Server] web root: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\Lib\site-packages\comfyui_frontend_package\static
+[32m[INFO][0m Asset seeder disabled
+E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\Lib\site-packages\torch\jit\_script.py:1491: FutureWarning: `torch.jit.script` is deprecated. Please switch to `torch.compile` or `torch.export`.
+  warnings.warn(
+[32m[INFO][0m No OpenGL_accelerate module loaded: No module named 'OpenGL_accelerate'
+[1m[33m[WARNING][0m Traceback (most recent call last):
+  File "E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\nodes.py", line 2311, in load_custom_node
+    module_spec = importlib.util.spec_from_file_location(sys_module_name, os.path.join(module_path, "__init__.py"))
+                                                         ^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'sys_module_name' where it is not associated with a value
+
+[1m[33m[WARNING][0m Cannot import E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\comfy_extras\nodes_camera.py module for custom nodes: cannot access local variable 'sys_module_name' where it is not associated with a value
+[1m[33m[WARNING][0m Traceback (most recent call last):
+  File "E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\nodes.py", line 2311, in load_custom_node
+    module_spec = importlib.util.spec_from_file_location(sys_module_name, os.path.join(module_path, "__init__.py"))
+                                                         ^^^^^^^^^^^^^^^
+UnboundLocalError: cannot access local variable 'sys_module_name' where it is not associated with a value
+
+[1m[33m[WARNING][0m Cannot import E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\comfy_extras\nodes_camera_angle.py module for custom nodes: cannot access local variable 'sys_module_name' where it is not associated with a value
+Traceback (most recent call last):
+  File "E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\main.py", line 616, in <module>
+    event_loop, prompt_server, start_all_func = start_comfyui()
+                                                ~~~~~~~~~~~~~^^
+  File "E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\main.py", line 551, in start_comfyui
+    asyncio_loop.run_until_complete(nodes.init_extra_nodes(
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+        init_custom_nodes=(not args.disable_all_custom_nodes) or len(args.whitelist_custom_nodes) > 0,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        init_api_nodes=not args.disable_partner_nodes
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ))
+    ^^
+  File "asyncio\base_events.py", line 725, in run_until_complete
+  File "E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\nodes.py", line 2641, in init_extra_nodes
+    await init_external_custom_nodes()
+  File "E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\nodes.py", line 2430, in init_external_custom_nodes
+    if refusal is not None:
+       ^^^^^^^
+NameError: name 'refusal' is not defined
+[32m[INFO][0m comfy-aimdo XPU: restored the torch.xpu entry points

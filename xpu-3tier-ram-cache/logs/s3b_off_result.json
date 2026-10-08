@@ -1,0 +1,25 @@
+{
+  "port": 8196,
+  "jobs": [
+    {
+      "name": "small",
+      "graph": "PROMPT_small.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "image",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_small\\p3_small_00001_.png",
+          "exists": true,
+          "size": 375068
+        }
+      ],
+      "prompt_id": "fb14b13f-6bea-46bc-911b-d856cf00af5e",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-035547_small_hist.json",
+      "status": "success"
+    }
+  ],
+  "ok": true,
+  "started": 1791489330.5483859,
+  "finished": 1791489359.378466
+}

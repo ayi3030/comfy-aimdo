@@ -1,0 +1,13 @@
+--- main.py
++++ main.py
+@@ -270,6 +270,10 @@
+     if comfy.model_management.is_amd():
+         if comfy.model_management.rocm_version >= (7, 14):
+             return True
++    # Intel XPU (Arc) 路径：is_intel_xpu() 内部已保证仅当 XPU 真实可用时才返回 True，
++    # 故与 NVIDIA 分支同风格直接放行，无需额外的版本判断，保持最小改动。
++    if comfy.model_management.is_intel_xpu():
++        return True
+     return False
+ 
+ 

@@ -1,0 +1,2044 @@
+diff --git a/.github/workflows/build-wheels.yml b/.github/workflows/build-wheels.yml
+index 39e898a..c0e7a71 100644
+--- a/.github/workflows/build-wheels.yml
++++ b/.github/workflows/build-wheels.yml
+@@ -78,6 +78,14 @@ jobs:
+             /Isrc /Isrc-win /IC:/Detours/include /FIcompiler.h /Fe:comfy_aimdo/aimdo_rocm.dll ^
+             /link /LIBPATH:%DETOURS_LIB_DIR% ^
+             cfgmgr32.lib dxgi.lib dxguid.lib setupapi.lib detours.lib onecore.lib
++
++          rem XPU（Intel Arc / Level Zero）后端：不含 CUDA detour / WDDM 检测，故显式列出 win 源文件。
++          cl.exe /LD /O2 /DAIMDO_XPU ^
++            src/*.c src-xpu/dispatch.c ^
++            src-win/disk-id.c src-win/hostbuf-plat.c src-win/model-mmap.c src-win/module-load.c ^
++            src-win/thread-plat.c src-win/xfer-file-plat.c ^
++            /Isrc /Isrc-win /FIcompiler.h /Fe:comfy_aimdo/aimdo_xpu.dll ^
++            /link cfgmgr32.lib setupapi.lib onecore.lib
+         shell: cmd
+ 
+       - name: Build default Stub Wheel
+diff --git a/comfy_aimdo/control.py b/comfy_aimdo/control.py
+index 22032de..f463299 100644
+--- a/comfy_aimdo/control.py
++++ b/comfy_aimdo/control.py
+@@ -52,6 +52,15 @@ def detect_vendor():
+     if cuda:
+         return "cuda"
+ 
++    # Intel XPU（Arc 显卡，torch-xpu wheel）：torch.version.cuda/hip 均为空，
++    # 但 torch.xpu 可用。放在版本号后缀回退之前判断。
++    try:
++        import torch
++        if hasattr(torch, "xpu") and torch.xpu.is_available():
++            return "xpu"
++    except Exception:
++        pass
++
+     if '+cu' in version:
+         return "cuda"
+     if '+rocm' in version:
+@@ -72,12 +81,15 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
+         implementation = detect_vendor()
+ 
+     if implementation is None:
+-        logging.warning("Could not autodetect AIMDO implementation, assuming Nvidia")
+-        implementation = "cuda"
++        # 不再默认假设 Nvidia：无法识别后端时干净地禁用自身（尤其对 XPU 环境，
++        # 避免去加载并不存在的 CUDA 扩展并抛出误导性日志）。
++        logging.warning("comfy-aimdo: could not detect a supported GPU backend; aimdo disabled")
++        return False
+ 
+     impl = {
+         "cuda": "aimdo",
+         "rocm": "aimdo_rocm",
++        "xpu": "aimdo_xpu",
+     }[implementation]
+ 
+     try:
+@@ -96,7 +108,8 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
+         lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
+     except Exception as e:
+         logging.info(f"comfy-aimdo failed to load: {e}")
+-        logging.info(f"NOTE: comfy-aimdo currently only supports Nvidia and AMD GPUs")
++        logging.info("NOTE: comfy-aimdo supports Nvidia (CUDA), AMD (ROCm) and Intel (XPU); "
++                     "the XPU backend requires a locally built aimdo_xpu.{so,dll}")
+         return False
+ 
+     lib.set_log_callback.argtypes = [_LOG_CALLBACK]
+diff --git a/comfy_aimdo/model_vbar.py b/comfy_aimdo/model_vbar.py
+index bc789cb..0b56cf8 100644
+--- a/comfy_aimdo/model_vbar.py
++++ b/comfy_aimdo/model_vbar.py
+@@ -48,6 +48,9 @@ if lib is not None:
+ 
+ class ModelVBAR:
+     def __init__(self, size, device):
++        # 守卫：XPU 等未启用/未构建后端时，给出明确错误而不是 AttributeError。
++        if control.lib is None:
++            raise RuntimeError("comfy-aimdo 未初始化或当前后端(XPU 等)未启用；ModelVBAR 不可用")
+         self._devctx = control.get_devctx(device)
+         self._ptr = lib.vbar_allocate(self._devctx, int(size), device)
+         if not self._ptr:
+diff --git a/comfy_aimdo/torch.py b/comfy_aimdo/torch.py
+index 128684a..37d130e 100644
+--- a/comfy_aimdo/torch.py
++++ b/comfy_aimdo/torch.py
+@@ -2,6 +2,7 @@ import torch
+ import ctypes
+ 
+ import logging
++from pathlib import Path
+ 
+ from . import control
+ 
+@@ -16,7 +17,22 @@ def get_tensor_from_raw_ptr(ptr, size, device):
+     class Holder:
+         pass
+ 
++    # 防御（审查项 R-g）：__cuda_array_interface__ 是 CUDA/HIP 专有协议，XPU 张量由
++    # XPUPluggableAllocator 直接产出、不应经此函数构造。若在此对非 CUDA 设备继续使用该协议，
++    # 会得到难以定位的错误结果。故仅在确认设备为 cuda/HIP（torch 中 HIP 也报 "cuda"）或未指定时放行，
++    # 其余（如 "xpu"）显式报错，避免误用。此守卫对既有 CUDA/HIP 调用路径为恒等放行、无行为变化。
++    _dev_type = getattr(device, "type", None)
++    if _dev_type is None and isinstance(device, str):
++        _dev_type = device.split(":")[0]
++    if _dev_type not in (None, "cuda"):
++        raise NotImplementedError(
++            "comfy-aimdo: get_tensor_from_raw_ptr only supports CUDA/HIP tensors "
++            f"(got device={device!r}). XPU tensors are produced directly by the "
++            "XPUPluggableAllocator; do not route them through the CUDA array interface."
++        )
++
+     holder = Holder()
++    # 注意：这里是 CUDA 专用的 __cuda_array_interface__ 包装；XPU 后端不走此路径。
+     holder.__cuda_array_interface__ = container
+ 
+     return torch.as_tensor(holder, device=device)
+@@ -33,13 +49,51 @@ def hostbuf_to_tensor(hostbuf):
+ #library. Rather than force a second load that pytorch owns, construct these
+ #pytorch internals outselves as sperate CDLL loads is far too risky.
+ 
+-class CUDAPluggableAllocator(torch.cuda.memory.CUDAPluggableAllocator):
+-    def __init__(self):
+-        alloc_fn = ctypes.cast(getattr(control.lib, "alloc_fn"), ctypes.c_void_p).value
+-        free_fn = ctypes.cast(getattr(control.lib, "free_fn"), ctypes.c_void_p).value
+-        assert alloc_fn is not None
+-        assert free_fn is not None
+-        self._allocator = torch._C._cuda_customAllocator(alloc_fn, free_fn)
++# CUDA/HIP 路径：仅在 torch 提供了 CUDA 可插拔分配器基类时定义（XPU-only 环境下不定义，避免导入崩溃）。
++try:
++    _CudaPluggableAllocatorBase = torch.cuda.memory.CUDAPluggableAllocator
++except Exception:
++    _CudaPluggableAllocatorBase = None
++
++if _CudaPluggableAllocatorBase is not None:
++    class CUDAPluggableAllocator(_CudaPluggableAllocatorBase):
++        def __init__(self):
++            alloc_fn = ctypes.cast(getattr(control.lib, "alloc_fn"), ctypes.c_void_p).value
++            free_fn = ctypes.cast(getattr(control.lib, "free_fn"), ctypes.c_void_p).value
++            assert alloc_fn is not None
++            assert free_fn is not None
++            self._allocator = torch._C._cuda_customAllocator(alloc_fn, free_fn)
++
++
++def _xpu_extension_path():
++    """返回本扩展 XPU 动态库的绝对路径（PyTorch XPUPluggableAllocator 需要路径+符号名）。"""
++    import platform
++    ext = "dll" if platform.system() == "Windows" else "so"
++    return str(Path(__file__).parent.resolve() / f"aimdo_xpu.{ext}")
++
++
++def _get_xpu_allocator():
++    """XPU 后端：用 PyTorch XPUPluggableAllocator 注册本扩展导出的 alloc_fn/free_fn。
++
++    API（已联网查证）：torch.xpu.memory.XPUPluggableAllocator(so_path, "alloc_fn", "free_fn")
++                       torch.xpu.memory.change_current_allocator(allocator)
++    必须在首次 XPU 分配前注册。
++    """
++    if control.lib is None:
++        return None
++    try:
++        from torch.xpu import memory as xpu_memory
++    except Exception as e:
++        logging.warning(f"comfy-aimdo: torch.xpu.memory unavailable ({e})")
++        return None
++    try:
++        allocator = xpu_memory.XPUPluggableAllocator(_xpu_extension_path(), "alloc_fn", "free_fn")
++        xpu_memory.change_current_allocator(allocator)
++        return allocator
++    except Exception as e:
++        logging.warning(f"comfy-aimdo: failed to register XPUPluggableAllocator ({e})")
++        return None
++
+ 
+ def get_torch_allocator():
+     #As of this writing (pytorch 2.10), pytorch MemPools + CUDAPluggableAllocator
+@@ -48,5 +102,11 @@ def get_torch_allocator():
+     #suggests that the assumptions of cudaGraphs completely prohibits pool cleanup
+     #on VRAM pressure which ultimately makes this un-usable for our high pressure
+     #allocator.
++    if control.lib is None:
++        return None
++    if control.detect_vendor() == "xpu":
++        return _get_xpu_allocator()
+     logging.warning(f"WARNING: Aimdo+CUDAPluggableAllocator is experimental and unsupported.")
+-    return None if control.lib is None else CUDAPluggableAllocator()
++    if _CudaPluggableAllocatorBase is None:
++        return None
++    return CUDAPluggableAllocator()
+diff --git a/comfy_aimdo/vram_buffer.py b/comfy_aimdo/vram_buffer.py
+index b815d44..1828dc0 100644
+--- a/comfy_aimdo/vram_buffer.py
++++ b/comfy_aimdo/vram_buffer.py
+@@ -26,6 +26,9 @@ if lib is not None:
+ 
+ class VRAMBuffer:
+     def __init__(self, max_size, device):
++        # 守卫：XPU 等未启用/未构建后端时，给出明确错误而不是 AttributeError。
++        if control.lib is None:
++            raise RuntimeError("comfy-aimdo 未初始化或当前后端(XPU 等)未启用；VRAMBuffer 不可用")
+         self._devctx = control.get_devctx(device)
+         self.device = device
+         self.max_size = max_size
+diff --git a/scripts/build-linux-aimdo.sh b/scripts/build-linux-aimdo.sh
+index 122903a..fae346c 100644
+--- a/scripts/build-linux-aimdo.sh
++++ b/scripts/build-linux-aimdo.sh
+@@ -6,6 +6,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ BUILD_DIR="$ROOT_DIR/build"
+ CUDA_OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo.so"
+ ROCM_OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo_rocm.so"
++XPU_OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo_xpu.so"
+ FUNCHOOK_VERSION=1.1.3
+ FUNCHOOK_SRC="$BUILD_DIR/funchook-$FUNCHOOK_VERSION"
+ FUNCHOOK_TARBALL="$BUILD_DIR/funchook-$FUNCHOOK_VERSION.tar.gz"
+@@ -107,3 +108,15 @@ gcc -shared -o "$ROCM_OUTPUT_PATH" -fPIC -O2 -g -pthread \
+     -I"$ROOT_DIR/src" -I"$FUNCHOOK_SRC/include" \
+     $FUNCHOOK_LIBS \
+     -ldl
++
++# XPU（Intel Arc / oneAPI Level Zero）后端：不链接 funchook，且排除 CUDA 专属的
++# cuda-funchooks.c（XPU 通过 PyTorch XPUPluggableAllocator 注册 alloc_fn/free_fn）。
++XPU_POSIX_SOURCES=$(ls "$ROOT_DIR"/src-posix/*.c | grep -v '/cuda-funchooks\.c$')
++
++# shellcheck disable=SC2086
++gcc -shared -o "$XPU_OUTPUT_PATH" -fPIC -O2 -g -pthread \
++    -DAIMDO_XPU \
++    ${AIMDO_EXTRA_CFLAGS:-} \
++    "$ROOT_DIR"/src/*.c "$ROOT_DIR"/src-xpu/dispatch.c $XPU_POSIX_SOURCES \
++    -I"$ROOT_DIR/src" \
++    -ldl
+diff --git a/src-xpu/dispatch.c b/src-xpu/dispatch.c
+new file mode 100644
+index 0000000..8615af7
+--- /dev/null
++++ b/src-xpu/dispatch.c
+@@ -0,0 +1,676 @@
++/* ============================================================================
++ * comfy-aimdo XPU 后端（Intel Arc / oneAPI Level Zero）
++ *
++ * ⚠️⚠️ 未编译 / 未实机验证 ⚠️⚠️
++ *   本文件无法在无 Intel 硬件的环境下编译验证。需在 Intel Arc (B580) 机器上
++ *   按交付说明编译，并完成两项关键实机验证：
++ *     (a) zeVirtualMemReserve/zePhysicalMemCreate/zeVirtualMemMap 在 B580 驱动上
++ *         能否成功（VMM 功能可用性）；
++ *     (b) PyTorch XPUPluggableAllocator 用本文件导出的 alloc_fn 返回的 VMM 设备
++ *         VA 后，PyTorch 能否把它当作合法设备 USM 指针识别并正确回收。
++ *
++ * 设计约束：
++ *   - 不 include 任何 SDK 头（含 <ze_api.h>）。运行时 dlopen Level Zero loader，
++ *     用 dlsym 解析 ze* 符号；ze* 类型在本文件内以「鸭子类型」自行声明。
++ *   - 全部 ze* 函数签名逐字核对自 oneapi-src/level-zero master include/ze_api.h。
++ *   - 未取得确切数值的常量（如结构体 stype）以 #define + TODO 标注，待实机确认。
++ * ==========================================================================*/
++#include "plat.h"
++#include "vrambuf.h"
++
++#if defined(_WIN32) || defined(_WIN64)
++#include <windows.h>
++#define AIMDO_DLOPEN(p)    ((void *)LoadLibraryA(p))
++#define AIMDO_DLSYM(h, s)  ((void *)GetProcAddress((HMODULE)(h), (s)))
++#define AIMDO_DLCLOSE(h)   FreeLibrary((HMODULE)(h))
++#else
++#include <dlfcn.h>
++#define AIMDO_DLOPEN(p)    dlopen((p), RTLD_NOW | RTLD_GLOBAL)
++#define AIMDO_DLSYM(h, s)  dlsym((h), (s))
++#define AIMDO_DLCLOSE(h)   dlclose(h)
++#endif
++
++/* ---- Level Zero 鸭子类型（不 include ze_api.h）---- */
++typedef int       ze_result_t;
++typedef void     *ze_driver_handle_t;
++typedef void     *ze_device_handle_t;
++typedef void     *ze_context_handle_t;
++typedef void     *ze_physical_mem_handle_t;
++typedef uint32_t  ze_init_flags_t;
++typedef uint32_t  ze_structure_type_t;
++typedef uint32_t  ze_memory_type_t;
++typedef uint32_t  ze_memory_access_attribute_t;
++typedef uint32_t  ze_physical_mem_flags_t;
++
++/* 枚举/常量（数值已逐字核对自 oneapi-src/level-zero master include/ze_api.h） */
++#define ZE_SUCCESS                               0
++#define ZE_INIT_FLAG_GPU_ONLY                    (1u << 0)
++#define ZE_MEMORY_TYPE_DEVICE                    2u
++#define ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE     1u
++#define ZE_PHYSICAL_MEM_FLAG_ALLOCATE_ON_DEVICE  (1u << 0)
++/* ze_structure_type_t 取值（关键修正）：
++ *   ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC       = 0x20   <-- 原实现猜为 0x1D 是错的，
++ *       会导致 zePhysicalMemCreate 因 stype 不匹配被驱动拒绝（INVALID_ENUMERATION/ARGUMENT），
++ *       整个 VMM 卸载通路直接失效。已按上游 ze_api.h 更正为 0x20。
++ *   ZE_STRUCTURE_TYPE_CONTEXT_DESC            = 0x0D
++ *   ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES = 0x07 */
++#define ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC      0x20u
++#define ZE_STRUCTURE_TYPE_CONTEXT_DESC           0x0Du
++#define ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES 0x07u
++#define ZE_MAX_DEVICE_NAME                       256
++
++/* 结构体（字段布局按 Level Zero 规范，逐字核对自 ze_api.h） */
++typedef struct {
++    ze_structure_type_t stype;
++    const void *pNext;
++    ze_physical_mem_flags_t flags;
++    size_t size;
++} ze_physical_mem_desc_t;
++
++typedef struct {
++    ze_structure_type_t stype;
++    const void *pNext;
++    /* 原实现漏掉了 flags 字段：zeContextCreate 会读取 desc->flags（偏移 16），
++     * 结构体过短属于越界读取（UB）。补齐以保证 ABI 与驱动一致。flags 置 0。 */
++    uint32_t flags;
++} ze_context_desc_t;
++
++/* ze_device_memory_properties_t：用于取真实显存总量（替代 12GiB 占位值）。
++ * 字段顺序/偏移严格按 ze_api.h：stype(0) pNext(8) flags(16) maxClockRate(20)
++ * maxBusWidth(24) totalSize(32) name(40)。 */
++typedef struct {
++    ze_structure_type_t stype;
++    void *pNext;
++    uint32_t flags;
++    uint32_t maxClockRate;
++    uint32_t maxBusWidth;
++    uint64_t totalSize;
++    char name[ZE_MAX_DEVICE_NAME];
++} ze_device_memory_properties_t;
++
++typedef struct {
++    ze_structure_type_t stype;
++    void *pNext;
++    ze_memory_type_t type;
++    uint64_t id;
++    uint64_t pageSize;
++} ze_memory_allocation_properties_t;
++
++/* ---- 函数指针（签名逐字核对自 ze_api.h）---- */
++static ze_result_t (*p_zeInit)(ze_init_flags_t);
++static ze_result_t (*p_zeDriverGet)(uint32_t *, ze_driver_handle_t *);
++static ze_result_t (*p_zeDeviceGet)(ze_driver_handle_t, uint32_t *, ze_device_handle_t *);
++static ze_result_t (*p_zeContextCreate)(ze_driver_handle_t, const ze_context_desc_t *,
++                                        ze_context_handle_t *);
++static ze_result_t (*p_zeContextDestroy)(ze_context_handle_t);
++static ze_result_t (*p_zeMemGetAllocProperties)(ze_context_handle_t, const void *,
++                                                ze_memory_allocation_properties_t *,
++                                                ze_device_handle_t *);
++static ze_result_t (*p_zeVirtualMemReserve)(ze_context_handle_t, const void *, size_t, void **);
++static ze_result_t (*p_zeVirtualMemFree)(ze_context_handle_t, const void *, size_t);
++static ze_result_t (*p_zeVirtualMemQueryPageSize)(ze_context_handle_t, ze_device_handle_t,
++                                                  size_t, size_t *);
++static ze_result_t (*p_zePhysicalMemCreate)(ze_context_handle_t, ze_device_handle_t,
++                                            const ze_physical_mem_desc_t *,
++                                            ze_physical_mem_handle_t *);
++static ze_result_t (*p_zePhysicalMemDestroy)(ze_context_handle_t, ze_physical_mem_handle_t);
++static ze_result_t (*p_zeVirtualMemMap)(ze_context_handle_t, const void *, size_t,
++                                        ze_physical_mem_handle_t, size_t,
++                                        ze_memory_access_attribute_t);
++static ze_result_t (*p_zeVirtualMemUnmap)(ze_context_handle_t, const void *, size_t);
++static ze_result_t (*p_zeVirtualMemSetAccessAttribute)(ze_context_handle_t, const void *, size_t,
++                                                       ze_memory_access_attribute_t);
++static ze_result_t (*p_zeVirtualMemGetAccessAttribute)(ze_context_handle_t, const void *, size_t,
++                                                       ze_memory_access_attribute_t *, size_t *);
++static ze_result_t (*p_zeDeviceGetMemoryProperties)(ze_device_handle_t, uint32_t *,
++                                                    ze_device_memory_properties_t *);
++
++/* ---- 运行时状态 ---- */
++#define XPU_MAX_DEVICES 16
++/* TODO 待实机：B580 标称显存；正式实现应改由 zeDeviceGetMemoryProperties 或
++ * torch.xpu.mem_get_info() 取得真实总量，此处仅为避免预算数学除零的兜底值。 */
++#define XPU_FALLBACK_VRAM (12ULL << 30)
++
++static void *g_ze_module;
++static ze_context_handle_t g_ze_ctx;
++static ze_device_handle_t  g_ze_devs[XPU_MAX_DEVICES];
++static uint64_t            g_ze_dev_total[XPU_MAX_DEVICES];
++static uint32_t            g_ze_dev_count;
++static size_t              g_ze_page_size = 2 * 1024 * 1024;
++
++GpuDispatch g_gpu;
++extern _Thread_local AimdoContext *g_devctx;
++
++/* 用 zeDeviceGetMemoryProperties 取真实显存总量；失败返回 0，调用方回退占位值。
++ * Level Zero 无「空闲显存」原生查询，故 mem_get_info 仍依赖 aimdo 自身记账。 */
++static uint64_t xpu_query_device_memory(ze_device_handle_t dev) {
++    ze_device_memory_properties_t props[8];
++    uint32_t count = (uint32_t)ARRAY_SIZE(props);
++    uint32_t i;
++    uint64_t total = 0;
++
++    if (!p_zeDeviceGetMemoryProperties) {
++        return 0;
++    }
++    for (i = 0; i < count; i++) {
++        memset(&props[i], 0, sizeof(props[i]));
++        props[i].stype = ZE_STRUCTURE_TYPE_DEVICE_MEMORY_PROPERTIES;
++    }
++    if (p_zeDeviceGetMemoryProperties(dev, &count, props) != ZE_SUCCESS) {
++        return 0;
++    }
++    if (count > ARRAY_SIZE(props)) {
++        count = (uint32_t)ARRAY_SIZE(props);
++    }
++    for (i = 0; i < count; i++) {
++        total += props[i].totalSize;
++    }
++    return total;
++}
++
++/* ============================ GpuDispatch 实现 ============================ */
++
++static gpu_result_t xpu_init(unsigned int flags) {
++    (void)flags;
++    return GPU_SUCCESS; /* 真正的初始化在 aimdo_cuda_runtime_init() 里完成 */
++}
++
++static gpu_result_t xpu_get_error_string(gpu_result_t error, const char **pStr) {
++    (void)error;
++    if (pStr) {
++        *pStr = "Level Zero error (see ze_result_t)";
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_ctx_get_device(gpu_device_t *device) {
++    if (device) {
++        *device = g_ze_dev_count ? g_ze_devs[0] : NULL;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_ctx_synchronize(void) {
++    /* Level Zero 的无队列 VMM 操作本身同步；此处为空操作。 */
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_device_get(gpu_device_t *device, int ordinal) {
++    if (!device || ordinal < 0 || (uint32_t)ordinal >= g_ze_dev_count) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    *device = g_ze_devs[ordinal];
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_device_get_attribute(int *pi, int attrib, gpu_device_t dev) {
++    (void)attrib;
++    (void)dev;
++    if (pi) {
++        *pi = 0; /* 离散 Arc：非集成设备 */
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_device_total_mem(size_t *bytes, gpu_device_t dev) {
++    uint32_t i;
++    (void)dev;
++    if (bytes) {
++        *bytes = g_ze_dev_count ? (size_t)g_ze_dev_total[0] : (size_t)XPU_FALLBACK_VRAM;
++    }
++    (void)i;
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_device_get_name(char *name, int len, gpu_device_t dev) {
++    (void)dev;
++    if (name && len > 0) {
++        /* 正式实现可用 zeDeviceGetProperties 取真实名称（结构体布局待实机核对）。 */
++        snprintf(name, (size_t)len, "Intel XPU device");
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_get_info(size_t *free_bytes, size_t *total_bytes) {
++    /* Level Zero 无原生「空闲显存」查询：用 aimdo 自身记账近似。
++     * 也可在 Python 侧改用 torch.xpu.mem_get_info()。 */
++    size_t total = 0;
++    size_t used = 0;
++
++    if (g_devctx && g_devctx->_device_id >= 0 &&
++        (uint32_t)g_devctx->_device_id < g_ze_dev_count) {
++        total = (size_t)g_ze_dev_total[g_devctx->_device_id];
++        used = (size_t)g_devctx->_total_vram_usage;
++    }
++    if (!total) {
++        total = g_ze_dev_count ? (size_t)g_ze_dev_total[0] : (size_t)XPU_FALLBACK_VRAM;
++        used = 0;
++    }
++    if (total_bytes) {
++        *total_bytes = total;
++    }
++    if (free_bytes) {
++        *free_bytes = total > used ? total - used : 0;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_alloc_host(void **pp, size_t bytesize) {
++    /* 简化：普通堆分配（非固定/精确到 XPU 的 pinned 语义）。待实机验证是否需
++     * 改用 zeHostMemAlloc。 */
++    if (!pp) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    *pp = malloc(bytesize ? bytesize : 1);
++    return *pp ? GPU_SUCCESS : GPU_ERROR_OUT_OF_MEMORY;
++}
++
++static gpu_result_t xpu_mem_free_host(void *p) {
++    free(p);
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_host_register(void *p, size_t bytesize, unsigned int flags) {
++    (void)p;
++    (void)bytesize;
++    (void)flags;
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_host_unregister(void *p) {
++    (void)p;
++    return GPU_SUCCESS;
++}
++
++static inline size_t xpu_align(size_t size) {
++    return (size + g_ze_page_size - 1) & ~(g_ze_page_size - 1);
++}
++
++static gpu_result_t xpu_mem_address_reserve(gpu_deviceptr_t *ptr, size_t size, size_t alignment,
++                                            gpu_deviceptr_t addr, unsigned long long flags) {
++    void *p = NULL;
++    (void)alignment; /* zeVirtualMemReserve 不接受对齐参数，返回即页对齐 */
++    (void)addr;
++    (void)flags;
++    if (!ptr) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    /* 修正 R-a：reserve/free 与 create/map/unmap/setaccess 统一使用 xpu_align(size)，
++     * 避免二者尺寸不一致导致「map 映射范围超出 reserve 预留范围」。
++     * 实机 B580 页大小 64KiB，而入参来自 vrambuf_create 的 2MiB 对齐（CUDA_ALIGN_UP），
++     * 2MiB 是 64KiB 的整数倍 ⇒ xpu_align(size)==size，本改动在 B580 上为恒等变换、无行为变化。
++     * 仅当驱动给出 >2MiB 页时才生效（该情形 init 已另有告警）。 */
++    if (p_zeVirtualMemReserve(g_ze_ctx, NULL, xpu_align(size), &p) != ZE_SUCCESS || !p) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    *ptr = (gpu_deviceptr_t)p;
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_address_free(gpu_deviceptr_t ptr, size_t size) {
++    /* 与 xpu_mem_address_reserve 采用同一 xpu_align，保证 free 尺寸与 reserve 尺寸一致。 */
++    if (p_zeVirtualMemFree(g_ze_ctx, (const void *)ptr, xpu_align(size)) != ZE_SUCCESS) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_create(gpu_mem_handle_t *handle, size_t size,
++                                   const gpu_mem_prop_t *prop, unsigned long long flags) {
++    ze_physical_mem_desc_t desc;
++    ze_physical_mem_handle_t h = NULL;
++    int dev_id = prop ? prop->location.id : 0;
++    ze_device_handle_t dev;
++    (void)flags;
++
++    if (!handle) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    dev = (dev_id >= 0 && (uint32_t)dev_id < g_ze_dev_count) ? g_ze_devs[dev_id] : g_ze_devs[0];
++
++    memset(&desc, 0, sizeof(desc));
++    desc.stype = ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC;
++    desc.flags = ZE_PHYSICAL_MEM_FLAG_ALLOCATE_ON_DEVICE;
++    desc.size  = xpu_align(size);
++
++    if (p_zePhysicalMemCreate(g_ze_ctx, dev, &desc, &h) != ZE_SUCCESS || !h) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    *handle = (gpu_mem_handle_t)h;
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_map(gpu_deviceptr_t ptr, size_t size, size_t offset,
++                                gpu_mem_handle_t handle, unsigned long long flags) {
++    (void)flags;
++    if (p_zeVirtualMemMap(g_ze_ctx, (const void *)ptr, xpu_align(size),
++                          (ze_physical_mem_handle_t)handle, offset,
++                          ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE) != ZE_SUCCESS) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_set_access(gpu_deviceptr_t ptr, size_t size,
++                                       const gpu_mem_access_desc_t *desc, size_t count) {
++    (void)desc;
++    (void)count;
++    if (p_zeVirtualMemSetAccessAttribute(g_ze_ctx, (const void *)ptr, xpu_align(size),
++                                         ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE) != ZE_SUCCESS) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_unmap(gpu_deviceptr_t ptr, size_t size) {
++    if (p_zeVirtualMemUnmap(g_ze_ctx, (const void *)ptr, xpu_align(size)) != ZE_SUCCESS) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_mem_release(gpu_mem_handle_t handle) {
++    if (p_zePhysicalMemDestroy(g_ze_ctx, (ze_physical_mem_handle_t)handle) != ZE_SUCCESS) {
++        return GPU_ERROR_OUT_OF_MEMORY;
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_memcpy_htod_async(gpu_deviceptr_t dst, const void *src,
++                                          size_t bytes, gpu_stream_t stream) {
++    /* 未实现：VMM 设备 VA 不可被 CPU 直接访问，需经 zeCommandListAppendMemoryCopy 拷贝。
++     * 关键：返回「非 0」而非 GPU_SUCCESS —— 否则 hostbuf_read_file_slice /
++     * hostbuf_file_reader_read 里的 CHECK_CU(cuMemcpyHtoDAsync(...)) 会判成功，
++     * 导致「文件已读进 hostbuf 但从未拷到显存」的静默数据损坏（调用方误以为完成）。
++     * 返回非 0 会让它们向上返回 false，使缺口显式暴露。
++     * 实机 B580 已确认此为空操作占位，是本后端唯一未实现的功能路径，须用
++     * zeCommandListAppendMemoryCopy 补齐。*/
++    (void)dst;
++    (void)src;
++    (void)bytes;
++    (void)stream;
++    log(AIMDO_LOG_ERROR,
++        "%s: XPU host->device copy not implemented; hostbuf file->VRAM loading disabled\n",
++        __func__);
++    return 1; /* 非 0 = 失败：避免静默数据损坏 */
++}
++
++static gpu_result_t xpu_event_create(gpu_event_t *phEvent, unsigned int flags) {
++    (void)flags;
++    if (phEvent) {
++        *phEvent = (gpu_event_t)(uintptr_t)1; /* 哨兵非空句柄 */
++    }
++    return GPU_SUCCESS;
++}
++
++static gpu_result_t xpu_event_destroy(gpu_event_t hEvent) { (void)hEvent; return GPU_SUCCESS; }
++static gpu_result_t xpu_event_record(gpu_event_t hEvent, gpu_stream_t hStream) {
++    (void)hEvent; (void)hStream; return GPU_SUCCESS;
++}
++static gpu_result_t xpu_event_synchronize(gpu_event_t hEvent) { (void)hEvent; return GPU_SUCCESS; }
++
++static gpu_result_t xpu_device_get_luid(char *luid, unsigned int *deviceNodeMask,
++                                        gpu_device_t dev) {
++    (void)dev;
++    if (luid) {
++        memset(luid, 0, 16);
++    }
++    if (deviceNodeMask) {
++        *deviceNodeMask = 1;
++    }
++    return GPU_SUCCESS;
++}
++
++/* ====================== 运行时初始化 / 清理 ============================== */
++
++static bool xpu_resolve(void **slot, const char *name) {
++    *slot = AIMDO_DLSYM(g_ze_module, name);
++    if (!*slot) {
++        log(AIMDO_LOG_ERROR, "comfy-aimdo XPU: failed to resolve symbol %s\n", name);
++        return false;
++    }
++    return true;
++}
++
++bool aimdo_cuda_runtime_init(void) {
++    static const char *const loader_names[] = {
++#if defined(_WIN32) || defined(_WIN64)
++        "ze_loader.dll",
++        "ze_api.dll",
++#else
++        "libze_loader.so.1",
++        "libze_loader.so",
++#endif
++    };
++    uint32_t i;
++    ze_driver_handle_t driver = NULL;
++    uint32_t driver_count = 0;
++    ze_context_desc_t ctx_desc;
++
++    if (p_zeInit) {
++        return true; /* 已初始化 */
++    }
++
++    for (i = 0; i < ARRAY_SIZE(loader_names); i++) {
++        g_ze_module = AIMDO_DLOPEN(loader_names[i]);
++        if (g_ze_module) {
++            break;
++        }
++    }
++    if (!g_ze_module) {
++        log(AIMDO_LOG_ERROR, "comfy-aimdo XPU: Level Zero loader not found\n");
++        return false;
++    }
++
++    if (!xpu_resolve((void **)&p_zeInit, "zeInit") ||
++        !xpu_resolve((void **)&p_zeDriverGet, "zeDriverGet") ||
++        !xpu_resolve((void **)&p_zeDeviceGet, "zeDeviceGet") ||
++        !xpu_resolve((void **)&p_zeContextCreate, "zeContextCreate") ||
++        !xpu_resolve((void **)&p_zeContextDestroy, "zeContextDestroy") ||
++        !xpu_resolve((void **)&p_zeMemGetAllocProperties, "zeMemGetAllocProperties") ||
++        !xpu_resolve((void **)&p_zeVirtualMemReserve, "zeVirtualMemReserve") ||
++        !xpu_resolve((void **)&p_zeVirtualMemFree, "zeVirtualMemFree") ||
++        !xpu_resolve((void **)&p_zeVirtualMemQueryPageSize, "zeVirtualMemQueryPageSize") ||
++        !xpu_resolve((void **)&p_zePhysicalMemCreate, "zePhysicalMemCreate") ||
++        !xpu_resolve((void **)&p_zePhysicalMemDestroy, "zePhysicalMemDestroy") ||
++        !xpu_resolve((void **)&p_zeVirtualMemMap, "zeVirtualMemMap") ||
++        !xpu_resolve((void **)&p_zeVirtualMemUnmap, "zeVirtualMemUnmap") ||
++        !xpu_resolve((void **)&p_zeVirtualMemSetAccessAttribute, "zeVirtualMemSetAccessAttribute") ||
++        !xpu_resolve((void **)&p_zeVirtualMemGetAccessAttribute, "zeVirtualMemGetAccessAttribute")) {
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++
++    /* 可选符号：取真实显存总量（缺失时回退 XPU_FALLBACK_VRAM，不影响 VMM 主通路）。 */
++    p_zeDeviceGetMemoryProperties =
++        (ze_result_t (*)(ze_device_handle_t, uint32_t *, ze_device_memory_properties_t *))
++        AIMDO_DLSYM(g_ze_module, "zeDeviceGetMemoryProperties");
++    if (!p_zeDeviceGetMemoryProperties) {
++        log(WARNING, "comfy-aimdo XPU: zeDeviceGetMemoryProperties unavailable; using fallback VRAM\n");
++    }
++
++    if (p_zeInit(ZE_INIT_FLAG_GPU_ONLY) != ZE_SUCCESS) {
++        log(AIMDO_LOG_ERROR, "comfy-aimdo XPU: zeInit failed\n");
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++
++    p_zeDriverGet(&driver_count, NULL);
++    if (driver_count == 0) {
++        log(AIMDO_LOG_ERROR, "comfy-aimdo XPU: no Level Zero driver\n");
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++    driver_count = 1;
++    if (p_zeDriverGet(&driver_count, &driver) != ZE_SUCCESS || !driver) {
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++
++    p_zeDeviceGet(driver, &g_ze_dev_count, NULL);
++    if (g_ze_dev_count == 0) {
++        log(AIMDO_LOG_ERROR, "comfy-aimdo XPU: no XPU devices\n");
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++    if (g_ze_dev_count > XPU_MAX_DEVICES) {
++        g_ze_dev_count = XPU_MAX_DEVICES;
++    }
++    if (p_zeDeviceGet(driver, &g_ze_dev_count, g_ze_devs) != ZE_SUCCESS) {
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++
++    memset(&ctx_desc, 0, sizeof(ctx_desc));
++    /* 规范要求 stype=ZE_STRUCTURE_TYPE_CONTEXT_DESC(0x0D)；驱动据此做参数校验。
++     * （设计文档曾记「全 0 即可」，但对照 ze_api.h 与上游 llama.cpp 用法，置 0x0D 更稳妥。）*/
++    ctx_desc.stype = ZE_STRUCTURE_TYPE_CONTEXT_DESC;
++    if (p_zeContextCreate(driver, &ctx_desc, &g_ze_ctx) != ZE_SUCCESS || !g_ze_ctx) {
++        log(AIMDO_LOG_ERROR, "comfy-aimdo XPU: zeContextCreate failed\n");
++        aimdo_cuda_runtime_cleanup();
++        return false;
++    }
++
++    if (p_zeVirtualMemQueryPageSize(g_ze_ctx, g_ze_devs[0], 1, &g_ze_page_size) != ZE_SUCCESS ||
++        g_ze_page_size == 0) {
++        g_ze_page_size = 2 * 1024 * 1024; /* 兜底；实机 B580 实测为 64KiB */
++    }
++    /* 实机 B580 页大小为 64KiB，整除 VBAR(32MiB)/vrambuf(16MiB) 块，对齐无风险。
++     * 防御：若驱动给出 > 2MiB 的页大小，three_stooges 隐含的 2MiB 对齐假设可能不成立。*/
++    if (g_ze_page_size > (size_t)(2 * 1024 * 1024)) {
++        log(WARNING,
++            "comfy-aimdo XPU: page size %zu exceeds 2MiB; alignment assumptions may break\n",
++            g_ze_page_size);
++    }
++
++    for (i = 0; i < g_ze_dev_count; i++) {
++        uint64_t total = xpu_query_device_memory(g_ze_devs[i]);
++        /* 查询失败时回退占位值，避免预算数学除零（真实值应在实机确认）。 */
++        g_ze_dev_total[i] = total ? total : XPU_FALLBACK_VRAM;
++    }
++
++    /* 填充中性分发 */
++    g_gpu.p_init = xpu_init;
++    g_gpu.p_get_error_string = xpu_get_error_string;
++    g_gpu.p_ctx_get_device = xpu_ctx_get_device;
++    g_gpu.p_ctx_synchronize = xpu_ctx_synchronize;
++    g_gpu.p_device_get = xpu_device_get;
++    g_gpu.p_device_get_attribute = xpu_device_get_attribute;
++    g_gpu.p_device_total_mem = xpu_device_total_mem;
++    g_gpu.p_device_get_name = xpu_device_get_name;
++    g_gpu.p_mem_get_info = xpu_mem_get_info;
++    g_gpu.p_mem_alloc_host = xpu_mem_alloc_host;
++    g_gpu.p_mem_free_host = xpu_mem_free_host;
++    g_gpu.p_mem_host_register = xpu_mem_host_register;
++    g_gpu.p_mem_host_unregister = xpu_mem_host_unregister;
++    g_gpu.p_mem_address_reserve = xpu_mem_address_reserve;
++    g_gpu.p_mem_address_free = xpu_mem_address_free;
++    g_gpu.p_mem_create = xpu_mem_create;
++    g_gpu.p_mem_map = xpu_mem_map;
++    g_gpu.p_mem_set_access = xpu_mem_set_access;
++    g_gpu.p_mem_unmap = xpu_mem_unmap;
++    g_gpu.p_mem_release = xpu_mem_release;
++    g_gpu.p_memcpy_htod_async = xpu_memcpy_htod_async;
++    g_gpu.p_event_create = xpu_event_create;
++    g_gpu.p_event_destroy = xpu_event_destroy;
++    g_gpu.p_event_record = xpu_event_record;
++    g_gpu.p_event_synchronize = xpu_event_synchronize;
++    g_gpu.p_device_get_luid = xpu_device_get_luid;
++
++    log(INFO, "comfy-aimdo XPU backend initialized (%u device(s), page=%zu)\n",
++        g_ze_dev_count, g_ze_page_size);
++    return true;
++}
++
++void aimdo_cuda_runtime_cleanup(void) {
++    if (p_zeContextDestroy && g_ze_ctx) {
++        p_zeContextDestroy(g_ze_ctx);
++    }
++    g_ze_ctx = NULL;
++    memset(g_ze_devs, 0, sizeof(g_ze_devs));
++    g_ze_dev_count = 0;
++    memset(&g_gpu, 0, sizeof(g_gpu));
++
++    if (g_ze_module) {
++        AIMDO_DLCLOSE(g_ze_module);
++        g_ze_module = NULL;
++    }
++
++    p_zeInit = NULL;
++    p_zeDriverGet = NULL;
++    p_zeDeviceGet = NULL;
++    p_zeContextCreate = NULL;
++    p_zeContextDestroy = NULL;
++    p_zeMemGetAllocProperties = NULL;
++    p_zeVirtualMemReserve = NULL;
++    p_zeVirtualMemFree = NULL;
++    p_zeVirtualMemQueryPageSize = NULL;
++    p_zePhysicalMemCreate = NULL;
++    p_zePhysicalMemDestroy = NULL;
++    p_zeVirtualMemMap = NULL;
++    p_zeVirtualMemUnmap = NULL;
++    p_zeVirtualMemSetAccessAttribute = NULL;
++    p_zeVirtualMemGetAccessAttribute = NULL;
++    p_zeDeviceGetMemoryProperties = NULL;
++}
++
++/* ================== PyTorch XPUPluggableAllocator 入口 ==================== */
++/* PyTorch 侧：torch.xpu.memory.XPUPluggableAllocator(so_path, "alloc_fn", "free_fn")
++ * 再 torch.xpu.memory.change_current_allocator(...)。
++ * 签名：void *alloc_fn(size_t size, int device, sycl::queue *queue)（queue 当 void* 忽略）*/
++
++static inline unsigned int xpu_vmm_hash(gpu_deviceptr_t ptr) {
++    return (unsigned int)(((uintptr_t)(void *)ptr >> 21) % VMM_HASH_SIZE);
++}
++
++SHARED_EXPORT
++void *alloc_fn(size_t size, int device, gpu_stream_t stream) {
++    VramBuffer *entry;
++    unsigned int h;
++    (void)stream; /* sycl::queue*，本后端无需 */
++
++    if (!set_devctx_for_device(device)) {
++        return NULL;
++    }
++
++    entry = vrambuf_create(device, size);
++    if (!entry) {
++        return NULL;
++    }
++    if (!vrambuf_grow(entry, size)) {
++        vrambuf_destroy(entry);
++        return NULL;
++    }
++
++    h = xpu_vmm_hash(vrambuf_get(entry));
++    entry->next = vmm_table[h];
++    vmm_table[h] = entry;
++    allocations_dirty = true;
++
++    return (void *)vrambuf_get(entry);
++}
++
++SHARED_EXPORT
++void free_fn(void *ptr, size_t size, int device, gpu_stream_t stream) {
++    (void)size;
++    (void)stream;
++
++    if (!ptr || !set_devctx_for_device(device)) {
++        return;
++    }
++
++    for (VramBuffer **curr = &vmm_table[xpu_vmm_hash((gpu_deviceptr_t)ptr)]; *curr;
++         curr = &(*curr)->next) {
++        VramBuffer *entry = *curr;
++
++        if (vrambuf_get(entry) != (gpu_deviceptr_t)ptr || entry->device != device) {
++            continue;
++        }
++        *curr = entry->next;
++        allocations_dirty = true;
++        vrambuf_destroy(entry);
++        return;
++    }
++
++    log(AIMDO_LOG_ERROR, "%s: could not find VRAM@%p\n", __func__, ptr);
++}
+diff --git a/src/control.c b/src/control.c
+index c7e2809..dd10c4f 100644
+--- a/src/control.c
++++ b/src/control.c
+@@ -20,10 +20,10 @@ static size_t calculate_integrated_ram_headroom(size_t total_bytes) {
+     return headroom;
+ }
+ 
+-static bool is_integrated_cuda_device(CUdevice dev) {
++static bool is_integrated_cuda_device(gpu_device_t dev) {
+     int integrated = 0;
+ 
+-    return CHECK_CU(cuDeviceGetAttribute(&integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, dev)) &&
++    return CHECK_CU(cuDeviceGetAttribute(&integrated, GPU_DEVICE_ATTRIBUTE_INTEGRATED, dev)) &&
+            integrated;
+ }
+ 
+@@ -97,7 +97,7 @@ bool set_devctx_for_device(int device_id) {
+ }
+ 
+ bool set_devctx_for_current_cuda_device(void) {
+-    CUdevice device;
++    gpu_device_t device;
+ 
+     if (!CHECK_CU(cuCtxGetDevice(&device))) {
+         set_devctx(NULL);
+@@ -237,7 +237,7 @@ bool init(const int *cuda_device_ids, const uint64_t *extra_vram_headrooms, size
+     g_all_devctx_count = num_devices;
+ 
+     for (i = 0; i < num_devices; i++) {
+-        CUdevice dev;
++        gpu_device_t dev;
+         char dev_name[256];
+         AimdoContext *devctx = &g_all_devctxs[i];
+ 
+diff --git a/src/control.h b/src/control.h
+index 9c024c1..6558896 100644
+--- a/src/control.h
++++ b/src/control.h
+@@ -21,8 +21,8 @@ typedef struct ModelVBAR ModelVBAR;
+ typedef struct HostbufFileReaderSlot {
+     uint8_t *buffer;
+     uint64_t offset;
+-    CUstream stream;
+-    CUevent event;
++    gpu_stream_t stream;
++    gpu_event_t event;
+ } HostbufFileReaderSlot;
+ 
+ typedef struct AimdoContext {
+diff --git a/src/gpu_abi.h b/src/gpu_abi.h
+index aed2882..a1bccea 100644
+--- a/src/gpu_abi.h
++++ b/src/gpu_abi.h
+@@ -109,3 +109,65 @@ typedef enum CUdriverProcAddressQueryResult_enum {
+     CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND = 1,
+     CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT = 2,
+ } CUdriverProcAddressQueryResult;
++
++/* ============================================================================
++ * 后端无关中性类型（XPU 适配新增）
++ *
++ * 目的：让共享的 src/*.c 在不改动逻辑的前提下同时服务 CUDA / HIP / XPU。
++ *  - AIMDO_XPU 构建：真中性类型，完全不依赖任何 CUDA 类型（Level Zero 后端填充 g_gpu）。
++ *  - CUDA/HIP 构建：typedef 回原 CUDA 类型（HIP 的驱动 API 与 CUDA ABI 兼容），
++ *                  因此既有调用点语义与字节级行为完全不变。
++ *
++ * 注意：gpu_mem_prop_t 的字段布局对齐 CUDA 的 CUmemAllocationProp 的三个关键字段
++ *       （type / location.type / location.id），以便 three_stooges() 用同一份字面量
++ *       初始化语法在两种后端下都能编译。
++ * ==========================================================================*/
++#if defined(AIMDO_XPU)
++typedef int    gpu_result_t;
++typedef void  *gpu_device_t;
++typedef void  *gpu_deviceptr_t;
++typedef void  *gpu_mem_handle_t;
++typedef void  *gpu_stream_t;   /* Level Zero 无 CUDA stream 概念，占位 */
++typedef void  *gpu_event_t;    /* Level Zero 事件用占位实现 */
++
++typedef struct gpu_mem_location_st {
++    int type;
++    int id;
++} gpu_mem_location_t;
++
++typedef struct gpu_mem_access_desc_st {
++    gpu_mem_location_t location;
++    int flags;
++} gpu_mem_access_desc_t;
++
++typedef struct gpu_mem_prop_st {
++    int type;
++    int requestedHandleTypes;
++    gpu_mem_location_t location;
++} gpu_mem_prop_t;
++
++#define GPU_SUCCESS                          0
++#define GPU_ERROR_OUT_OF_MEMORY              2
++#define GPU_MEM_ALLOCATION_TYPE_PINNED       1
++#define GPU_MEM_LOCATION_TYPE_DEVICE         1
++#define GPU_MEM_ACCESS_FLAGS_PROT_READWRITE  3
++#define GPU_EVENT_DISABLE_TIMING             0x2
++#define GPU_DEVICE_ATTRIBUTE_INTEGRATED      18
++#else
++typedef CUresult                        gpu_result_t;
++typedef CUdevice                        gpu_device_t;
++typedef CUdeviceptr                     gpu_deviceptr_t;
++typedef CUmemGenericAllocationHandle    gpu_mem_handle_t;
++typedef CUstream                        gpu_stream_t;
++typedef CUevent                         gpu_event_t;
++typedef CUmemAllocationProp             gpu_mem_prop_t;
++typedef CUmemAccessDesc                 gpu_mem_access_desc_t;
++
++#define GPU_SUCCESS                          CUDA_SUCCESS
++#define GPU_ERROR_OUT_OF_MEMORY              CUDA_ERROR_OUT_OF_MEMORY
++#define GPU_MEM_ALLOCATION_TYPE_PINNED       CU_MEM_ALLOCATION_TYPE_PINNED
++#define GPU_MEM_LOCATION_TYPE_DEVICE         CU_MEM_LOCATION_TYPE_DEVICE
++#define GPU_MEM_ACCESS_FLAGS_PROT_READWRITE  CU_MEM_ACCESS_FLAGS_PROT_READWRITE
++#define GPU_EVENT_DISABLE_TIMING             CU_EVENT_DISABLE_TIMING
++#define GPU_DEVICE_ATTRIBUTE_INTEGRATED      CU_DEVICE_ATTRIBUTE_INTEGRATED
++#endif
+diff --git a/src/gpu_dispatch.h b/src/gpu_dispatch.h
+index 3323308..cfb19a6 100644
+--- a/src/gpu_dispatch.h
++++ b/src/gpu_dispatch.h
+@@ -4,6 +4,15 @@
+ 
+ #include <stdbool.h>
+ 
++/* 后端运行时初始化/清理：每个后端（src-cuda / src-hip / src-xpu 的 dispatch.c）
++ * 各自定义同名符号，共享层只调用这一个入口，因此无需改动 control.c。 */
++bool aimdo_cuda_runtime_init(void);
++void aimdo_cuda_runtime_cleanup(void);
++
++#if !defined(AIMDO_XPU)
++/* ---------------------------------------------------------------------------
++ * CUDA / HIP 后端：沿用原有基于 CUDA 驱动 API 形状的分发结构。
++ * -------------------------------------------------------------------------*/
+ typedef CUresult (CUDAAPI *PFN_cuInit)(unsigned int flags);
+ typedef CUresult (CUDAAPI *PFN_cuGetProcAddress)(const char *symbol, void **pfn, int cudaVersion,
+                                                  cuuint64_t flags,
+@@ -94,10 +103,78 @@ typedef CUresult (CUDAAPI *PFN_deviceGetProperties)(void *prop, CUdevice dev);
+ 
+ extern PFN_deviceGetProperties g_device_get_properties;
+ 
+-bool aimdo_cuda_runtime_init(void);
+-void aimdo_cuda_runtime_cleanup(void);
+-
+ #if (defined(_WIN32) || defined(_WIN64)) && defined(AIMDO_CUDA)
+ bool aimdo_nvml_device_init(CUdevice device, void **handle);
+ bool aimdo_nvml_memory_info(void *handle, size_t *free_bytes, size_t *total_bytes);
+ #endif
++
++#else /* AIMDO_XPU -----------------------------------------------------------
++ * XPU（Intel Arc / oneAPI Level Zero）后端：后端无关中性分发结构。
++ * 由 src-xpu/dispatch.c 在 aimdo_cuda_runtime_init() 中填充。
++ * -------------------------------------------------------------------------*/
++typedef gpu_result_t (*PFN_gpu_init)(unsigned int flags);
++typedef gpu_result_t (*PFN_gpu_get_error_string)(gpu_result_t error, const char **pStr);
++typedef gpu_result_t (*PFN_gpu_ctx_get_device)(gpu_device_t *device);
++typedef gpu_result_t (*PFN_gpu_ctx_synchronize)(void);
++typedef gpu_result_t (*PFN_gpu_device_get)(gpu_device_t *device, int ordinal);
++typedef gpu_result_t (*PFN_gpu_device_get_attribute)(int *pi, int attrib, gpu_device_t dev);
++typedef gpu_result_t (*PFN_gpu_device_total_mem)(size_t *bytes, gpu_device_t dev);
++typedef gpu_result_t (*PFN_gpu_device_get_name)(char *name, int len, gpu_device_t dev);
++typedef gpu_result_t (*PFN_gpu_mem_get_info)(size_t *free_bytes, size_t *total_bytes);
++typedef gpu_result_t (*PFN_gpu_mem_alloc_host)(void **pp, size_t bytesize);
++typedef gpu_result_t (*PFN_gpu_mem_free_host)(void *p);
++typedef gpu_result_t (*PFN_gpu_mem_host_register)(void *p, size_t bytesize, unsigned int flags);
++typedef gpu_result_t (*PFN_gpu_mem_host_unregister)(void *p);
++typedef gpu_result_t (*PFN_gpu_mem_address_reserve)(gpu_deviceptr_t *ptr, size_t size,
++                                                    size_t alignment, gpu_deviceptr_t addr,
++                                                    unsigned long long flags);
++typedef gpu_result_t (*PFN_gpu_mem_address_free)(gpu_deviceptr_t ptr, size_t size);
++typedef gpu_result_t (*PFN_gpu_mem_create)(gpu_mem_handle_t *handle, size_t size,
++                                           const gpu_mem_prop_t *prop,
++                                           unsigned long long flags);
++typedef gpu_result_t (*PFN_gpu_mem_map)(gpu_deviceptr_t ptr, size_t size, size_t offset,
++                                        gpu_mem_handle_t handle, unsigned long long flags);
++typedef gpu_result_t (*PFN_gpu_mem_set_access)(gpu_deviceptr_t ptr, size_t size,
++                                               const gpu_mem_access_desc_t *desc, size_t count);
++typedef gpu_result_t (*PFN_gpu_mem_unmap)(gpu_deviceptr_t ptr, size_t size);
++typedef gpu_result_t (*PFN_gpu_mem_release)(gpu_mem_handle_t handle);
++typedef gpu_result_t (*PFN_gpu_memcpy_htod_async)(gpu_deviceptr_t dst, const void *src,
++                                                  size_t bytes, gpu_stream_t stream);
++typedef gpu_result_t (*PFN_gpu_event_create)(gpu_event_t *phEvent, unsigned int flags);
++typedef gpu_result_t (*PFN_gpu_event_destroy)(gpu_event_t hEvent);
++typedef gpu_result_t (*PFN_gpu_event_record)(gpu_event_t hEvent, gpu_stream_t hStream);
++typedef gpu_result_t (*PFN_gpu_event_synchronize)(gpu_event_t hEvent);
++typedef gpu_result_t (*PFN_gpu_device_get_luid)(char *luid, unsigned int *deviceNodeMask,
++                                                gpu_device_t dev);
++
++typedef struct GpuDispatch {
++    PFN_gpu_init p_init;
++    PFN_gpu_get_error_string p_get_error_string;
++    PFN_gpu_ctx_get_device p_ctx_get_device;
++    PFN_gpu_ctx_synchronize p_ctx_synchronize;
++    PFN_gpu_device_get p_device_get;
++    PFN_gpu_device_get_attribute p_device_get_attribute;
++    PFN_gpu_device_total_mem p_device_total_mem;
++    PFN_gpu_device_get_name p_device_get_name;
++    PFN_gpu_mem_get_info p_mem_get_info;
++    PFN_gpu_mem_alloc_host p_mem_alloc_host;
++    PFN_gpu_mem_free_host p_mem_free_host;
++    PFN_gpu_mem_host_register p_mem_host_register;
++    PFN_gpu_mem_host_unregister p_mem_host_unregister;
++    PFN_gpu_mem_address_reserve p_mem_address_reserve;
++    PFN_gpu_mem_address_free p_mem_address_free;
++    PFN_gpu_mem_create p_mem_create;
++    PFN_gpu_mem_map p_mem_map;
++    PFN_gpu_mem_set_access p_mem_set_access;
++    PFN_gpu_mem_unmap p_mem_unmap;
++    PFN_gpu_mem_release p_mem_release;
++    PFN_gpu_memcpy_htod_async p_memcpy_htod_async;
++    PFN_gpu_event_create p_event_create;
++    PFN_gpu_event_destroy p_event_destroy;
++    PFN_gpu_event_record p_event_record;
++    PFN_gpu_event_synchronize p_event_synchronize;
++    PFN_gpu_device_get_luid p_device_get_luid;
++} GpuDispatch;
++
++extern GpuDispatch g_gpu;
++#endif
+\ No newline at end of file
+diff --git a/src/hostbuf-file-reader.c b/src/hostbuf-file-reader.c
+index 69395ac..d30dea1 100644
+--- a/src/hostbuf-file-reader.c
++++ b/src/hostbuf-file-reader.c
+@@ -20,11 +20,11 @@ static bool hostbuf_file_reader_retire_active(void) {
+             g_devctx->_hostbuf_file_reader_active);
+         return false;
+     }
+-    return CHECK_CU(cuEventCreate(&slot->event, CU_EVENT_DISABLE_TIMING)) &&
+-           CHECK_CU(cuEventRecord(slot->event, (CUstream)slot->stream));
++    return CHECK_CU(cuEventCreate(&slot->event, GPU_EVENT_DISABLE_TIMING)) &&
++           CHECK_CU(cuEventRecord(slot->event, (gpu_stream_t)slot->stream));
+ }
+ 
+-static HostbufFileReaderSlot *hostbuf_file_reader_next(cudaStream_t stream) {
++static HostbufFileReaderSlot *hostbuf_file_reader_next(gpu_stream_t stream) {
+     HostbufFileReaderSlot *slot;
+ 
+     g_devctx->_hostbuf_file_reader_active =
+@@ -45,13 +45,13 @@ static HostbufFileReaderSlot *hostbuf_file_reader_next(cudaStream_t stream) {
+     }
+ 
+     slot->offset = 0;
+-    slot->stream = (CUstream)stream;
++    slot->stream = (gpu_stream_t)stream;
+     return slot;
+ }
+ 
+ SHARED_EXPORT
+ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_offset,
+-                              uint64_t size, cudaStream_t stream,
++                              uint64_t size, gpu_stream_t stream,
+                               uint64_t device_ptr, bool mark_cold) {
+     if (size == 0) {
+         return true;
+@@ -67,7 +67,7 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
+             &g_devctx->_hostbuf_file_reader_slots[g_devctx->_hostbuf_file_reader_active];
+         size_t chunk;
+ 
+-        if (!slot || slot->stream != (CUstream)stream ||
++        if (!slot || slot->stream != (gpu_stream_t)stream ||
+             (slot->offset + size >= HOSTBUF_FILE_READER_WINDOW &&
+              slot->offset >= LEAD_IN_THRESHOLD)) {
+             if (!hostbuf_file_reader_retire_active() ||
+@@ -83,9 +83,9 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
+                 __func__, (ull)file_handle, (ull)file_offset, chunk);
+             return false;
+         }
+-        CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)device_ptr,
++        gpu_result_t copy_result = cuMemcpyHtoDAsync((gpu_deviceptr_t)device_ptr,
+                                                  slot->buffer + slot->offset,
+-                                                 chunk, (CUstream)stream);
++                                                 chunk, (gpu_stream_t)stream);
+         if (!CHECK_CU(copy_result)) {
+             log(AIMDO_LOG_ERROR, "%s: device copy failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
+                 __func__, (int)copy_result, (void *)(uintptr_t)device_ptr, device,
+diff --git a/src/hostbuf.c b/src/hostbuf.c
+index d9356f5..c477715 100644
+--- a/src/hostbuf.c
++++ b/src/hostbuf.c
+@@ -238,7 +238,7 @@ SHARED_EXPORT
+ bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
+                              uint64_t file_handle, uint64_t file_offset,
+                              uint64_t size, uint64_t offset,
+-                             cudaStream_t stream, uint64_t device_ptr) {
++                             gpu_stream_t stream, uint64_t device_ptr) {
+     HostBuffer *hostbuf = (HostBuffer *)hostbuf_ptr;
+     char *host;
+ 
+@@ -275,8 +275,8 @@ bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
+                 (ull)(offset + done));
+             return false;
+         }
+-        CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)(device_ptr + done),
+-                                                 host + done, chunk, (CUstream)stream);
++        gpu_result_t copy_result = cuMemcpyHtoDAsync((gpu_deviceptr_t)(device_ptr + done),
++                                                 host + done, chunk, (gpu_stream_t)stream);
+         if (!CHECK_CU(copy_result)) {
+             log(AIMDO_LOG_ERROR, "%s: device copy failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
+                 __func__, (int)copy_result, (void *)(uintptr_t)(device_ptr + done),
+diff --git a/src/malloc-graph.c b/src/malloc-graph.c
+index 477f579..4452cdb 100644
+--- a/src/malloc-graph.c
++++ b/src/malloc-graph.c
+@@ -73,7 +73,7 @@ typedef struct {
+ struct SmallRange {
+     size_t offset;
+     size_t bytes;
+-    CUdeviceptr rogue_ptr;
++    gpu_deviceptr_t rogue_ptr;
+     uint32_t owner_depth;
+     Event *allocation;
+ 
+@@ -88,7 +88,7 @@ struct AllocationState {
+ typedef struct {
+     VirtualRange *base;
+     VirtualRange *small_base;
+-    CUstream stream;
++    gpu_stream_t stream;
+     int device;
+     void *owner_thread;
+ 
+@@ -99,7 +99,7 @@ typedef struct {
+     AllocationState allocations;
+     SmallRange *small_ranges;
+     SmallRange *small_unusable;
+-    CUdeviceptr black_holes[MG_PAGES];
++    gpu_deviceptr_t black_holes[MG_PAGES];
+     int va_phys[MG_PAGES];
+     PhysicalPage *physical_pages[MG_PAGES];
+     PhysicalPage *mapped_pages[MG_PAGES];
+@@ -128,10 +128,10 @@ static _Thread_local MallocGraph *active_graph;
+ static bool rogue_va(MallocGraph *g, size_t va);
+ static bool rogue_phys(MallocGraph *g, size_t phys);
+ static bool small_unavailable(MallocGraph *g, size_t offset, size_t bytes);
+-static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
++static gpu_result_t map_reference(MallocGraph *g, gpu_deviceptr_t address,
+                               PhysicalPage *page, PhysicalPage **mapping);
+ 
+-static CUdeviceptr candidate_ptr(MallocGraph *g, Event *candidate) {
++static gpu_deviceptr_t candidate_ptr(MallocGraph *g, Event *candidate) {
+     VirtualRange *range = candidate->type == EV_ALLOC_SMALL ? g->small_base : g->base;
+     return virtual_range_get(range) + candidate->value *
+            (candidate->type == EV_ALLOC_SMALL ? 1 : MG_PAGE);
+@@ -329,7 +329,7 @@ static bool is_rogue_candidate(MallocGraph *g, Event *event) {
+ }
+ 
+ static bool rogue_va(MallocGraph *g, size_t va) {
+-    CUdeviceptr ptr = g->black_holes[va];
++    gpu_deviceptr_t ptr = g->black_holes[va];
+     if (ptr && !rogue_exists(ptr)) {
+         if (map_reference(g, virtual_range_get(g->base) + va * MG_PAGE,
+                           g->physical_pages[g->va_phys[va]], &g->mapped_pages[va])) {
+@@ -420,28 +420,28 @@ static bool push_stack(MallocGraph *g, Event *scope, bool recording) {
+     return true;
+ }
+ 
+-static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
+-    CUresult r;
++static gpu_result_t create_page(MallocGraph *g, PhysicalPage **page) {
++    gpu_result_t r;
+ 
+     vbars_free(budget_deficit(MG_PAGE));
+     r = physical_page_alloc(page, MG_PAGE, g->device);
+-    if (r == CUDA_ERROR_OUT_OF_MEMORY) {
++    if (r == GPU_ERROR_OUT_OF_MEMORY) {
+         vbars_free(MG_PAGE);
+         r = physical_page_alloc(page, MG_PAGE, g->device);
+     }
+     return r;
+ }
+ 
+-static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
++static gpu_result_t map_reference(MallocGraph *g, gpu_deviceptr_t address,
+                               PhysicalPage *page, PhysicalPage **mapping) {
+-    CUmemAccessDesc access = {.location = {CU_MEM_LOCATION_TYPE_DEVICE, g->device},
+-                              .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE};
++    gpu_mem_access_desc_t access = {.location = {GPU_MEM_LOCATION_TYPE_DEVICE, g->device},
++                              .flags = GPU_MEM_ACCESS_FLAGS_PROT_READWRITE};
+     PhysicalPage *reference = physical_page_ref(page, 0);
+     if (!reference) {
+-        return CUDA_ERROR_OUT_OF_MEMORY;
++        return GPU_ERROR_OUT_OF_MEMORY;
+     }
+ 
+-    CUresult result = cuMemMap(address, MG_PAGE, 0, physical_page_get(page), 0);
++    gpu_result_t result = cuMemMap(address, MG_PAGE, 0, physical_page_get(page), 0);
+     if (!result) {
+         reference->address = address;
+         result = cuMemSetAccess(address, MG_PAGE, &access, 1);
+@@ -455,8 +455,8 @@ static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
+ }
+ 
+ static int map_page(MallocGraph *g, size_t va, size_t phys) {
+-    CUdeviceptr addr = virtual_range_get(g->base) + va * MG_PAGE;
+-    CUresult r;
++    gpu_deviceptr_t addr = virtual_range_get(g->base) + va * MG_PAGE;
++    gpu_result_t r;
+ 
+     if (phys == g->phys_count) {
+         r = create_page(g, &g->physical_pages[phys]);
+@@ -601,7 +601,7 @@ static bool handoff_rogues(MallocGraph *g) {
+         }
+ 
+         VirtualRange *range;
+-        CUdeviceptr ptr;
++        gpu_deviceptr_t ptr;
+         size_t count;
+ 
+         if (candidate->type == EV_ALLOC_SMALL) {
+@@ -861,7 +861,7 @@ static size_t small_allocation_offset(MallocGraph *g, size_t bytes) {
+     return offset;
+ }
+ 
+-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
++bool malloc_graph_alloc(gpu_deviceptr_t *ptr, size_t size, gpu_stream_t stream) {
+     MallocGraph *g = active_graph;
+ 
+     if (!g || graph_failed(g) || g->paused || stream != g->stream) {
+@@ -900,8 +900,8 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+ 
+             if (g->small_pages < pages) {
+                 PhysicalPage **page = &g->small_physical_pages[g->small_pages];
+-                CUdeviceptr addr = virtual_range_get(g->small_base) + g->small_pages * MG_PAGE;
+-                CUresult r = create_page(g, page);
++                gpu_deviceptr_t addr = virtual_range_get(g->small_base) + g->small_pages * MG_PAGE;
++                gpu_result_t r = create_page(g, page);
+                 RETURN_G_FAILED(r, true);
+                 g->small_pages++;
+                 RETURN_G_FAILED(map_reference(g, addr, *page,
+@@ -982,15 +982,15 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+     return true;
+ }
+ 
+-bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
++bool malloc_graph_free(gpu_deviceptr_t ptr, gpu_stream_t stream, int *result) {
+     MallocGraph *g = active_graph;
+ 
+     if (!g || graph_failed(g) || g->paused || stream != g->stream) {
+         return false;
+     }
+ 
+-    CUdeviceptr base = virtual_range_get(g->base);
+-    CUdeviceptr small_base = virtual_range_get(g->small_base);
++    gpu_deviceptr_t base = virtual_range_get(g->base);
++    gpu_deviceptr_t small_base = virtual_range_get(g->small_base);
+     bool small = ptr >= small_base && ptr < small_base + MG_SMALL_PAGES * MG_PAGE;
+     if (!small && (ptr < base || ptr >= base + MG_PAGES * MG_PAGE)) {
+         return false;
+@@ -1038,7 +1038,7 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
+     return true;
+ }
+ 
+-SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool assert_breaks) {
++SHARED_EXPORT void *malloc_graph_create(void *devctx, gpu_stream_t stream, bool assert_breaks) {
+     MallocGraph *g = calloc(1, sizeof(*g));
+ 
+     if (!g || active_graph) {
+@@ -1093,7 +1093,7 @@ SHARED_EXPORT bool malloc_graph_pause(void *handle, bool paused, bool sync) {
+     return true;
+ }
+ 
+-SHARED_EXPORT bool malloc_graph_set_stream(void *handle, CUstream stream) {
++SHARED_EXPORT bool malloc_graph_set_stream(void *handle, gpu_stream_t stream) {
+     MallocGraph *g = handle;
+ 
+     if (!g || g != active_graph || graph_failed(g)) {
+diff --git a/src/malloc-rogue.c b/src/malloc-rogue.c
+index 99ba22c..c2a782d 100644
+--- a/src/malloc-rogue.c
++++ b/src/malloc-rogue.c
+@@ -3,7 +3,7 @@
+ 
+ typedef struct Rogue {
+     VirtualRange *range;
+-    CUdeviceptr ptr;
++    gpu_deviceptr_t ptr;
+     PhysicalPage **pages;
+     size_t page_count;
+     bool freeing;
+@@ -12,13 +12,13 @@ typedef struct Rogue {
+ } Rogue;
+ 
+ typedef struct RogueCandidate {
+-    CUdeviceptr ptr;
++    gpu_deviceptr_t ptr;
+     bool freed;
+ 
+     struct RogueCandidate *next;
+ } RogueCandidate;
+ 
+-static void unregister_candidate(CUdeviceptr ptr) {
++static void unregister_candidate(gpu_deviceptr_t ptr) {
+     RogueCandidate **entry = (RogueCandidate **)&global_rogue_candidates;
+     while (*entry && (*entry)->ptr != ptr) {
+         entry = &(*entry)->next;
+@@ -30,7 +30,7 @@ static void unregister_candidate(CUdeviceptr ptr) {
+     }
+ }
+ 
+-bool register_rogue_candidate(CUdeviceptr ptr) {
++bool register_rogue_candidate(gpu_deviceptr_t ptr) {
+     RogueCandidate *candidate = malloc(sizeof(*candidate));
+     if (!candidate) {
+         return false;
+@@ -44,13 +44,13 @@ bool register_rogue_candidate(CUdeviceptr ptr) {
+     return true;
+ }
+ 
+-void unregister_rogue_candidate(CUdeviceptr ptr) {
++void unregister_rogue_candidate(gpu_deviceptr_t ptr) {
+     allocations_lock();
+     unregister_candidate(ptr);
+     allocations_unlock();
+ }
+ 
+-bool rogue_candidate_freed(CUdeviceptr ptr) {
++bool rogue_candidate_freed(gpu_deviceptr_t ptr) {
+     allocations_lock();
+     RogueCandidate *candidate = global_rogue_candidates;
+     while (candidate && candidate->ptr != ptr) {
+@@ -61,7 +61,7 @@ bool rogue_candidate_freed(CUdeviceptr ptr) {
+     return freed;
+ }
+ 
+-RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
++RogueHandoff handoff_rogue(VirtualRange *range, gpu_deviceptr_t ptr,
+                            PhysicalPage **pages, size_t page_count) {
+     Rogue *rogue = malloc(sizeof(*rogue));
+     PhysicalPage **references = calloc(page_count, sizeof(*references));
+@@ -73,7 +73,7 @@ RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
+     }
+ 
+     size_t page_bytes = pages[0]->allocation->bytes;
+-    CUdeviceptr address = ptr - (ptr - virtual_range_get(range)) % page_bytes;
++    gpu_deviceptr_t address = ptr - (ptr - virtual_range_get(range)) % page_bytes;
+     for (size_t i = 0; i < page_count; i++) {
+         references[i] = physical_page_ref(pages[i], 0);
+         if (!references[i]) {
+@@ -123,7 +123,7 @@ RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
+     return result;
+ }
+ 
+-bool rogue_exists(CUdeviceptr ptr) {
++bool rogue_exists(gpu_deviceptr_t ptr) {
+     allocations_lock();
+     Rogue *rogue = rogues;
+     while (rogue && rogue->ptr != ptr) {
+@@ -133,7 +133,7 @@ bool rogue_exists(CUdeviceptr ptr) {
+     return rogue != NULL;
+ }
+ 
+-bool free_rogue(CUdeviceptr ptr, int *result) {
++bool free_rogue(gpu_deviceptr_t ptr, int *result) {
+     allocations_lock();
+     Rogue **entry = (Rogue **)&rogues;
+     while (*entry && (*entry)->ptr != ptr) {
+@@ -149,14 +149,14 @@ bool free_rogue(CUdeviceptr ptr, int *result) {
+             return false;
+         }
+         candidate->freed = true;
+-        *result = CUDA_SUCCESS;
++        *result = GPU_SUCCESS;
+         allocations_unlock();
+         return true;
+     }
+ 
+     Rogue *rogue = *entry;
+     if (rogue->freeing) {
+-        *result = CUDA_SUCCESS;
++        *result = GPU_SUCCESS;
+         allocations_unlock();
+         return true;
+     }
+@@ -165,12 +165,12 @@ bool free_rogue(CUdeviceptr ptr, int *result) {
+ 
+     *result = cuCtxSynchronize();
+     for (size_t i = 0; i < rogue->page_count; i++) {
+-        CUresult status = physical_page_unref(rogue->pages[i]);
++        gpu_result_t status = physical_page_unref(rogue->pages[i]);
+         if (!*result) {
+             *result = status;
+         }
+     }
+-    CUresult status = virtual_range_unref(rogue->range);
++    gpu_result_t status = virtual_range_unref(rogue->range);
+     if (!*result) {
+         *result = status;
+     }
+diff --git a/src/malloc-rogue.h b/src/malloc-rogue.h
+index 94b7862..474c4cc 100644
+--- a/src/malloc-rogue.h
++++ b/src/malloc-rogue.h
+@@ -10,10 +10,10 @@ typedef enum {
+     ROGUE_HANDOFF_OWNED,
+ } RogueHandoff;
+ 
+-bool register_rogue_candidate(CUdeviceptr ptr);
+-void unregister_rogue_candidate(CUdeviceptr ptr);
+-bool rogue_candidate_freed(CUdeviceptr ptr);
+-RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
++bool register_rogue_candidate(gpu_deviceptr_t ptr);
++void unregister_rogue_candidate(gpu_deviceptr_t ptr);
++bool rogue_candidate_freed(gpu_deviceptr_t ptr);
++RogueHandoff handoff_rogue(VirtualRange *range, gpu_deviceptr_t ptr,
+                            PhysicalPage **pages, size_t page_count);
+-bool rogue_exists(CUdeviceptr ptr);
+-bool free_rogue(CUdeviceptr ptr, int *result);
++bool rogue_exists(gpu_deviceptr_t ptr);
++bool free_rogue(gpu_deviceptr_t ptr, int *result);
+diff --git a/src/model-vbar.c b/src/model-vbar.c
+index 83c1d2e..4300d4a 100644
+--- a/src/model-vbar.c
++++ b/src/model-vbar.c
+@@ -6,13 +6,13 @@
+ #define VBAR_GET_PAGE_NR_UP(x) VBAR_GET_PAGE_NR((x) + VBAR_PAGE_SIZE - 1)
+ 
+ typedef struct ResidentPage {
+-    CUmemGenericAllocationHandle handle;
++    gpu_mem_handle_t handle;
+     uint32_t pin_count;
+     size_t serial;
+ } ResidentPage;
+ 
+ typedef struct ModelVBAR {
+-    CUdeviceptr vbar;
++    gpu_deviceptr_t vbar;
+     size_t nr_pages;
+     size_t watermark;
+     size_t watermark_limit;
+@@ -93,7 +93,7 @@ uint64_t vbars_analyze(void *devctx, bool only_dirty) {
+ 
+ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unpin) {
+     ResidentPage *rp = &mv->residency_map[page_nr];
+-    CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
++    gpu_deviceptr_t vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
+ 
+     do_free = do_free && rp->handle && (do_unpin || rp->pin_count == 0);
+     if (do_free) {
+@@ -368,8 +368,8 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
+     }
+ 
+     for (uint64_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end; page_nr++) {
+-        CUresult err = CUDA_ERROR_OUT_OF_MEMORY;
+-        CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
++        gpu_result_t err = GPU_ERROR_OUT_OF_MEMORY;
++        gpu_deviceptr_t vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
+         ResidentPage *rp = &mv->residency_map[page_nr];
+ 
+         if (rp->handle) {
+@@ -394,8 +394,8 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
+         log(VERBOSE, "VBAR needs to allocate VRAM for page %d\n", (int)page_nr);
+ 
+         if (budget_deficit(VBAR_PAGE_SIZE) > 0 ||
+-            (err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != CUDA_SUCCESS) {
+-            if (err != CUDA_ERROR_OUT_OF_MEMORY) {
++            (err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != GPU_SUCCESS) {
++            if (err != GPU_ERROR_OUT_OF_MEMORY) {
+                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
+                 return VBAR_FAULT_ERROR;
+             }
+@@ -405,7 +405,7 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
+                 log(DEBUG, "VBAR allocation cancelled due to backup-free watermark reduction\n");
+                 return VBAR_FAULT_OOM;
+             }
+-            if ((err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != CUDA_SUCCESS) {
++            if ((err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != GPU_SUCCESS) {
+                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed\n");
+                 return VBAR_FAULT_ERROR;
+             }
+diff --git a/src/plat.h b/src/plat.h
+index a1cf4b0..16193ab 100644
+--- a/src/plat.h
++++ b/src/plat.h
+@@ -33,27 +33,26 @@ typedef struct CUstream_st *cudaStream_t;
+ /* control.c */
+ bool cuda_budget_deficit(const char **prevailing_deficit_method);
+ 
++/* 导出宏：Windows 需 dllexport；XPU 后端同样要导出 alloc_fn/free_fn，故不随平台分支裁剪。 */
+ #if defined(_WIN32) || defined(_WIN64)
+-
+ #define SHARED_EXPORT __declspec(dllexport)
+-
+ #include <BaseTsd.h>
+-
+ typedef SSIZE_T ssize_t;
++#else
++#define SHARED_EXPORT
++#endif
+ 
++#if (defined(_WIN32) || defined(_WIN64)) && !defined(AIMDO_XPU)
+ /* shmem-detect.c */
+-bool aimdo_wddm_init(CUdevice dev);
++bool aimdo_wddm_init(gpu_device_t dev);
+ void aimdo_wddm_cleanup();
+ bool poll_budget_deficit(const char **prevailing_deficit_method);
+ /* cuda-detour.c */
+ bool aimdo_setup_hooks();
+ void aimdo_teardown_hooks();
+-
+ #else
+-
+-#define SHARED_EXPORT
+-
+-static inline bool aimdo_wddm_init(CUdevice dev) { return true; }
++/* 非 Windows 或 XPU：WDDM/NVML 检测不适用，使用内联空实现。 */
++static inline bool aimdo_wddm_init(gpu_device_t dev) { return true; }
+ static inline void aimdo_wddm_cleanup() {}
+ bool aimdo_setup_hooks(void);
+ void aimdo_teardown_hooks(void);
+@@ -61,7 +60,13 @@ void aimdo_teardown_hooks(void);
+ static inline bool poll_budget_deficit(const char **prevailing_deficit_method) {
+     return cuda_budget_deficit(prevailing_deficit_method);
+ }
++#endif
+ 
++#if defined(AIMDO_XPU)
++/* XPU 后端不 hook CUDA 分配器：改由 Python 侧通过 PyTorch XPUPluggableAllocator
++ * 注册本扩展导出的 alloc_fn/free_fn，因此 hook 入口为空实现。 */
++#define aimdo_setup_hooks()    (true)
++#define aimdo_teardown_hooks() ((void)0)
+ #endif
+ 
+ /* module-load.c */
+@@ -69,6 +74,35 @@ void *aimdo_find_loaded_module(const char *const *libraries, size_t library_coun
+ 
+ #include "control.h"
+ 
++#if defined(AIMDO_XPU)
++/* XPU 后端：宏改道到后端无关中性分发 g_gpu（由 src-xpu/dispatch.c 在运行时填充）。 */
++#define cuInit                      g_gpu.p_init
++#define cuGetErrorString            g_gpu.p_get_error_string
++#define cuCtxGetDevice              g_gpu.p_ctx_get_device
++#define cuCtxSynchronize            g_gpu.p_ctx_synchronize
++#define cuDeviceGet                 g_gpu.p_device_get
++#define cuDeviceGetAttribute        g_gpu.p_device_get_attribute
++#define cuDeviceTotalMem            g_gpu.p_device_total_mem
++#define cuDeviceGetName             g_gpu.p_device_get_name
++#define cuMemGetInfo                g_gpu.p_mem_get_info
++#define cuMemAllocHost              g_gpu.p_mem_alloc_host
++#define cuMemFreeHost               g_gpu.p_mem_free_host
++#define cuMemHostRegister           g_gpu.p_mem_host_register
++#define cuMemHostUnregister         g_gpu.p_mem_host_unregister
++#define cuMemAddressReserve         g_gpu.p_mem_address_reserve
++#define cuMemAddressFree            g_gpu.p_mem_address_free
++#define cuMemCreate                 g_gpu.p_mem_create
++#define cuMemMap                    g_gpu.p_mem_map
++#define cuMemSetAccess              g_gpu.p_mem_set_access
++#define cuMemUnmap                  g_gpu.p_mem_unmap
++#define cuMemRelease                g_gpu.p_mem_release
++#define cuMemcpyHtoDAsync           g_gpu.p_memcpy_htod_async
++#define cuEventCreate               g_gpu.p_event_create
++#define cuEventDestroy              g_gpu.p_event_destroy
++#define cuEventRecord               g_gpu.p_event_record
++#define cuEventSynchronize          g_gpu.p_event_synchronize
++#define cuDeviceGetLuid             g_gpu.p_device_get_luid
++#else
+ #define cuInit                      g_cuda.p_cuInit
+ #define cuGetErrorString            g_cuda.p_cuGetErrorString
+ #define cuCtxGetDevice              g_cuda.p_cuCtxGetDevice
+@@ -95,6 +129,7 @@ void *aimdo_find_loaded_module(const char *const *libraries, size_t library_coun
+ #define cuEventRecord               g_cuda.p_cuEventRecord
+ #define cuEventSynchronize          g_cuda.p_cuEventSynchronize
+ #define cuDeviceGetLuid             g_cuda.p_cuDeviceGetLuid
++#endif
+ 
+ #define MAX(a, b) (((a) > (b)) ? (a) : (b))
+ #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+@@ -165,37 +200,37 @@ static inline ssize_t budget_deficit(size_t size) {
+     return deficit;
+ }
+ 
+-static inline int check_cu_impl(CUresult res, const char *label, int oom_level, int error_level) {
+-    if (res != CUDA_SUCCESS) {
++static inline int check_cu_impl(gpu_result_t res, const char *label, int oom_level, int error_level) {
++    if (res != GPU_SUCCESS) {
+         const char* desc;
+-        if (cuGetErrorString(res, &desc) != CUDA_SUCCESS) {
+-            desc = "<FATAL - CANNOT PARSE CUDA ERROR CODE>";
++        if (cuGetErrorString(res, &desc) != GPU_SUCCESS) {
++            desc = "<FATAL - CANNOT PARSE GPU ERROR CODE>";
+ 
+         }
+-        log(res == CUDA_ERROR_OUT_OF_MEMORY ? oom_level : error_level,
+-            "CUDA API FAILED (%d): %s: %s\n", (int)res, label, desc);
++        log(res == GPU_ERROR_OUT_OF_MEMORY ? oom_level : error_level,
++            "GPU API FAILED (%d): %s: %s\n", (int)res, label, desc);
+     }
+-    return (res == CUDA_SUCCESS);
++    return (res == GPU_SUCCESS);
+ }
+ #define CHECK_CU(x) check_cu_impl((x), #x, VVERBOSE, DEBUG)
+ #define CHECK_CU_OOM_ERROR(x) check_cu_impl((x), #x, AIMDO_LOG_ERROR, DEBUG)
+ #define CHECK_CU_ERROR(x) check_cu_impl((x), #x, VVERBOSE, AIMDO_LOG_ERROR)
+ 
+-static inline CUresult three_stooges(CUdeviceptr vaddr, size_t size, int device,
+-                                     CUmemGenericAllocationHandle *handle) {
+-    CUmemGenericAllocationHandle h = 0;
+-    CUresult err;
++static inline gpu_result_t three_stooges(gpu_deviceptr_t vaddr, size_t size, int device,
++                                     gpu_mem_handle_t *handle) {
++    gpu_mem_handle_t h = 0;
++    gpu_result_t err;
+ 
+-    CUmemAllocationProp prop = {
+-        .type = CU_MEM_ALLOCATION_TYPE_PINNED,
+-        .location.type = CU_MEM_LOCATION_TYPE_DEVICE,
++    gpu_mem_prop_t prop = {
++        .type = GPU_MEM_ALLOCATION_TYPE_PINNED,
++        .location.type = GPU_MEM_LOCATION_TYPE_DEVICE,
+         .location.id = device,
+     };
+ 
+-    CUmemAccessDesc accessDesc = {
+-        .location.type = CU_MEM_LOCATION_TYPE_DEVICE,
++    gpu_mem_access_desc_t accessDesc = {
++        .location.type = GPU_MEM_LOCATION_TYPE_DEVICE,
+         .location.id = device,
+-        .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
++        .flags = GPU_MEM_ACCESS_FLAGS_PROT_READWRITE,
+     };
+ 
+     if (!CHECK_CU_ERROR(err = cuMemCreate(&h, size, &prop, 0))) {
+@@ -210,7 +245,7 @@ static inline CUresult three_stooges(CUdeviceptr vaddr, size_t size, int device,
+     total_vram_usage += size;
+ 
+     *handle = h;
+-    return CUDA_SUCCESS;
++    return GPU_SUCCESS;
+ 
+ fail_access:
+     CHECK_CU_ERROR(cuMemUnmap(vaddr, size));
+@@ -235,19 +270,19 @@ size_t vbars_free(ssize_t size);
+ SHARED_EXPORT
+ uint64_t vbars_analyze(void *devctx, bool only_dirty);
+ 
+-/* pyt-cu-alloc.c */
+-int aimdo_cuda_malloc(CUdeviceptr *dptr, size_t size,
+-                      CUresult (*true_cuMemAlloc_v2)(CUdeviceptr*, size_t));
+-int aimdo_cuda_free(CUdeviceptr dptr,
+-                    CUresult (*true_cuMemFree_v2)(CUdeviceptr));
++/* pyt-cu-alloc.c（CUDA 专属，XPU 构建下不定义，但这些声明保持中性类型以便一致） */
++int aimdo_cuda_malloc(gpu_deviceptr_t *dptr, size_t size,
++                      gpu_result_t (*true_cuMemAlloc_v2)(gpu_deviceptr_t*, size_t));
++int aimdo_cuda_free(gpu_deviceptr_t dptr,
++                    gpu_result_t (*true_cuMemFree_v2)(gpu_deviceptr_t));
+ 
+-int aimdo_cuda_malloc_async(CUdeviceptr *devPtr, size_t size, CUstream hStream,
+-                            CUresult (*true_cuMemAllocAsync)(CUdeviceptr*, size_t, CUstream));
+-int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
+-                          CUresult (*true_cuMemFreeAsync)(CUdeviceptr, CUstream));
++int aimdo_cuda_malloc_async(gpu_deviceptr_t *devPtr, size_t size, gpu_stream_t hStream,
++                            gpu_result_t (*true_cuMemAllocAsync)(gpu_deviceptr_t*, size_t, gpu_stream_t));
++int aimdo_cuda_free_async(gpu_deviceptr_t devPtr, gpu_stream_t hStream,
++                          gpu_result_t (*true_cuMemFreeAsync)(gpu_deviceptr_t, gpu_stream_t));
+ 
+-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream);
+-bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result);
++bool malloc_graph_alloc(gpu_deviceptr_t *ptr, size_t size, gpu_stream_t stream);
++bool malloc_graph_free(gpu_deviceptr_t ptr, gpu_stream_t stream, int *result);
+ bool malloc_graph_sync_paused(void);
+ 
+ bool allocations_init(void);
+diff --git a/src/pyt-cu-plug-alloc-async.c b/src/pyt-cu-plug-alloc-async.c
+index 9bea536..40aebc0 100644
+--- a/src/pyt-cu-plug-alloc-async.c
++++ b/src/pyt-cu-plug-alloc-async.c
+@@ -6,6 +6,8 @@
+  */
+ #define CUDA_MALLOC_HEADROOM (128 * M)
+ 
++#if !defined(AIMDO_XPU)
++/* SizeEntry/size_hash 仅用于 CUDA 分配记账，XPU 构建下不需要。 */
+ typedef struct SizeEntry {
+     CUdeviceptr ptr;
+     size_t size;
+@@ -15,6 +17,7 @@ typedef struct SizeEntry {
+ static inline unsigned int size_hash(CUdeviceptr ptr) {
+     return ((uintptr_t)ptr >> 10 ^ (uintptr_t)ptr >> 21) % SIZE_HASH_SIZE;
+ }
++#endif /* !AIMDO_XPU */
+ 
+ #if defined(_WIN32) || defined(_WIN64)
+ #include <windows.h>
+@@ -85,6 +88,10 @@ void allocations_cleanup(void) {
+     st_cleanup();
+ }
+ 
++#if !defined(AIMDO_XPU)
++/* 以下全部为 CUDA 专属：显存分配记账（account_alloc/free）与 CUDA 分配器钩子
++ * 实现（aimdo_cuda_malloc/free[_async]）。XPU 构建下由 PyTorch
++ * XPUPluggableAllocator + src-xpu/dispatch.c 接管，故整段守卫掉。 */
+ static inline size_t accounted_alloc_size(size_t size) {
+     size_t rounded = size;
+ 
+@@ -281,3 +288,4 @@ int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
+     account_free(devPtr, hStream);
+     return status;
+ }
++#endif /* !AIMDO_XPU */
+diff --git a/src/pyt-cu-plug-alloc.c b/src/pyt-cu-plug-alloc.c
+index b53a31b..9d6e5a0 100644
+--- a/src/pyt-cu-plug-alloc.c
++++ b/src/pyt-cu-plug-alloc.c
+@@ -37,6 +37,9 @@ void allocations_analyze(bool only_dirty) {
+     log(DEBUG, "%d Active Allocations for a total of %7zu MB\n", count, total_size / M);
+ }
+ 
++#if !defined(AIMDO_XPU)
++/* XPU 构建下不定义 CUDA 可插拔分配器入口 alloc_fn/free_fn；
++ * XPU 版入口见 src-xpu/dispatch.c（PyTorch XPUPluggableAllocator 用）。 */
+ SHARED_EXPORT
+ void *alloc_fn(size_t size, int device, cudaStream_t stream) {
+     VramBuffer *entry;
+@@ -90,3 +93,4 @@ void free_fn(void* ptr, size_t size, int device, cudaStream_t stream) {
+ 
+     log(AIMDO_LOG_ERROR, "%s could not find VRAM@%p\n", __func__, ptr);
+ }
++#endif /* !AIMDO_XPU */
+diff --git a/src/vmm-ref.c b/src/vmm-ref.c
+index 3bc9fa1..3d6491f 100644
+--- a/src/vmm-ref.c
++++ b/src/vmm-ref.c
+@@ -23,14 +23,14 @@ VirtualRange *virtual_range_ref(VirtualRange *range) {
+     return range;
+ }
+ 
+-CUresult virtual_range_unref(VirtualRange *range) {
++gpu_result_t virtual_range_unref(VirtualRange *range) {
+     allocations_lock();
+     if (--range->refs) {
+         allocations_unlock();
+-        return CUDA_SUCCESS;
++        return GPU_SUCCESS;
+     }
+ 
+-    CUresult result = cuMemAddressFree(range->address, range->bytes);
++    gpu_result_t result = cuMemAddressFree(range->address, range->bytes);
+     if (result) {
+         range->refs++;
+     } else {
+@@ -40,19 +40,19 @@ CUresult virtual_range_unref(VirtualRange *range) {
+     return result;
+ }
+ 
+-CUresult physical_page_alloc(PhysicalPage **page, size_t bytes, int device) {
++gpu_result_t physical_page_alloc(PhysicalPage **page, size_t bytes, int device) {
+     PhysicalPage *reference = malloc(sizeof(*reference));
+     PhysicalAllocation *allocation = malloc(sizeof(*allocation));
+ 
+     if (!reference || !allocation) {
+         free(reference);
+         free(allocation);
+-        return CUDA_ERROR_OUT_OF_MEMORY;
++        return GPU_ERROR_OUT_OF_MEMORY;
+     }
+ 
+-    CUmemAllocationProp prop = {.type = CU_MEM_ALLOCATION_TYPE_PINNED,
+-        .location = {CU_MEM_LOCATION_TYPE_DEVICE, device}};
+-    CUresult result = cuMemCreate(&allocation->handle, bytes, &prop, 0);
++    gpu_mem_prop_t prop = {.type = GPU_MEM_ALLOCATION_TYPE_PINNED,
++        .location = {GPU_MEM_LOCATION_TYPE_DEVICE, device}};
++    gpu_result_t result = cuMemCreate(&allocation->handle, bytes, &prop, 0);
+     if (result) {
+         free(reference);
+         free(allocation);
+@@ -67,10 +67,10 @@ CUresult physical_page_alloc(PhysicalPage **page, size_t bytes, int device) {
+     allocations_lock();
+     total_vram_usage += bytes;
+     allocations_unlock();
+-    return CUDA_SUCCESS;
++    return GPU_SUCCESS;
+ }
+ 
+-PhysicalPage *physical_page_ref(PhysicalPage *page, CUdeviceptr address) {
++PhysicalPage *physical_page_ref(PhysicalPage *page, gpu_deviceptr_t address) {
+     PhysicalPage *reference = malloc(sizeof(*reference));
+ 
+     if (!reference) {
+@@ -85,11 +85,11 @@ PhysicalPage *physical_page_ref(PhysicalPage *page, CUdeviceptr address) {
+     return reference;
+ }
+ 
+-CUresult physical_page_unref(PhysicalPage *page) {
+-    CUresult result = CUDA_SUCCESS;
++gpu_result_t physical_page_unref(PhysicalPage *page) {
++    gpu_result_t result = GPU_SUCCESS;
+ 
+     if (!page) {
+-        return CUDA_SUCCESS;
++        return GPU_SUCCESS;
+     }
+ 
+     allocations_lock();
+@@ -127,5 +127,5 @@ CUresult physical_page_unref(PhysicalPage *page) {
+     }
+     free(page);
+     allocations_unlock();
+-    return CUDA_SUCCESS;
++    return GPU_SUCCESS;
+ }
+diff --git a/src/vmm-ref.h b/src/vmm-ref.h
+index 75387e6..08cea06 100644
+--- a/src/vmm-ref.h
++++ b/src/vmm-ref.h
+@@ -5,13 +5,13 @@
+ #include <stddef.h>
+ 
+ typedef struct VirtualRange {
+-    CUdeviceptr address;
++    gpu_deviceptr_t address;
+     size_t bytes;
+     size_t refs;
+ } VirtualRange;
+ 
+ typedef struct PhysicalAllocation {
+-    CUmemGenericAllocationHandle handle;
++    gpu_mem_handle_t handle;
+     size_t bytes;
+     size_t refs;
+     struct PhysicalPage *references;
+@@ -19,21 +19,21 @@ typedef struct PhysicalAllocation {
+ 
+ typedef struct PhysicalPage {
+     PhysicalAllocation *allocation;
+-    CUdeviceptr address;
++    gpu_deviceptr_t address;
+     struct PhysicalPage *next;
+ } PhysicalPage;
+ 
+ VirtualRange *virtual_range_alloc(size_t bytes, size_t alignment);
+ VirtualRange *virtual_range_ref(VirtualRange *range);
+-CUresult virtual_range_unref(VirtualRange *range);
+-CUresult physical_page_alloc(PhysicalPage **page, size_t bytes, int device);
+-PhysicalPage *physical_page_ref(PhysicalPage *page, CUdeviceptr address);
+-CUresult physical_page_unref(PhysicalPage *page);
++gpu_result_t virtual_range_unref(VirtualRange *range);
++gpu_result_t physical_page_alloc(PhysicalPage **page, size_t bytes, int device);
++PhysicalPage *physical_page_ref(PhysicalPage *page, gpu_deviceptr_t address);
++gpu_result_t physical_page_unref(PhysicalPage *page);
+ 
+-static inline CUdeviceptr virtual_range_get(VirtualRange *range) {
++static inline gpu_deviceptr_t virtual_range_get(VirtualRange *range) {
+     return range->address;
+ }
+ 
+-static inline CUmemGenericAllocationHandle physical_page_get(PhysicalPage *page) {
++static inline gpu_mem_handle_t physical_page_get(PhysicalPage *page) {
+     return page->allocation->handle;
+ }
+diff --git a/src/vrambuf.c b/src/vrambuf.c
+index 3503411..9247d43 100644
+--- a/src/vrambuf.c
++++ b/src/vrambuf.c
+@@ -68,7 +68,7 @@ void *vrambuf_create(int device, size_t max_size) {
+     mutex_unlock((Mutex)va_pool_lock);
+ #endif
+ 
+-    buf = (VramBuffer *)calloc(1, sizeof(*buf) + sizeof(CUmemGenericAllocationHandle) * max_size / VRAM_CHUNK_SIZE);
++    buf = (VramBuffer *)calloc(1, sizeof(*buf) + sizeof(gpu_mem_handle_t) * max_size / VRAM_CHUNK_SIZE);
+     if (!buf) {
+         return NULL;
+     }
+@@ -88,8 +88,8 @@ SHARED_EXPORT
+ bool vrambuf_grow(void *arg, size_t required_size) {
+     VramBuffer *buf = (VramBuffer *)arg;
+     size_t grow_to;
+-    CUmemGenericAllocationHandle handle;
+-    CUresult err;
++    gpu_mem_handle_t handle;
++    gpu_result_t err;
+ 
+     if (!buf) {
+         return false;
+@@ -115,15 +115,15 @@ bool vrambuf_grow(void *arg, size_t required_size) {
+         if (to_allocate > VRAM_CHUNK_SIZE) {
+             to_allocate = VRAM_CHUNK_SIZE;
+         }
+-        if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != CUDA_SUCCESS) {
+-            if (err != CUDA_ERROR_OUT_OF_MEMORY) {
++        if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != GPU_SUCCESS) {
++            if (err != GPU_ERROR_OUT_OF_MEMORY) {
+                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
+                 return false;
+             }
+             log(DEBUG, "Pytorch allocator attempt exceeds available VRAM ...\n");
+             vbars_free(VRAM_CHUNK_SIZE);
+-            if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != CUDA_SUCCESS) {
+-                bool is_oom = err == CUDA_ERROR_OUT_OF_MEMORY;
++            if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != GPU_SUCCESS) {
++                bool is_oom = err == GPU_ERROR_OUT_OF_MEMORY;
+                 log(is_oom ? INFO : AIMDO_LOG_ERROR, "VRAM Allocation failed (%s)\n", is_oom ? "OOM" : "error");
+                 return false;
+             }
+@@ -137,7 +137,7 @@ bool vrambuf_grow(void *arg, size_t required_size) {
+ }
+ 
+ SHARED_EXPORT
+-CUdeviceptr vrambuf_get(void *arg) {
++gpu_deviceptr_t vrambuf_get(void *arg) {
+     VramBuffer *buf = (VramBuffer *)arg;
+ 
+     if (!buf) {
+diff --git a/src/vrambuf.h b/src/vrambuf.h
+index dc04972..73e65b8 100644
+--- a/src/vrambuf.h
++++ b/src/vrambuf.h
+@@ -3,13 +3,13 @@
+ #include "plat.h"
+ 
+ typedef struct VramBuffer {
+-    CUdeviceptr base_ptr;
++    gpu_deviceptr_t base_ptr;
+     size_t max_size;
+     size_t allocated;
+     size_t handle_count;
+     int device;
+     struct VramBuffer *next;
+-    CUmemGenericAllocationHandle handles[1];
++    gpu_mem_handle_t handles[1];
+ } VramBuffer;
+ 
+ SHARED_EXPORT
+@@ -22,4 +22,4 @@ SHARED_EXPORT
+ bool vrambuf_destroy(void *arg);
+ 
+ SHARED_EXPORT
+-CUdeviceptr vrambuf_get(void *arg);
++gpu_deviceptr_t vrambuf_get(void *arg);
