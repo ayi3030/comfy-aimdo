@@ -1736,8 +1736,27 @@ AIMDO_XPU_EXPORT bool xpu_get_vmm_stats(
 
 bool aimdo_cuda_runtime_init(void) {
     std::lock_guard<std::mutex> guard(g_devices_mutex);
-    if (g_devices.empty() || zeInit(0) != ZE_RESULT_SUCCESS) {
+    /* On the CUDA path this gate exists because the shim table below is only
+     * safe once a real device has been enumerated. The XPU backend does not
+     * enumerate devices here: it publishes them later via xpu_set_queues(),
+     * which the Python layer calls from setup_backend() -- i.e. AFTER
+     * plat_init()/init(). Requiring a non-empty g_devices at this point
+     * therefore fails unconditionally and aborts init_devices() before the
+     * backend is ever wired up.
+     *
+     * So: only require the Level Zero runtime to be initializable. An empty
+     * g_devices here is a valid transient state meaning "queues not published
+     * yet"; every shim entry point already resolves its device per call. */
+    if (zeInit(0) != ZE_RESULT_SUCCESS) {
         return false;
+    }
+    if (g_devices.empty()) {
+        /* stdio only: plat.h/aimdo_log() is not on this translation unit's
+         * include chain, and the Python side already surfaces stderr. */
+        std::fprintf(stderr,
+                     "[aimdo] %s: no XPU device published yet; deferring "
+                     "dispatch table wiring until xpu_set_queues()\n",
+                     __func__);
     }
     g_cuda.p_cuInit = xpu_init;
     g_cuda.p_cuGetErrorString = xpu_get_error_string;

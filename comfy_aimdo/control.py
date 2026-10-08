@@ -182,6 +182,12 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib.set_nvml_pressure(bool(nvml_pressure))
         return True
 
+    # Remember whether the caller named the backend explicitly. This is read
+    # later when handing control to the XPU backend: an explicit "xpu" request
+    # must bypass the opt-in environment gate, whereas an auto-detected one
+    # must not. Must be captured before `implementation` is defaulted below.
+    implementation_was_explicit = implementation is not None
+
     if implementation is None:
         implementation = detect_vendor()
 
@@ -249,29 +255,32 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     lib.get_devctx.argtypes = [ctypes.c_int]
     lib.get_devctx.restype = ctypes.c_void_p
 
-    lib.malloc_graph_create.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool]
-    lib.malloc_graph_create.restype = ctypes.c_void_p
-
-    lib.malloc_graph_push.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
-    lib.malloc_graph_push.restype = ctypes.c_bool
-
-    lib.malloc_graph_pause.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool]
-    lib.malloc_graph_pause.restype = ctypes.c_bool
-
-    lib.malloc_graph_set_stream.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.malloc_graph_set_stream.restype = ctypes.c_bool
-
-    lib.malloc_graph_pop.argtypes = [ctypes.c_void_p]
-    lib.malloc_graph_pop.restype = ctypes.c_int
-
-    lib.malloc_graph_abort.argtypes = [ctypes.c_void_p]
-    lib.malloc_graph_abort.restype = ctypes.c_bool
-
-    lib.malloc_graph_stat.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    lib.malloc_graph_stat.restype = ctypes.c_uint64
-
-    lib.malloc_graph_destroy.argtypes = [ctypes.c_void_p]
-    lib.malloc_graph_destroy.restype = None
+    # malloc-graph capture is a CUDA-only capability: the XPU native backend
+    # (aimdo_xpu.dll) does not export the malloc_graph_* family at all. Binding
+    # argtypes on a missing export raises AttributeError and aborts init() before
+    # the XPU backend ever gets wired up. Bind them only when present, and
+    # degrade fail-soft (ComfyUI then simply runs without graph capture) instead
+    # of taking down the whole allocator initialization.
+    _malloc_graph_symbols = (
+        ("malloc_graph_create", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool], ctypes.c_void_p),
+        ("malloc_graph_push", [ctypes.c_void_p, ctypes.c_char_p], ctypes.c_bool),
+        ("malloc_graph_pause", [ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool], ctypes.c_bool),
+        ("malloc_graph_set_stream", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_bool),
+        ("malloc_graph_pop", [ctypes.c_void_p], ctypes.c_int),
+        ("malloc_graph_abort", [ctypes.c_void_p], ctypes.c_bool),
+        ("malloc_graph_stat", [ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64),
+        ("malloc_graph_destroy", [ctypes.c_void_p], None),
+    )
+    if all(hasattr(lib, name) for name, _, _ in _malloc_graph_symbols):
+        for _name, _argtypes, _restype in _malloc_graph_symbols:
+            getattr(lib, _name).argtypes = _argtypes
+            getattr(lib, _name).restype = _restype
+    else:
+        _missing = [name for name, _, _ in _malloc_graph_symbols if not hasattr(lib, name)]
+        logging.info(
+            "comfy-aimdo: native backend does not provide malloc-graph capture "
+            f"({', '.join(_missing)}); continuing without graph capture"
+        )
 
     if simple_vram_headroom is not None:
         lib.set_simple_vram_headroom(int(simple_vram_headroom))
