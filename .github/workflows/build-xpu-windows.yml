@@ -207,6 +207,95 @@ jobs:
           print("ABI GATE PASSED: imports %s as required." % os.environ["EXPECTED"])
           PY
 
+      - name: Verify overlay contract (fork src/ provides the L2/L3 unload layer)
+        # The L2/L3 unload entry points are DEFINED IN THE FORK's
+        # src/model-vbar.c. This repo's src/ is an older revision with the whole
+        # XPU retirement layer stripped (vbar_map_new_page, vbars_free_retired,
+        # vbar_async_reclaim_enabled: 0 occurrences here vs 4/9/9 upstream), and
+        # src-xpu/ does not define them either.
+        #
+        # The "Overlay patched src-xpu/" step copies ONLY src-xpu/ onto the
+        # fork checkout, so today these symbols resolve. If anyone widens the
+        # overlay to src/ + src-win/ to pick up local native changes, they
+        # disappear -- and CI will NOT report a missing file, because this
+        # repo's src/model-vbar.c is a complete, compilable translation unit
+        # with 16 SHARED_EXPORTs. The build would silently ship a
+        # feature-incomplete DLL and the Python layer would degrade to its
+        # slow path with no error.
+        #
+        # A comment in src-xpu/ would be the wrong layer for this: src-xpu/ is
+        # owned by this repo, and describing what the fork provides there would
+        # blur ownership. The invariant belongs to the CI overlay behaviour, so
+        # it is enforced here instead.
+        shell: bash
+        run: |
+          python - <<'PY'
+          import struct, sys
+
+          p = "native/comfy_aimdo/aimdo_xpu.dll"
+          d = open(p, "rb").read()
+          e = struct.unpack_from("<I", d, 0x3C)[0]
+          if d[e:e + 4] != b"PE\x00\x00":
+              sys.exit("not a PE: %s" % p)
+          opt = e + 4 + 20
+          is64 = struct.unpack_from("<H", d, opt)[0] == 0x20B
+          # DataDirectory[0] = Export Table (PE32+ at 112, PE32 at 96).
+          exp_rva = struct.unpack_from("<I", d, opt + (112 if is64 else 96))[0]
+          if not exp_rva:
+              sys.exit("OVERLAY CONTRACT VIOLATED: DLL exports nothing.")
+          opt_size = struct.unpack_from("<H", d, e + 4 + 16)[0]
+          sec_off = e + 4 + 20 + opt_size
+          nsec = struct.unpack_from("<H", d, e + 4 + 2)[0]
+
+          secs = []
+          for i in range(nsec):
+              so = sec_off + i * 40
+              vs, va, rs, rp = struct.unpack_from("<IIII", d, so + 8)
+              secs.append((va, max(vs, rs), rp))
+
+          def r2o(rva):
+              for va, sz, rp in secs:
+                  if va <= rva < va + sz:
+                      return rp + (rva - va)
+              return None
+
+          eo = r2o(exp_rva)
+          n_names = struct.unpack_from("<I", d, eo + 24)[0]
+          names_rva = struct.unpack_from("<I", d, eo + 32)[0]
+          no = r2o(names_rva)
+          names = set()
+          for i in range(n_names):
+              off = r2o(struct.unpack_from("<I", d, no + i * 4)[0])
+              names.add(d[off:d.index(b"\x00", off)].decode("utf-8", "replace"))
+
+          # vbars_prepare_allocation drives the owner-boundary pre-reclaim, and
+          # the consumer/page-state trio drive L2 stream-consumption safety.
+          # vbars_prepare_allocation degrades SILENTLY when absent (its
+          # _prepare_allocation_supported guard skips the call with no log), so
+          # this gate is the only thing that notices.
+          need = {
+              "vbars_prepare_allocation",
+              "vbar_unpin_stream",
+              "vbar_register_consumer_stream",
+              "vbar_consumer_acquire",
+              "vbar_consumer_release",
+              "vbar_get_page_states",
+          }
+          missing = sorted(need - names)
+          if missing:
+              sys.exit(
+                  "OVERLAY CONTRACT VIOLATED: aimdo_xpu.dll is missing %s.\n"
+                  "These live in the FORK's src/model-vbar.c, not in this repo's "
+                  "src/ or src-xpu/. The 'Overlay patched src-xpu/' step only "
+                  "copies src-xpu/ onto the fork checkout, so they resolve "
+                  "today. Widening that overlay to src/ + src-win/ drops them, "
+                  "and the build would still succeed -- shipping a DLL whose "
+                  "three-layer unload silently degrades to its slow path."
+                  % missing)
+          print("OVERLAY CONTRACT PASSED: all %d fork-provided unload symbols "
+                "present (%s)." % (len(need), ", ".join(sorted(need))))
+          PY
+
       - name: Best-effort no-GPU hook unit test
         # Validates the UR/USM interception logic without a device. Non-fatal:
         # surfaces signal but never blocks the artifact.
