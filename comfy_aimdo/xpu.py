@@ -483,51 +483,86 @@ def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool
 def _xpu_opt_in() -> bool:
     """Whether XPU dynamic offload should activate.
 
-    Opt-in succeeds if any of the following holds:
-      1. the explicit env flag ``AIMDO_XPU_ENABLED=1`` is set; or
-      2. ComfyUI is running with an explicit ``--enable-dynamic-vram`` arg; or
-      3. ComfyUI itself has already decided dynamic VRAM is enabled
-         (``comfy.cli_args.enables_dynamic_vram()``, falling back to
-         ``args.enable_dynamic_vram`` when that helper is absent) *and* the
-         active device is an Intel XPU (``comfy.model_management.is_intel_xpu()``).
+    Activation sources, in order:
 
-    Import-safe when ``comfy.*`` is unavailable (aimdo used standalone): the
-    function then simply returns False and never raises. CUDA/ROCm behavior is
-    untouched — condition 3 only fires for Intel XPU devices.
+    1. ``AIMDO_XPU_ENABLED`` env override -- ``"1"`` forces on, ``"0"`` forces off.
+       The force-off hatch matters because source (2) makes XPU default-on, so a
+       user needs a way to keep native ``torch.xpu`` for AIMDO only without also
+       turning DynamicVRAM off for the rest of ComfyUI.
+    2. ComfyUI's own gate: ``comfy.cli_args.enables_dynamic_vram()`` and the
+       ``is_intel_xpu()`` confirmation when that module is already available.
+
+    Source (2) is the task-#17 "same source" alignment. ComfyUI decides DynamicVRAM
+    support *by vendor* -- ``main.py`` runs ``enables_dynamic_vram() and
+    dynamic_vram_supported()``, and ``dynamic_vram_supported()`` returns True for
+    Intel XPU. A process that reaches this backend has therefore already been
+    approved by ComfyUI's own gate, so it must not be refused by a second, stricter
+    gate here. Reading the same predicate makes XPU default-on and opt-*out* the
+    usual way (--disable-dynamic-vram / --highvram / --gpu-only / --novram / --cpu),
+    i.e. exactly like NVIDIA; both gates read the same args and can no longer
+    disagree. The extra ``is_intel_xpu()`` confirmation rejects the rare
+    "torch version says xpu but no usable device" case before we start wiring
+    queues.
+
+    Import-order note: ``main.py`` calls ``control.init()`` (which reaches this
+    function) at ~line 74, but ``import comfy.model_management`` does not happen
+    until ~line 258. So during real startup ``comfy.model_management`` is normally
+    NOT yet in ``sys.modules`` -- the confirmation below MUST therefore be
+    non-blocking, or the whole auto-enable silently fails irrespective of what
+    ComfyUI already decided (this is the exact bug this version fixes).
+
+    Degradation is deliberate and conservative:
+      * no ``comfy.cli_args`` (plain library / unit-test) -> False unless env set;
+      * no ``enables_dynamic_vram`` (older ComfyUI) -> fall back to the
+        --enable-dynamic-vram flag only;
+      * predicate raises (args not ready) -> warn, then fall back;
+      * ``is_intel_xpu`` unavailable or raising -> do NOT block (the backend's own
+        fail-closed gate still guards the real wiring).
+
+    Callers that pass ``implementation="xpu"`` bypass this gate entirely via
+    ``explicitly_requested`` in ``setup_backend``.
     """
-    if os.environ.get("AIMDO_XPU_ENABLED") == "1":
+    override = os.environ.get("AIMDO_XPU_ENABLED")
+    if override == "1":
         return True
+    if override == "0":
+        # 显式关闭：即便 ComfyUI 侧判定支持，也不在 XPU 上启用 AIMDO。
+        return False
 
     comfy_cli = sys.modules.get("comfy.cli_args")
-    if comfy_cli is not None:
-        args = getattr(comfy_cli, "args", None)
-        # 条件 2：显式 --enable-dynamic-vram
-        if args is not None and getattr(args, "enable_dynamic_vram", False):
-            return True
-        # 条件 3：ComfyUI 自身已判定 dynamic VRAM 开启，且当前设备是 Intel XPU。
-        # 这样用户在 Intel 卡上直接跑 ComfyUI（不开 --enable-dynamic-vram）也能自动启用。
+    if comfy_cli is None:
+        # 纯库 / 单测场景：保留旧的保守默认（仅 env 可开启）。
+        return False
+
+    # (1) ComfyUI 的 DynamicVRAM 开关（已编码「默认启用 + 各类 --no* 退出开关」）。
+    enabled = None
+    enables = getattr(comfy_cli, "enables_dynamic_vram", None)
+    if callable(enables):
         try:
-            enables = getattr(comfy_cli, "enables_dynamic_vram", None)
-            if callable(enables):
-                dynamic_on = bool(enables())
-            else:
-                # 老版本 ComfyUI 无该 helper 时退回原始 arg
-                dynamic_on = bool(
-                    args is not None and getattr(args, "enable_dynamic_vram", False)
-                )
-            if dynamic_on:
-                comfy_mm = sys.modules.get("comfy.model_management")
-                is_intel = (
-                    getattr(comfy_mm, "is_intel_xpu", None)
-                    if comfy_mm is not None
-                    else None
-                )
-                if callable(is_intel) and is_intel():
-                    return True
-        except Exception:
-            # 任何 ComfyUI 侧异常都不应影响 aimdo 的导入与决策
-            pass
-    return False
+            enabled = bool(enables())
+        except Exception as error:  # args 未就绪等异常
+            logging.warning(
+                f"comfy-aimdo XPU: enables_dynamic_vram() failed ({error}); "
+                f"falling back to the --enable-dynamic-vram flag"
+            )
+    if enabled is None:
+        # 兜底：旧版 ComfyUI 无 enables_dynamic_vram()，退化为显式 flag 判据。
+        args = getattr(comfy_cli, "args", None)
+        enabled = bool(args is not None and getattr(args, "enable_dynamic_vram", False))
+    if not enabled:
+        return False
+
+    # (2) Intel XPU 硬件确认：仅当 ComfyUI 已加载 model_management 且其判据可用时校验；
+    #     不可用 / 异常时**不阻断**（交由 setup_backend 的 fail-closed 兜底）。启动期
+    #     comfy.model_management 尚未导入（见 docstring），故此处通常直接放行。
+    mm = sys.modules.get("comfy.model_management")
+    is_intel = getattr(mm, "is_intel_xpu", None) if mm is not None else None
+    if callable(is_intel):
+        try:
+            return bool(is_intel())
+        except Exception as error:
+            logging.warning(f"comfy-aimdo XPU: is_intel_xpu() failed ({error}); ignoring")
+    return True
 
 
 def get_torch_allocator():
