@@ -489,8 +489,8 @@ def _xpu_opt_in() -> bool:
        The force-off hatch matters because source (2) makes XPU default-on, so a
        user needs a way to keep native ``torch.xpu`` for AIMDO only without also
        turning DynamicVRAM off for the rest of ComfyUI.
-    2. ComfyUI's own gate: ``comfy.cli_args.enables_dynamic_vram()`` and the
-       ``is_intel_xpu()`` confirmation when that module is already available.
+    2. ComfyUI's own gate: ``comfy.cli_args.enables_dynamic_vram()`` **and**
+       ``comfy.model_management.is_intel_xpu()``.
 
     Source (2) is the task-#17 "same source" alignment. ComfyUI decides DynamicVRAM
     support *by vendor* -- ``main.py`` runs ``enables_dynamic_vram() and
@@ -503,13 +503,6 @@ def _xpu_opt_in() -> bool:
     disagree. The extra ``is_intel_xpu()`` confirmation rejects the rare
     "torch version says xpu but no usable device" case before we start wiring
     queues.
-
-    Import-order note: ``main.py`` calls ``control.init()`` (which reaches this
-    function) at ~line 74, but ``import comfy.model_management`` does not happen
-    until ~line 258. So during real startup ``comfy.model_management`` is normally
-    NOT yet in ``sys.modules`` -- the confirmation below MUST therefore be
-    non-blocking, or the whole auto-enable silently fails irrespective of what
-    ComfyUI already decided (this is the exact bug this version fixes).
 
     Degradation is deliberate and conservative:
       * no ``comfy.cli_args`` (plain library / unit-test) -> False unless env set;
@@ -553,8 +546,12 @@ def _xpu_opt_in() -> bool:
         return False
 
     # (2) Intel XPU 硬件确认：仅当 ComfyUI 已加载 model_management 且其判据可用时校验；
-    #     不可用 / 异常时**不阻断**（交由 setup_backend 的 fail-closed 兜底）。启动期
-    #     comfy.model_management 尚未导入（见 docstring），故此处通常直接放行。
+    #     不可用 / 异常时不阻断（交由 setup_backend 的 fail-closed 兜底）。
+    #
+    #     IMPORTANT: main.py 在 ~line 74-84 就调用 comfy_aimdo.control.init()（-> 本函数），
+    #     但 comfy.model_management 直到 ~line 258 才 import。真实启动调用点上它并不在
+    #     sys.modules；此处若「要求它存在」会让门禁恒为 False（即出货版 728d6bb 的 bug）。
+    #     故采用「不可用即不阻断」：可用时保留 Intel 确认，不可用时不因时序竞态而静默退出。
     mm = sys.modules.get("comfy.model_management")
     is_intel = getattr(mm, "is_intel_xpu", None) if mm is not None else None
     if callable(is_intel):
