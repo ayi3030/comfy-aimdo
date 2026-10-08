@@ -53,7 +53,7 @@ extern void aimdo_xpu_native_accounting_cleanup(void);
 extern bool aimdo_xpu_tracer_install(void);
 extern void aimdo_xpu_tracer_remove(void);
 extern bool aimdo_xpu_ur_hook_install(void);
-extern void aimdo_xpu_ur_hook_remove(void);
+extern bool aimdo_xpu_ur_hook_remove(void);
 
 typedef ze_result_t (ZE_APICALL *PFN_zeMemAllocDevice)(
     ze_context_handle_t, const ze_device_mem_alloc_desc_t *, size_t, size_t,
@@ -230,7 +230,11 @@ static bool install_detours(void) {
     return true;
 }
 
-static void remove_detours(void) {
+/* Returns false when the transaction commit failed, i.e. the hooks are still
+ * live. Callers must NOT tear down the state those hooks reference (the
+ * accounting table, the devctx) in that case: doing so is exactly the
+ * use-after-free that keeping the trampolines is meant to avoid. */
+static bool remove_detours(void) {
     LONG status;
 
     DetourTransactionBegin();
@@ -247,15 +251,17 @@ static void remove_detours(void) {
     status = DetourTransactionCommit();
     if (status != NO_ERROR) {
         /* The hooks are still live. Keeping the trampolines is the only way
-         * they can still reach the real driver entry points. */
+         * they can still reach the real driver entry points -- and it means the
+         * caller must leave every structure they touch intact. */
         aimdo_log(kAimdoDetourLogError, __FILE__, __LINE__,
                   "%s: DetourDetach failed: %ld; hooks remain installed\n",
                   __func__, (long)status);
-        return;
+        return false;
     }
     true_zeMemAllocDevice = NULL;
     true_zeMemFree = NULL;
     true_zeMemFreeExt = NULL;
+    return true;
 }
 
 bool aimdo_setup_hooks(void) {
@@ -317,6 +323,8 @@ bool aimdo_setup_hooks(void) {
 }
 
 void aimdo_teardown_hooks(void) {
+    bool accounting_intact = true;
+
     if (!g_hooks_installed) {
         return;
     }
@@ -326,13 +334,33 @@ void aimdo_teardown_hooks(void) {
         g_hooks_installed = false;
         return;
     }
-    if (true_zeMemAllocDevice) {
-        remove_detours();
-        aimdo_xpu_native_accounting_cleanup();
-    }
+
+    /* Strict reverse of aimdo_setup_hooks(): UR hook (upper) -> Level Zero
+     * detour -> accounting (lower). The previous order detached the lower
+     * layers first, so the still-installed upper hooks could call into the
+     * accounting table while it was being torn down. */
     if (g_ur_hook_owns_arbitration) {
-        aimdo_xpu_ur_hook_remove();
-        g_ur_hook_owns_arbitration = false;
+        if (aimdo_xpu_ur_hook_remove()) {
+            g_ur_hook_owns_arbitration = false;
+        } else {
+            /* Still live, so the accounting table must stay valid. */
+            accounting_intact = false;
+        }
+    }
+    if (true_zeMemAllocDevice) {
+        if (!remove_detours()) {
+            accounting_intact = false;
+        }
+    }
+    if (accounting_intact) {
+        aimdo_xpu_native_accounting_cleanup();
+    } else {
+        aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
+                  "%s: detaching did not complete; leaving the native "
+                  "accounting table in place so live hooks stay valid\n",
+                  __func__);
+        /* Stay marked as installed so a later teardown can retry. */
+        return;
     }
     g_hooks_installed = false;
 }

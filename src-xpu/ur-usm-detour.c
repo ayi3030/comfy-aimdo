@@ -850,11 +850,11 @@ bool aimdo_xpu_ur_hook_install(void) {
     return true;
 }
 
-void aimdo_xpu_ur_hook_remove(void) {
+bool aimdo_xpu_ur_hook_remove(void) {
     LONG status;
 
     if (!InterlockedCompareExchange(&g_attached, 0, 0)) {
-        return;
+        return true;
     }
     InterlockedExchange(&g_enabled, 0);
     DetourTransactionBegin();
@@ -868,16 +868,19 @@ void aimdo_xpu_ur_hook_remove(void) {
     status = DetourTransactionCommit();
     if (status != NO_ERROR) {
         /* The hooks are still live; keeping the trampolines is the only way
-         * they can still reach the real entry points. */
+         * they can still reach the real entry points. g_attached stays 1 so
+         * the caller can retry, and so nothing tears down state the live
+         * hooks still reference. */
         aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
                   "%s: DetourDetach failed: %ld; hooks remain installed\n",
                   __func__, (long)status);
-        return;
+        return false;
     }
     true_urUSMDeviceAlloc = NULL;
     true_urUSMFree = NULL;
     true_urPhysicalMemCreate = NULL;
     InterlockedExchange(&g_attached, 0);
+    return true;
 }
 
 /* The four entry points below carry the same names and meanings as the Linux
