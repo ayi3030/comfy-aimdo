@@ -4,8 +4,10 @@
 # Why this shape:
 #   * The native XPU implementation (src-xpu/) lives in the community fork
 #     xiangyuT/comfy-aimdo-xpu, kept mutually compatible with its own src/ +
-#     src-win/. Upstream comfy-aimdo has no src-xpu/ at all. To get a reliable
-#     first build we compile the fork's compatible native tree, then package
+#     src-win/. Upstream comfy-aimdo has no src-xpu/ at all. We keep a
+#     patched copy of src-xpu/ in THIS repo and overlay it onto the community
+#     tree after checkout (see "Overlay patched src-xpu/" step) so the build
+#     compiles OUR source (M2 single-ledger / Book A fix), then we package
 #     ONLY the resulting DLL into THIS repo's clean Python integration
 #     (comfy_aimdo/ with our xpu.py + control.py/torch.py edits).
 #   * The DLL is torch-version agnostic at compile time (it talks to Level Zero
@@ -84,6 +86,16 @@ jobs:
           ref: ${{ env.COMMUNITY_FORK_SHA }}
           fetch-depth: 1
           path: native
+
+      - name: Overlay patched src-xpu/ from this repo (M2 single-ledger / Book A)
+        shell: bash
+        run: |
+          # Our fork owns the XPU native source. The community checkout above is
+          # only a known-good build environment + scripts; we must compile OUR
+          # src-xpu/ (dispatch.cpp carries the M2 Book A fix), not the community's
+          # unmodified tree -- otherwise the Book A exports never reach the DLL.
+          cp -r aimdo/src-xpu/. native/src-xpu/
+          echo "Overlaid src-xpu into native/src-xpu/:"; ls -1 native/src-xpu/
 
       - name: Install Intel oneAPI DPC++/C++ Compiler (offline installer)
         shell: cmd
