@@ -108,6 +108,14 @@ def _declare_argtypes(lib) -> None:
     lib.xpu_allocator_reset_peak_stats.argtypes = [ctypes.c_int]
     lib.xpu_allocator_reset_peak_stats.restype = None
 
+    # M2: Book A（单一记账源）导出；老 DLL 可能缺失，故仅在有符号时声明。
+    if hasattr(lib, "xpu_get_total_vram_usage"):
+        lib.xpu_get_total_vram_usage.argtypes = [ctypes.c_int]
+        lib.xpu_get_total_vram_usage.restype = ctypes.c_uint64
+    if hasattr(lib, "xpu_get_peak_total_vram_usage"):
+        lib.xpu_get_peak_total_vram_usage.argtypes = [ctypes.c_int]
+        lib.xpu_get_peak_total_vram_usage.restype = ctypes.c_uint64
+
     if platform.system() == "Windows":
         # Windows-specific small-VBAR copy workaround entry points.
         if hasattr(lib, "aimdo_xpu_is_mapped_pinned_vbar"):
@@ -303,17 +311,43 @@ def get_torch_allocator():
 
 
 def get_xpu_allocator_memory_stats(device=None):
+    """返回 (active, reserved, peak_active, peak_reserved)。
+
+    M2 单一记账源：优先读 Book A（xpu_get_total_vram_usage，即
+    g_devctx->_total_vram_usage，AIMDO 权威物理显存账），彻底避免与
+    torch 自记账副本（Book B / g_torch_*_bytes）造成的双记账。XPU 上
+    active 与 reserved 的拆分无权威来源，采用保守近似 active == reserved；
+    峰值用 AIMDO 维护的 Book A 峰值。
+
+    老 DLL 未导出 Book A 时回落 Book B 并告警（双记账风险，仅兼容）。
+    """
     if control.lib is None:
         return None
     dev = torch.xpu.current_device() if device is None else device
     dev = dev if isinstance(dev, int) else dev.index
-    out = (ctypes.c_uint64 * 4)()
+    if hasattr(control.lib, "xpu_get_total_vram_usage"):
+        try:
+            active = reserved = int(control.lib.xpu_get_total_vram_usage(int(dev)))
+            peak = (
+                int(control.lib.xpu_get_peak_total_vram_usage(int(dev)))
+                if hasattr(control.lib, "xpu_get_peak_total_vram_usage")
+                else active
+            )
+            return (active, reserved, peak, peak)
+        except Exception:
+            pass
+    # 兼容路径：老 DLL 仅暴露 Book B（双记账风险）
     try:
+        out = (ctypes.c_uint64 * 4)()
         ok = control.lib.xpu_allocator_get_memory_stats(int(dev), out, 4)
     except Exception:
         return None
     if not ok:
         return None
+    logging.warning(
+        "comfy-aimdo XPU: DLL 未导出 Book A (xpu_get_total_vram_usage)，"
+        "显存统计回落 Book B，存在双记账风险（请升级 aimdo_xpu.dll）"
+    )
     return int(out[0]), int(out[1]), int(out[2]), int(out[3])
 
 

@@ -1489,11 +1489,37 @@ AIMDO_XPU_EXPORT bool xpu_allocator_get_memory_stats(
     return true;
 }
 
+// ---- M2: 单一记账源（Book A）----
+// 双记账根因：上面 xpu_allocator_get_memory_stats 返回的是 Book B
+// (g_torch_active/reserved_bytes)，它是 torch 字节的“第二本账”，与
+// AIMDO 权威物理账 (g_devctx->_total_vram_usage, Book A) 重复计同一块
+// XPU 显存。下游若同时看 reserved(Book B) 与 total_vram_usage(Book A)
+// 会低估可用显存、过度驱逐。M2 以 Book A 为唯一权威账本，故新增以下
+// 两个导出，让 Python 侧直接读 Book A，彻底不再暴露 Book B。
+extern "C" uint64_t aimdo_xpu_recorded_usage(void);  // 返回 g_devctx->_total_vram_usage (Book A)
+static uint64_t g_peak_total_vram_usage = 0;
+
+AIMDO_XPU_EXPORT uint64_t xpu_get_total_vram_usage(int device) {
+    (void)device;  // Book A 为进程级单设备账；保留 device 形参以匹配上游签名词典
+    return aimdo_xpu_recorded_usage();
+}
+
+AIMDO_XPU_EXPORT uint64_t xpu_get_peak_total_vram_usage(int device) {
+    (void)device;
+    std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
+    uint64_t cur = aimdo_xpu_recorded_usage();
+    if (cur > g_peak_total_vram_usage) {
+        g_peak_total_vram_usage = cur;
+    }
+    return g_peak_total_vram_usage;
+}
+
 AIMDO_XPU_EXPORT void xpu_allocator_reset_peak_stats(
     int device) {
     std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
     g_torch_peak_active_bytes[device] = g_torch_active_bytes[device];
     g_torch_peak_reserved_bytes[device] = g_torch_reserved_bytes[device];
+    g_peak_total_vram_usage = aimdo_xpu_recorded_usage();  // M2: Book A 峰值一并重置
 }
 
 AIMDO_XPU_EXPORT bool xpu_set_queues(
