@@ -680,6 +680,14 @@ def get_xpu_torch_reserved_growth(device=None):
     fork 的原始取值是 torch.xpu.memory_stats() 的
     reserved_bytes.all.peak - reserved_bytes.all.current —— torch 自己知道
     自己的预留历史，且这是与 Book A 不同源的前瞻量，语义正确。
+
+    实测（Arc B580 / torch 2.14.0+xpu，绕过包装器后）：
+        分配 4x256MiB     reserved=1024MiB allocated=1024MiB -> cached=   0MiB
+        释放后（未trim）    reserved=1024MiB allocated=   0MiB -> cached=1024MiB
+        empty_cache 后    reserved=   0MiB allocated=   0MiB -> cached=   0MiB
+    即 torch 只在 empty_cache() 后才把 cached 降下来 —— 这正是 L3 存在的
+    理由，也是 L2 必须与 L3 串联的原因（只有 trim 之后 peak/current 才拉开，
+    growth 才有前瞻值）。
     """
     try:
         # 必须走 torch 原生口径。M2 安装的 aimdo_xpu_memory_stats 把 reserved

@@ -248,8 +248,19 @@ def torch_reserved_stats(device=None):
 
         L3 trim 永不触发、anticipated_growth 恒为 0。
 
-    L3 的判据（reserved - allocated > 32MB）与 growth 前瞻量都必须建立在 torch
-    自己的字节口径上，所以这里显式调用包装前捕获的原始函数。
+    实测（Arc B580 / torch 2.14.0+xpu，Book A=6GB、torch 真实 8GB/4GB）：
+        经包装器: reserved=6GB allocated=6GB -> cached=0GB  （L3 判据恒假）
+        绕过后  : reserved=8GB allocated=4GB -> cached=4GB  （L3 正常触发）
+
+    所以本函数只捕获并调用「包装前」的原始函数。任何改动
+    _install_native_hook_wrappers 捕获时机或 _wrappers_installed 守卫的代码，
+    都可能让本函数静默变成 None，进而让 L3 停工 —— 故 model_vbar 的
+    _release_native_cache 在 None 时会打一条限流告警。
+
+    ⚠️ 耦合约束：本模块顶层的 M2 包装器（_install_native_hook_wrappers）既是
+    「双记账修复」，也是「torch 真实字节」的唯一遮蔽源。改它之前先确认
+    torch_reserved_stats 的捕获仍然有效；否则 L3 会静默失效，且实机症状只是
+    「采样变慢」，不会有任何报错。
 
     返回 (reserved, allocated, peak_reserved)；不可用时返回 None。
     """
