@@ -48,6 +48,7 @@ _NATIVE_HOOK_SYMBOLS = (
 
 _xpu_allocator_ready = False
 _xpu_allocator_mode = None
+_wrappers_installed = False
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
@@ -174,7 +175,13 @@ def _install_global_allocator(lib):
 def _install_native_hook_wrappers():
     """Override torch.xpu cache/stat accessors so AIMDO's bookkeeping is visible."""
     global _torch_xpu_empty_cache_original, _torch_xpu_memory_stats_original
-    global _torch_xpu_reset_peak_stats_original
+    global _torch_xpu_reset_peak_stats_original, _wrappers_installed
+
+    # Idempotence guard (teardown-review F-05). Re-capturing the originals on a
+    # second call would store our own wrapper as the "original", so the restore
+    # in teardown_backend() would put the wrapper back instead of torch's.
+    if _wrappers_installed:
+        return
 
     _torch_xpu_empty_cache_original = torch.xpu.empty_cache
     _torch_xpu_memory_stats_original = torch.xpu.memory_stats
@@ -223,6 +230,57 @@ def _install_native_hook_wrappers():
     torch.xpu.memory_stats = aimdo_xpu_memory_stats
     torch.xpu.memory.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     torch.xpu.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
+    _wrappers_installed = True
+
+
+def teardown_backend() -> None:
+    """Undo everything setup_backend() changed (teardown-review F-03).
+
+    Without this, control.deinit() released the native library while the AIMDO
+    wrappers stayed bound to torch.xpu -- verified on Arc B580: after deinit()
+    returned successfully, torch.xpu.empty_cache still pointed at
+    comfy_aimdo.xpu and _xpu_allocator_ready was still True. Any later XPU
+    allocation therefore went through a wrapper whose `control.lib` was None,
+    and its bookkeeping was silently dropped.
+
+    Safe to call when nothing was installed, and safe to call twice.
+    """
+    global _torch_xpu_empty_cache_original, _torch_xpu_memory_stats_original
+    global _torch_xpu_reset_peak_stats_original
+    global _xpu_allocator_ready, _xpu_allocator_mode, _wrappers_installed
+
+    if _wrappers_installed:
+        # Only rebind attributes we actually replaced; a caller may have
+        # installed their own wrapper after us.
+        if _torch_xpu_empty_cache_original is not None:
+            torch.xpu.empty_cache = _torch_xpu_empty_cache_original
+        if _torch_xpu_memory_stats_original is not None:
+            torch.xpu.memory.memory_stats = _torch_xpu_memory_stats_original
+            torch.xpu.memory_stats = _torch_xpu_memory_stats_original
+        if _torch_xpu_reset_peak_stats_original is not None:
+            torch.xpu.memory.reset_peak_memory_stats = (
+                _torch_xpu_reset_peak_stats_original)
+            torch.xpu.reset_peak_memory_stats = (
+                _torch_xpu_reset_peak_stats_original)
+
+        _torch_xpu_empty_cache_original = None
+        _torch_xpu_memory_stats_original = None
+        _torch_xpu_reset_peak_stats_original = None
+        _wrappers_installed = False
+        logging.info("comfy-aimdo XPU: restored the torch.xpu entry points")
+
+    # In "global" mode torch's allocator was replaced wholesale; hand it back.
+    if _xpu_allocator_mode == "global":
+        try:
+            from . import torch as _torch_backend
+            restore = getattr(_torch_backend, "restore_torch_allocator", None)
+            if restore is not None:
+                restore()
+        except Exception as _error:
+            logging.info(f"comfy-aimdo XPU: allocator restore skipped: {_error!r}")
+
+    _xpu_allocator_ready = False
+    _xpu_allocator_mode = None
 
 
 def _publish_queues(lib) -> bool:
@@ -289,6 +347,14 @@ def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool
     Caller (control.init) treats False as "use native torch.xpu instead".
     """
     global _xpu_allocator_ready, _xpu_allocator_mode
+
+    # Idempotence guard (teardown-review F-05): a second setup_backend() call
+    # would wrap our own wrapper and re-run the hook enable, so short-circuit
+    # when the requested mode is already live.
+    if _xpu_allocator_ready and _xpu_allocator_mode == _normalize_mode(mode):
+        logging.info(
+            f"comfy-aimdo XPU backend already ready (mode={_xpu_allocator_mode})")
+        return True
 
     try:
         requested_mode = _normalize_mode(mode)

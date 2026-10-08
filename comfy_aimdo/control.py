@@ -402,13 +402,42 @@ def get_simple_vram_headroom():
 
 def deinit():
     global lib, devctxs, _log_callback
-    if lib is not None:
+    if lib is None:
+        return
+
+    # Restore the torch.xpu entry points and reset the backend state BEFORE
+    # releasing the native library. The AIMDO wrappers installed by
+    # xpu.setup_backend() close over `lib`; leaving them attached after it is
+    # unloaded leaves torch calling into a half-torn-down backend (verified on
+    # Arc B580: torch.xpu.empty_cache stayed bound to comfy_aimdo.xpu after
+    # deinit(), and every state flag kept its loaded value).
+    try:
+        from . import xpu as _xpu_backend
+        _xpu_backend.teardown_backend()
+    except Exception as _error:  # teardown must never block unloading
+        logging.info(f"comfy-aimdo: XPU backend teardown skipped: {_error!r}")
+
+    # Detach the native log callback while the library is still alive, and
+    # always clear the Python-side reference. Doing this first removes the
+    # window in which native code could call a CFUNCTYPE that Python has
+    # already dropped -- a dangling function pointer.
+    try:
+        lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
+    finally:
+        _log_callback = None
+
+    # From here on the platform teardown must not abort the remaining steps.
+    # cleanup() releases device resources, plat_cleanup() detaches the
+    # Level Zero / Unified Runtime hooks; neither depends on the other's
+    # bookkeeping being visible afterwards.
+    try:
         lib.cleanup()
         devctxs = []
-        lib.plat_cleanup()
-        lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
-        _log_callback = None
-    lib = None
+    finally:
+        try:
+            lib.plat_cleanup()
+        finally:
+            lib = None
 
 
 def set_log_none(): lib.set_log_level_none()
