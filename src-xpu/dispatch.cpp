@@ -1557,7 +1557,15 @@ extern "C" uint64_t aimdo_xpu_vram_capacity(void);  // 返回 g_devctx->_vram_ca
 static uint64_t g_peak_total_vram_usage = 0;
 
 AIMDO_XPU_EXPORT uint64_t xpu_get_total_vram_usage(int device) {
-    (void)device;  // Book A 为进程级单设备账；保留 device 形参以匹配上游签名词典
+    /* g_devctx 是 _Thread_local。Python 多在主线程调用本导出，而 XPU 队列是
+     * 由 ComfyUI 在别的线程 publish 的，主线程的 g_devctx 通常为 NULL——
+     * 不绑定就会恒返回 0，让诊断把Book A 读成「没占显存」。
+     * 与 xpu_get_vram_capacity / xpu_get_peak_total_vram_usage 保持同一模式：
+     * 先按 device 绑定本线程 devctx，再读权威账本。
+     * device< 0 表示不绑定（进程级单设备账的旧语义），保留兼容。 */
+    if (device >= 0 && !set_devctx_for_device(device)) {
+        return 0;
+    }
     return aimdo_xpu_recorded_usage();
 }
 
