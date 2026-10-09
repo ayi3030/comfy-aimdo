@@ -307,6 +307,14 @@ def main():
             " * model.py:777 torch.lerp -> +1875 -> gate trips -> P1 hard-deny).\n"
             " * Do NOT exceed 4096 MiB. See RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13. */\n"
             "#define SAFE_FREE_FLOOR (4096ULL * 1024 * 1024)\n"
+            "\n"
+            "/* True device free captured by poll_budget_deficit() each poll; exposed\n"
+            " * (extern) to src-xpu/stubs.c so the Windows eviction path can log the\n"
+            " * real physical free in its deny message. Defined HERE (the compiled\n"
+            " * translation unit) because this file is patched into the community fork\n"
+            " * at build time by apply-ram-rootcause-patch.py -- a definition placed in\n"
+            " * this repo's own src-win/shmem-detect.c would never reach the DLL. */\n"
+            "uint64_t last_free_vram = 0;\n"
         ),
         already_marker="SAFE_FREE_FLOOR (4096",
     )
@@ -315,6 +323,7 @@ def main():
         FILES["shmem_c"],
         "        ssize_t headroom = used_nvml ? NVML_BUDGET_HEADROOM : CUDA_BUDGET_HEADROOM / 2;\n"
         "        ssize_t deficit_cuda = headroom - (ssize_t)free_vram;",
+        "        last_free_vram = free_vram;\n"
         "        ssize_t deficit_real = (ssize_t)SAFE_FREE_FLOOR - (ssize_t)free_vram;",
         already_marker="deficit_real = (ssize_t)SAFE_FREE_FLOOR",
     )
