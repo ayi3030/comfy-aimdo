@@ -216,6 +216,15 @@ def _install_native_hook_wrappers():
             except RuntimeError:
                 return {}
         active, reserved, peak_active, peak_reserved = stats
+        # P2: refresh the external VRAM ledger on every memory-stats query.
+        # Sampling steps and VBAR faults query stats frequently, so this keeps
+        # Book A from going stale by the ~940 MB window that previously only
+        # closed on empty_cache() calls. Same try/except style as the
+        # empty_cache wrapper above.
+        try:
+            _feed_external_vram_usage()
+        except Exception:
+            pass
         return {
             "active_bytes.all.current": active,
             "active_bytes.all.peak": peak_active,

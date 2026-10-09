@@ -17,6 +17,12 @@ typedef union {
 } AimdoHipDeviceProp;
 #endif
 
+/* True Level-Zero device free bytes from the most recent cuMemGetInfo / NVML
+ * poll. Exposed (via extern) to src-xpu/stubs.c so the Windows eviction path
+ * can reason about the real physical free instead of the optimistic WDDM
+ * budget. Updated only on a successful poll. */
+uint64_t last_free_vram = 0;
+
 bool aimdo_wddm_init(CUdevice dev)
 {
     int fail_code = 1;
@@ -106,6 +112,29 @@ fail:
 #define CUDA_BUDGET_HEADROOM (192 * 1024 * 1024)
 #define NVML_BUDGET_HEADROOM (512 * 1024 * 1024)
 
+/* SAFE_FREE_FLOOR — the Windows/XPU admission gate's real-free guard. We deny
+ * (deficit_real > 0) ONLY when the TRUE Level-Zero device free drops below this
+ * floor. This implicitly covers the system/driver overhead the external ledger
+ * (Book A / total_vram_usage) never sees — Level-Zero queue & descriptor pools,
+ * the WDDM resident working set, and other reservations the XPU path does not
+ * account for (empirically ~940 MB on Arc B580) — by keeping a fixed reserve of
+ * device free, rather than adding a pad to Book A.
+ *
+ * Why a FLOOR instead of (Book A + margin) - free: on a 12 GiB Arc B580 the
+ * model pins Book A at ~6500 MB, so free normally sits at 3000-5500 MB. The
+ * form (6500 + 1024) - free is structurally positive for any free < ~7.5 GB,
+ * i.e. it denies EVERY allocation once the model is loaded and H3 can never
+ * run. The floor form denies only when free < 4096 MB; the observed crash fired
+ * at free=3221 MB during a transient kernel commit (torch.lerp, model.py:777),
+ * which this floor catches (3221 < 4096 -> deficit_real = +1875 -> gate trips
+ * -> P1 hard-deny on Windows returns synthetic OOM -> torch frees caches ->
+ * retry succeeds). With a healthy free of 5500-8000 MB the deficit is negative
+ * and allocation proceeds normally. See RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13.
+ *
+ * 4096 MiB is the lead-approved ceiling; do NOT exceed it. A smaller floor
+ * (3072/2048 MiB) would NOT catch the 3221 MB crash and is therefore unsafe. */
+#define SAFE_FREE_FLOOR (4096ULL * 1024 * 1024)
+
 bool poll_budget_deficit(const char **prevailing_deficit_method)
 {
     DXGI_QUERY_VIDEO_MEMORY_INFO info;
@@ -163,16 +192,24 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
     used_nvml = nvml_device && aimdo_nvml_memory_info(nvml_device, &free_vram, &total_vram);
 #endif
     if (used_nvml || CHECK_CU(cuMemGetInfo(&free_vram, &total_vram))) {
-        ssize_t headroom = used_nvml ? NVML_BUDGET_HEADROOM : CUDA_BUDGET_HEADROOM / 2;
-        ssize_t deficit_cuda = headroom - (ssize_t)free_vram;
+        /* Capture the TRUE device free for the Windows eviction path. */
+        last_free_vram = free_vram;
+
+        /* Real-free method: a SAFE_FREE_FLOOR guard against the ACTUAL device
+         * free (not the optimistic WDDM budget). Deny only when true device
+         * free drops below the floor — this is safe against the over-restriction
+         * bug (see SAFE_FREE_FLOOR comment above). The most-restrictive (largest)
+         * deficit across the WDDM-budget and real-free methods still wins, so the
+         * gate trips on whichever signal is tighter. */
+        ssize_t deficit_real = (ssize_t)SAFE_FREE_FLOOR - (ssize_t)free_vram;
 
         log(DEBUG,
-            "%s: device memory free=%zu MB total=%zu MB deficit_cuda=%zd MB\n",
-            __func__, free_vram / M, total_vram / M, deficit_cuda / (ssize_t)M);
+            "%s: device memory free=%zu MB total=%zu MB deficit_real=%zd MB\n",
+            __func__, free_vram / M, total_vram / M, deficit_real / (ssize_t)M);
 
-        if (deficit_cuda > deficit_sync) {
-            deficit_sync = deficit_cuda;
-            *prevailing_deficit_method = used_nvml ? "NVML (Windows)" : "cuMemGetInfo (Windows)";
+        if (deficit_real > deficit_sync) {
+            deficit_sync = deficit_real;
+            *prevailing_deficit_method = used_nvml ? "NVML real-free" : "cuMemGetInfo real-free";
         }
     }
 
