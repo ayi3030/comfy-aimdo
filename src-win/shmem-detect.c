@@ -17,12 +17,6 @@ typedef union {
 } AimdoHipDeviceProp;
 #endif
 
-/* True Level-Zero device free bytes from the most recent cuMemGetInfo / NVML
- * poll. Exposed (via extern) to src-xpu/stubs.c so the Windows eviction path
- * can reason about the real physical free instead of the optimistic WDDM
- * budget. Updated only on a successful poll. */
-uint64_t last_free_vram = 0;
-
 bool aimdo_wddm_init(CUdevice dev)
 {
     int fail_code = 1;
@@ -112,28 +106,56 @@ fail:
 #define CUDA_BUDGET_HEADROOM (192 * 1024 * 1024)
 #define NVML_BUDGET_HEADROOM (512 * 1024 * 1024)
 
-/* SAFE_FREE_FLOOR — the Windows/XPU admission gate's real-free guard. We deny
- * (deficit_real > 0) ONLY when the TRUE Level-Zero device free drops below this
- * floor. This implicitly covers the system/driver overhead the external ledger
- * (Book A / total_vram_usage) never sees — Level-Zero queue & descriptor pools,
- * the WDDM resident working set, and other reservations the XPU path does not
- * account for (empirically ~940 MB on Arc B580) — by keeping a fixed reserve of
- * device free, rather than adding a pad to Book A.
+/* Real-free admission guard: a SIZE-AWARE FIT CHECK with a capacity-derived
+ * reserve. An allocation is refused only when it does not fit in the real free
+ * memory (last_free_vram) minus this reserve. See real_free_fit_deficit() below
+ * and RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13.
  *
- * Why a FLOOR instead of (Book A + margin) - free: on a 12 GiB Arc B580 the
- * model pins Book A at ~6500 MB, so free normally sits at 3000-5500 MB. The
- * form (6500 + 1024) - free is structurally positive for any free < ~7.5 GB,
- * i.e. it denies EVERY allocation once the model is loaded and H3 can never
- * run. The floor form denies only when free < 4096 MB; the observed crash fired
- * at free=3221 MB during a transient kernel commit (torch.lerp, model.py:777),
- * which this floor catches (3221 < 4096 -> deficit_real = +1875 -> gate trips
- * -> P1 hard-deny on Windows returns synthetic OOM -> torch frees caches ->
- * retry succeeds). With a healthy free of 5500-8000 MB the deficit is negative
- * and allocation proceeds normally. See RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13.
+ * Why NOT a fixed free-memory floor. An earlier revision denied whenever free
+ * fell below a hardcoded 4096 MiB. That constant was only meaningful for one
+ * card: far too strict on a 24 GB board, too lax on a 6 GB one. Worse, it
+ * cannot work at all on B580 -- the observed DEVICE_LOST fired at free=3221 MB
+ * while the same log series recorded a NORMAL healthy band of 3000-5500 MB, so
+ * 3221 sits INSIDE that band. No threshold separates healthy from about-to-crash;
+ * retuning the constant (3072/2048) was never going to be sound, and any value
+ * low enough to catch the crash also fires on healthy steady-state allocations.
+ * That is what produced the nondeterministic, card-dependent behaviour.
  *
- * 4096 MiB is the lead-approved ceiling; do NOT exceed it. A smaller floor
- * (3072/2048 MiB) would NOT catch the 3221 MB crash and is therefore unsafe. */
-#define SAFE_FREE_FLOOR (4096ULL * 1024 * 1024)
+ * Why a fit check instead. Whether a request can be served depends on its SIZE
+ * relative to what is actually free, not on free crossing a magic line. The
+ * check is therefore size-aware, and the reserve is expressed as a capped share
+ * OF CAPACITY (capacity/16, capped at 512 MiB) so one rule holds from a 4 GB
+ * laptop dGPU to a 96 GB board, on integrated GPUs, and on the XPU path, with no
+ * per-vendor or per-SKU constant anywhere. The reserve covers the driver-side
+ * pools and a transient kernel's working set that no ledger sees.
+ *
+ * The vendor headroom term (deficit_cuda) below is deliberately left intact so
+ * NVIDIA/ROCm behaviour on this shared Windows path is unchanged; the fit check
+ * is an additional, separate term MAXed in by plat.h:budget_deficit, and can
+ * only ever tighten the gate for a request that genuinely does not fit. */
+#define REAL_FREE_RESERVE_DEN  16
+#define REAL_FREE_RESERVE_CAP  (512ULL * 1024 * 1024)
+
+uint64_t last_free_vram = 0;
+uint64_t last_total_vram = 0;
+
+SHARED_EXPORT
+ssize_t real_free_fit_deficit(uint64_t size) {
+    uint64_t capacity, reserve, available;
+    if (last_free_vram == 0) {
+        return 0;
+    }
+    capacity = last_total_vram ? last_total_vram : vram_capacity;
+    reserve = capacity / REAL_FREE_RESERVE_DEN;
+    if (reserve > REAL_FREE_RESERVE_CAP) {
+        reserve = REAL_FREE_RESERVE_CAP;
+    }
+    available = (last_free_vram > reserve) ? (last_free_vram - reserve) : 0;
+    if (size <= available) {
+        return 0;
+    }
+    return (ssize_t)(size - available);
+}
 
 bool poll_budget_deficit(const char **prevailing_deficit_method)
 {
@@ -192,24 +214,22 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
     used_nvml = nvml_device && aimdo_nvml_memory_info(nvml_device, &free_vram, &total_vram);
 #endif
     if (used_nvml || CHECK_CU(cuMemGetInfo(&free_vram, &total_vram))) {
-        /* Capture the TRUE device free for the Windows eviction path. */
+        /* The vendor headroom term keeps its original meaning and precedence;
+         * record the true free/total alongside it so the capacity-derived
+         * size-aware fit check (real_free_fit_deficit) and the Windows
+         * eviction path can both see the real physical state. */
+        ssize_t headroom = used_nvml ? NVML_BUDGET_HEADROOM : CUDA_BUDGET_HEADROOM / 2;
+        ssize_t deficit_cuda = headroom - (ssize_t)free_vram;
         last_free_vram = free_vram;
-
-        /* Real-free method: a SAFE_FREE_FLOOR guard against the ACTUAL device
-         * free (not the optimistic WDDM budget). Deny only when true device
-         * free drops below the floor — this is safe against the over-restriction
-         * bug (see SAFE_FREE_FLOOR comment above). The most-restrictive (largest)
-         * deficit across the WDDM-budget and real-free methods still wins, so the
-         * gate trips on whichever signal is tighter. */
-        ssize_t deficit_real = (ssize_t)SAFE_FREE_FLOOR - (ssize_t)free_vram;
+        last_total_vram = total_vram;
 
         log(DEBUG,
-            "%s: device memory free=%zu MB total=%zu MB deficit_real=%zd MB\n",
-            __func__, free_vram / M, total_vram / M, deficit_real / (ssize_t)M);
+            "%s: device memory free=%zu MB total=%zu MB deficit_cuda=%zd MB\n",
+            __func__, free_vram / M, total_vram / M, deficit_cuda / (ssize_t)M);
 
-        if (deficit_real > deficit_sync) {
-            deficit_sync = deficit_real;
-            *prevailing_deficit_method = used_nvml ? "NVML real-free" : "cuMemGetInfo real-free";
+        if (deficit_cuda > deficit_sync) {
+            deficit_sync = deficit_cuda;
+            *prevailing_deficit_method = used_nvml ? "NVML (Windows)" : "cuMemGetInfo (Windows)";
         }
     }
 

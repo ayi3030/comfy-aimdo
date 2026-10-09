@@ -1,9 +1,13 @@
 #include "plat.h"
 
-/* True device free captured by poll_budget_deficit() in src-win/shmem-detect.c.
- * Exposed here so the Windows eviction path can reason about the real physical
- * free. Read-only; never written from this translation unit. */
+/* True device free / total captured by poll_budget_deficit() in the compiled
+ * shmem-detect translation unit, plus the shared size-aware fit check built on
+ * them.  All three live in the DLL's real translation unit, so the admission
+ * decision here and the one in budget_deficit() cannot drift apart.
+ * Read-only from this side; never written here. */
 extern uint64_t last_free_vram;
+extern uint64_t last_total_vram;
+extern ssize_t real_free_fit_deficit(uint64_t size);
 
 /* The XPU allocator does not record or replay allocation graphs. Keep the
  * shared allocator/VBAR call sites on their ordinary allocation and
@@ -126,18 +130,42 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
     if (deficit > 0) {
 #if defined(_WIN32) || defined(_WIN64)
         /* The UR hook is above the driver call but remains inside the native
-         * allocation stack.  Best-effort reclaim of VBAR pages, THEN DENY the
-         * allocation so the caller's hard-deny branch (ur-usm-detour.c:608)
-         * fires the synthetic OOM -> torch releases its cache -> retry. The old
-         * code returned true here unconditionally, so over-admission was never
-         * actually denied and R2 crashed with OUT_OF_RESOURCES(40). The retry
-         * path at ur-usm-detour.c:568 does not check this return value, so
-         * there is no double-deny. */
+         * allocation stack.  Record the shortage, best-effort reclaim VBAR
+         * pages, and let the caller decide.
+         *
+         * Denial policy (corrected).  An earlier revision returned false here
+         * for ANY deficit > 0, so every pressured allocation was refused.  That
+         * is only safe for the one caller that can actually recover from a
+         * refusal: PyTorch, which responds by dropping its cache and retrying.
+         * The detour already routes that case (torch-native request with a
+         * non-empty cache) into its own arm_retry()/synthetic-OOM branch BEFORE
+         * reaching us, and it deliberately does not consult this return value
+         * (see ur-usm-detour.c:568).  So the unconditional false could only
+         * ever fire on the paths with NO retry available -- a non-torch
+         * allocation, or a torch request with nothing cached to surrender --
+         * turning a recoverable pressure signal into a hard failure that
+         * propagated out of the allocator.
+         *
+         * Deny only when the request genuinely does not fit in the real free
+         * memory that was just polled.  That is the same size-aware,
+         * capacity-derived test budget_deficit() already applies, so this
+         * function no longer needs its own private threshold and cannot drift
+         * from the gate's; and a merely tight-but-satisfiable device still
+         * proceeds to the driver exactly as it does on CUDA/ROCm, where
+         * vbars_free() is called and the request is admitted.
+         *
+         * Both are best-effort and safe to call under the allocator locks:
+         * vbars_request_reclaim only records a target for the next
+         * owner-side VBAR boundary, unlike vbars_free() which unmaps
+         * Level-Zero physical memory right here. */
+        int64_t shortfall = (int64_t)real_free_fit_deficit((uint64_t)(deficit < 0 ? 0 : deficit));
         log(DEBUG,
-            "%s: Windows reclaiming %zd bytes; true device free=%zu MB; denying allocation\n",
-            __func__, (ssize_t)deficit, last_free_vram / (1024 * 1024));
+            "%s: Windows shortage=%zd bytes; true device free=%zu MB total=%zu MB; %s\n",
+            __func__, (ssize_t)deficit, last_free_vram / (1024 * 1024),
+            last_total_vram / (1024 * 1024),
+            shortfall > 0 ? "request does not fit, denying" : "reclaim only, admitting");
         vbars_request_reclaim((ssize_t)deficit);
-        return false;
+        return shortfall <= 0;
 #else
         vbars_free((ssize_t)deficit);
 #endif

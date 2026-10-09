@@ -514,13 +514,42 @@ CUresult xpu_memory_info(size_t *free_bytes, size_t *total_bytes) {
     try {
         const sycl::device device = state->queue->get_device();
         *total_bytes = device.get_info<sycl::info::device::global_mem_size>();
+
+        /* Free-memory reporting is an OPT-IN device capability
+         * (sycl::aspect::ext_intel_free_memory), not a universal one.  The old
+         * code answered "unsupported" by failing the whole query, which is a
+         * capability gap being reported as a device error: the caller in
+         * poll_budget_deficit() then skipped its entire real-free branch and
+         * silently lost the admission signal it depends on, with nothing in
+         * the log to explain why the numbers stopped moving.
+         *
+         * Degrade explicitly instead.  Report success with free == 0, which the
+         * consumers already treat as "no reading available" -- the size-aware
+         * fit check returns 0 while last_free_vram is 0, so the guard becomes a
+         * no-op rather than a false alarm -- and say so once in the log so the
+         * absent signal is attributable instead of merely observed.  Note the
+         * capacity is still reported: total_vram feeds the capacity-derived
+         * reserve, and callers that only need capacity (vram_capacity) keep
+         * working on devices without the aspect.
+         */
         if (!device.has(sycl::aspect::ext_intel_free_memory)) {
-            return kCudaErrorUnknown;
+            *free_bytes = 0;
+            std::fprintf(
+                stderr,
+                "[AIMDO XPU] device does not expose free-memory reporting "
+                "(sycl::aspect::ext_intel_free_memory); real-free admission "
+                "guard is inactive for this device (capacity %llu MiB still "
+                "reported)\n",
+                static_cast<unsigned long long>(*total_bytes >> 20));
+            return CUDA_SUCCESS;
         }
         *free_bytes = static_cast<size_t>(
             device.get_info<sycl::ext::intel::info::device::free_memory>());
         return CUDA_SUCCESS;
     } catch (...) {
+        /* A throwing query is not evidence that the device is absent; report
+         * the failure honestly but do not fabricate a free-memory reading. */
+        *free_bytes = 0;
         return kCudaErrorUnknown;
     }
 }

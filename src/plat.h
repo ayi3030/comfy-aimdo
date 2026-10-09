@@ -160,8 +160,11 @@ static inline size_t effective_book_a(void) {
     return total_vram_usage > external_vram_usage ? total_vram_usage : external_vram_usage;
 }
 
+/* RAM-layer real-free fit check (see RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13). */
+ssize_t real_free_fit_deficit(uint64_t size);
+
 static inline ssize_t budget_deficit(size_t size) {
-    ssize_t deficit_simple, deficit_delta;
+    ssize_t deficit_simple, deficit_delta, deficit_fit;
     ssize_t deficit;
     const char *prevailing_deficit_method = "unknown";
 
@@ -169,12 +172,16 @@ static inline ssize_t budget_deficit(size_t size) {
     size_t book_a = effective_book_a();
     deficit_simple = (ssize_t)(book_a + size) + (ssize_t)simple_vram_headroom -
                      (ssize_t)vram_capacity;
-    deficit_delta = deficit_sync + (ssize_t)book_a -
+    deficit_delta = deficit_sync + (ssize_t)total_vram_usage -
                     (ssize_t)total_vram_last_check + (ssize_t)size;
-    deficit = MAX(deficit_simple, deficit_delta) + (ssize_t)extra_vram_headroom;
+    ssize_t deficit_fit = real_free_fit_deficit((uint64_t)size);
+    deficit = MAX(MAX(deficit_simple, deficit_delta), deficit_fit) +
+               (ssize_t)extra_vram_headroom;
     if (deficit > 0) {
         log(DEBUG, "%s: Prevailing Method: %s Deficit: %zu Extra Headroom: %zu Alloc Size %zu\n", __func__,
-            deficit_simple > deficit_delta ? "simple" : prevailing_deficit_method,
+            deficit_fit > MAX(deficit_simple, deficit_delta)
+                ? "real-free-fit"
+                : (deficit_simple > deficit_delta ? "simple" : prevailing_deficit_method),
             (size_t)deficit / M, (size_t)extra_vram_headroom / M, size / M);
     }
     return deficit;
