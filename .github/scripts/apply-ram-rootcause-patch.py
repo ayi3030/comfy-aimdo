@@ -202,7 +202,7 @@ def main():
         FILES["plat_h"],
         "poll_budget_deficit(&prevailing_deficit_method)",
         "    uint64_t book_a = effective_book_a();\n",
-        already_marker="size_t book_a = effective_book_a();",
+        already_marker="uint64_t book_a = effective_book_a();",
     )
     # 3) Use book_a in deficit_simple.
     apply_edit(

@@ -77,6 +77,22 @@ def main():
                     "void aimdo_set_external_vram_usage(uint64_t usage)": 1},
           order=[("aimdo_set_external_vram_usage", "void cleanup(void)")])
 
+    # R1 (re-audit hardening): the offline test must defend the C2370 fix, not
+    # just the compile gate. The bug was 'uint64_t external_vram_usage = 0;'
+    # sitting directly under SHARED_EXPORT (giving it dllexport storage class
+    # while plat.h declares it plain 'extern' -> MSVC C2370). Assert the
+    # definition is NOT directly under SHARED_EXPORT in the patched control.c.
+    cc = os.path.join(NATIVE, "src", "control.c")
+    with open(cc, "r", encoding="utf-8") as f:
+        cc_lines = f.read().split("\n")
+    if "uint64_t external_vram_usage = 0;" in cc_lines:
+        i = cc_lines.index("uint64_t external_vram_usage = 0;")
+        if i > 0 and cc_lines[i - 1].strip() == "SHARED_EXPORT":
+            fails.append("control.c: 'external_vram_usage' definition directly under "
+                         "SHARED_EXPORT (C2370 storage-class regression)")
+    else:
+        fails.append("control.c: 'uint64_t external_vram_usage = 0;' not found")
+
     check(os.path.join(NATIVE, "src-win", "shmem-detect.c"),
           ["sysmem fallback detected (DXGI budget", "if (effective_budget > vram_capacity)",
            "effective_usage = effective_book_a();",
