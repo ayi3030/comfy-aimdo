@@ -229,12 +229,7 @@ def cast_modules_with_vbar(comfy_modules, dtype, device, bias_dtype, non_blockin
             if pin is not None:
                 cast_maybe_lowvram_patch([pin], dest, offload_stream)
                 return
-            if (signature is None or not fast_disk or args.high_ram
-                    or comfy.model_management.xpu_ram_cache_enabled()):
-                # XPU 三层存储：即使判定为快盘（fast_disk）也要建立 RAM pin，
-                # 从而形成 VRAM 驱逐后仍可从 RAM 恢复的中间层。
-                # 该条件在 CUDA/ROCm/CPU 上恒为 False（xpu_ram_cache_enabled 内部门控），
-                # 故不改变其既有的"快盘直通"行为。
+            if signature is None or not fast_disk or args.high_ram:
                 comfy.pinned_memory.pin_memory(m, subset=subset, size=size)
                 pin = comfy.pinned_memory.get_pin(m, subset=subset)
             cast_maybe_lowvram_patch(source, pin, offload_stream, xfer_dest2=dest)

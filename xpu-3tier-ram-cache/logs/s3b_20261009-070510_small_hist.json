@@ -1,0 +1,146 @@
+{
+  "prompt": [
+    0,
+    "fc06dc20-8d53-4337-80d3-eb6b54b55891",
+    {
+      "1": {
+        "class_type": "CheckpointLoaderSimple",
+        "inputs": {
+          "ckpt_name": "v1-5-pruned-emaonly-fp16.safetensors"
+        }
+      },
+      "2": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "a photograph of a red apple resting on a rustic wooden table, soft studio lighting, shallow depth of field, high detail",
+          "clip": [
+            "1",
+            1
+          ]
+        }
+      },
+      "3": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "text, watermark, signature, low quality, blurry, deformed, extra limbs",
+          "clip": [
+            "1",
+            1
+          ]
+        }
+      },
+      "4": {
+        "class_type": "EmptyLatentImage",
+        "inputs": {
+          "width": 512,
+          "height": 512,
+          "batch_size": 1
+        }
+      },
+      "5": {
+        "class_type": "KSampler",
+        "inputs": {
+          "model": [
+            "1",
+            0
+          ],
+          "seed": 42,
+          "steps": 20,
+          "cfg": 7.0,
+          "sampler_name": "euler",
+          "scheduler": "normal",
+          "positive": [
+            "2",
+            0
+          ],
+          "negative": [
+            "3",
+            0
+          ],
+          "latent_image": [
+            "4",
+            0
+          ],
+          "denoise": 1.0
+        }
+      },
+      "6": {
+        "class_type": "VAEDecode",
+        "inputs": {
+          "samples": [
+            "5",
+            0
+          ],
+          "vae": [
+            "1",
+            2
+          ]
+        }
+      },
+      "7": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "images": [
+            "6",
+            0
+          ],
+          "filename_prefix": "p3_small/p3_small"
+        }
+      }
+    },
+    {
+      "client_id": "s3b-1791500710",
+      "create_time": 1791500710556
+    },
+    [
+      "7"
+    ]
+  ],
+  "outputs": {
+    "7": {
+      "images": [
+        {
+          "filename": "p3_small_00010_.png",
+          "subfolder": "p3_small",
+          "type": "output"
+        }
+      ]
+    }
+  },
+  "status": {
+    "status_str": "success",
+    "completed": true,
+    "messages": [
+      [
+        "execution_start",
+        {
+          "prompt_id": "fc06dc20-8d53-4337-80d3-eb6b54b55891",
+          "timestamp": 1791500710557
+        }
+      ],
+      [
+        "execution_cached",
+        {
+          "nodes": [],
+          "prompt_id": "fc06dc20-8d53-4337-80d3-eb6b54b55891",
+          "timestamp": 1791500710558
+        }
+      ],
+      [
+        "execution_success",
+        {
+          "prompt_id": "fc06dc20-8d53-4337-80d3-eb6b54b55891",
+          "timestamp": 1791500719147
+        }
+      ]
+    ]
+  },
+  "meta": {
+    "7": {
+      "node_id": "7",
+      "display_node": "7",
+      "parent_node": null,
+      "real_node_id": "7"
+    }
+  }
+}

@@ -1741,21 +1741,6 @@ def host_unregister_pin(ptr):
         return False
     return torch.cuda.cudart().cudaHostUnregister(ptr) == 0
 
-def xpu_ram_cache_enabled():
-    """XPU 三层存储：RAM 中间缓存是否启用（当前计算设备是 XPU 且预算 > 0）。
-
-    供 ops.py 的 handle_pin 使用——让"快盘 fast_disk"场景也能建立 RAM pin。
-
-    必须判"当前选中的计算设备"而非"XPU 是否可用"：
-    is_intel_xpu() 只反映 XPU 可用性；而 get_torch_device() 里 directml 分支
-    （model_management.py:198-200）是它的最前置短路——在 --directml 下即使 XPU 可用，
-    实际计算设备也不是 XPU（:206 的 is_intel_xpu() 分支根本轮不到）。
-    若用 is_intel_xpu()，就会在 DirectML 上因 MAX_PINNED_MEMORY>0 而误触发 ops.py:232 的 or，
-    去建 RAM pin，破坏"CUDA/DirectML 零变化"铁律。
-    故此处一律以 get_torch_device().type 为准。请勿"简化"回 is_intel_xpu()。
-    """
-    return get_torch_device().type == "xpu" and MAX_PINNED_MEMORY > 0
-
 def pin_memory(tensor, evict_active=True):
     global TOTAL_PINNED_MEMORY
     global TOTAL_PIN_CACHE_MEMORY

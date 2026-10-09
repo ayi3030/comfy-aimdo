@@ -1,0 +1,13 @@
+csv              : C:/Users/HE/WorkBuddy/2026-10-08-23-50-54/aimdo-xpu/logs/A-default_pin_20261009-062300.csv
+samples          : 203
+cache_mb         : n=203 max=0.0 min=0.0 distinct=1
+pinned_mb        : n=203 max=0.0 min=0.0 distinct=1
+loaded_ram_mb    : n=203 max=0.0 min=0.0 distinct=1
+budget_mb        : [8178.043]
+max_cache        : 0.0 MiB @ #0
+tail_min         : 0.0 MiB
+drop_after_peak  : 0.0 MiB
+monotonic        : True
+first_nonzero_idx: None
+largest_falls    : NONE after peak
+NOTE: numbers above are raw; any PASS/FAIL must be stated separately with the log line or byte that backs it.

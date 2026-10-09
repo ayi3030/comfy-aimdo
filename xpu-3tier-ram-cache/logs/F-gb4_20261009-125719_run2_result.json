@@ -1,0 +1,42 @@
+{
+  "port": 8196,
+  "jobs": [
+    {
+      "name": "small",
+      "graph": "PROMPT_small.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "image",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_small\\p3_small_00011_.png",
+          "exists": true,
+          "size": 375017
+        }
+      ],
+      "prompt_id": "74303df4-349c-43ce-abb7-d26df6cb7c3d",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-125737_small_hist.json",
+      "status": "success"
+    },
+    {
+      "name": "h3",
+      "graph": "PROMPT_h3.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "video",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_h3\\p3_h3_00010_.mp4",
+          "exists": true,
+          "size": 1123486
+        }
+      ],
+      "prompt_id": "6c10e04c-dfab-4699-beac-18569ca4b89e",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-125749_h3_hist.json",
+      "status": "success"
+    }
+  ],
+  "ok": true,
+  "started": 1791521839.990253,
+  "finished": 1791522043.499222
+}

@@ -4,6 +4,14 @@
 >
 > 目标机：**Intel Arc 独显（已在 B580 上验证）** · Windows x64 · ComfyUI + `torch+xpu`
 
+> ## ⚠️ v2 变更（请先读这三条，再决定怎么装）
+>
+> 1. **策略层已对齐上游（NVIDIA）**。v1 会在「磁盘判定为快盘」时也强制建 RAM pin；v2 **移除了这处覆盖**，`comfy/ops.py` 现已与 ComfyUI 原厂**逐字节相同**。
+> 2. **因此默认配置下 RAM 中间层会休眠**（实测峰值 0 MiB），这与 NVIDIA 用户在快盘上的行为一致 —— **这是预期结果，不是没生效**。想启用 RAM 层见 §「启用 RAM 中间层（可选，有风险）」。
+> 3. **启用 RAM 层存在已观测的设备级风险**：MiniMax H3 在 RAM 缓存启用时，8 次运行中出现 2 次 `UR_RESULT_ERROR_OUT_OF_RESOURCES` → `DEVICE_LOST`。根因未定位，失败率无法估计（样本太少）。**默认配置与 `AIMDO_XPU_RAM_CACHE_GB=0` 档位零失败记录。**
+>
+> 完整结论见 `docs/3tier-ram-cache/DELIVERY_v2_policy_align.md`，原始证据见 `docs/3tier-ram-cache/VERIFY_policy_align.md`。
+
 ---
 
 ## 0. 最短路径（TL;DR）
@@ -16,19 +24,22 @@
 
 :: ② 打 ComfyUI 三层卸载补丁
 .\python_embeded\python.exe -c "import comfy_aimdo,sys;print(comfy_aimdo.__version__, comfy_aimdo.__commit_id__)"
-git apply -p0 --directory=. "<本包>\patch\comfyui-3tier-ram-cache.patch"
+git apply -p0 --directory=. "<本包>\patch\comfyui-3tier-ram-cache-v2.patch"
 
 :: ③ 校验（必须逐字通过）
 cd comfy && ..\python_embeded\python.exe -c "import hashlib;[print(hashlib.md5(open(f,'rb').read()).hexdigest(),f) for f in ['model_management.py','pinned_memory.py','model_patcher.py','ops.py']]"
 ```
 
-期望输出（必须逐字一致，否则**停下**，见「排错」）：
+期望输出（**v2 值**，必须逐字一致，否则**停下**，见「排错」）：
 ```
-0f7c056c0d45645f81b4256f3d56703a model_management.py
+53c3fac684a22b8995ee0d5ba7b0becd model_management.py
 c629da9c2089c7c75d3b53386f49fdc9 pinned_memory.py
 d523b099933dad858e3a9e73a567c730 model_patcher.py
-96090a01b13e1b81907152324b6430a0 ops.py
+9e3f9620541118ee30479660a9191557 ops.py
 ```
+
+> 说明：`ops.py` 的期望值 `9e3f9620…` **就是 ComfyUI v0.39.0 原厂文件的 md5** —— v2 已把该文件恢复原样。若你看到的是 v1 的 `96090a01…`，说明打的还是旧补丁。
+> v1 补丁（`comfyui-3tier-ram-cache.patch`）仍在 `patch/` 下保留，仅供对照；**新装请用 v2**。
 
 然后直启（**不要**加任何 dynamic-vram 相关开关）：
 ```bat
@@ -143,7 +154,7 @@ cd <ComfyUI 根>
 | 1 | 日志出现 `Enabled XPU RAM cache <N>` | 说明 B 未生效 → 回到 §3.3 校验 md5 |
 | 2 | 出现 `published N SYCL queue(s)` / `backend ready (mode=native_hook)` / `DynamicVRAM support detected and enabled` | 出现 `XPU backend not requested` → A 未生效；出现 `No working comfy-aimdo install detected` → A 装错/装到了别的 Python |
 | 3 | 跑一个模型工作流，产物落盘且体积合理（图 >100 KB） | 见「排错」 |
-| 4 | 想确认 RAM 中间层**真的在回收**：观察 `Enabled XPU RAM cache` 的数值被反复触及（大模型场景下预算会被填满并触发驱逐） | 无 |
+| 4 | v2 默认下 RAM 缓存**应保持在接近 0** —— 这不是没生效，是与 NVIDIA 快盘行为一致 | 若必须看到缓存被填满，先读「启用 RAM 中间层（可选，有风险）」 |
 
 ### RAM 缓存预算怎么调
 | 环境变量 | 效果 |
@@ -154,6 +165,30 @@ cd <ComfyUI 根>
 
 > 预算吃的是**系统内存**。若机器内存紧张（例如同时跑别的任务），把它调小。
 
+### 启用 RAM 中间层（可选，有风险）
+
+v2 默认让 RAM 层按上游策略休眠。若你要显式启用它：
+
+```bat
+set AIMDO_XPU_RAM_CACHE_GB=4
+.\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --high-ram
+```
+
+**在这么做之前，请接受以下已观测事实**（B580 真机）：
+
+| 现象 | 数据 |
+|---|---|
+| RAM 缓存启用时 H3 崩溃 | 8 次运行中 **2 次** 失败：`UR_RESULT_ERROR_OUT_OF_RESOURCES` → `UR_RESULT_ERROR_DEVICE_LOST`，死在 `comfy/ldm/minimax/model.py:777 torch.lerp(...)` |
+| RAM 缓存未启用时 | 2 次运行 0 失败 |
+| 与宿主内存的关系 | **无关**：崩溃那次提交内存 77.65 %、可用剩 10,987 MB，反而**优于**通过的某次（81.69 % / 8,549 MB）。失败是**设备侧** OOR |
+| 与预算大小的关系 | **不单调**：4 GiB 的样本崩了，8 GiB 的两次反而过了 |
+| 失败率 | **无法估计**。样本太少（3 中 1 的 Wilson 95 % CI 约 [6 %, 66 %]），既不能说「约四分之一」也不能排除更高 |
+| 根因 | **未定位** |
+
+**不要用 `--disable-fast-disk`**：它会落 `weights-loaded` 子集并触发 `model_prefetch.py:116` 的 `ensure_pin_registerable()`，在 XPU 分支会**真销毁** hostbuf（NVIDIA 上只是解注册、数据保留），缓存抖动更明显，且同样有上述崩溃风险。
+
+想零风险，就用默认配置，或 `AIMDO_XPU_RAM_CACHE_GB=0`。
+
 ---
 
 ## 5. 回滚
@@ -161,7 +196,7 @@ cd <ComfyUI 根>
 | 层级 | 动作 |
 |---|---|
 | **软回滚（首选）** | 启动前设 `AIMDO_XPU_RAM_CACHE_GB=0` → 退回"磁盘直通"，**无需改文件** |
-| **B 回滚** | `git apply -R -p0 "<本包>\patch\comfyui-3tier-ram-cache.patch"`，或还原你自己的原始 `comfy/*.py` |
+| **B 回滚** | `git apply -R -p0 "<本包>\patch\comfyui-3tier-ram-cache-v2.patch"`，或还原你自己的原始 `comfy/*.py`（注意 v2 下 `ops.py` 已是原厂文件，无需还原） |
 | **A 回滚** | `.\python_embeded\python.exe -m pip uninstall comfy-aimdo`，或还原 §3.2 备份的 `site-packages\comfy_aimdo\` |
 
 ---
@@ -217,16 +252,19 @@ sha256sum -c SHA256SUMS.txt
 关键件校验和：
 ```
 8f2aba921cc24a420bf1225dde6594b6a4cd20fc71848dd77eb20717982ee3f7  wheel/comfy_aimdo-0.5.6.dev28-cp39-abi3-win_amd64.whl
-a517cfa1fc6f2be64fc0a47546494c54  patch/comfyui-3tier-ram-cache.patch   (306 行)
-0f7c056c0d45645f81b4256f3d56703a  comfy/model_management.py
+21daad6f0b74fd73e5372009a712a754  patch/comfyui-3tier-ram-cache-v2.patch   (223 行)  ← 本次用这个
+a517cfa1fc6f2be64fc0a47546494c54  patch/comfyui-3tier-ram-cache.patch      (306 行)  ← v1，仅留档
+53c3fac684a22b8995ee0d5ba7b0becd  comfy/model_management.py
 c629da9c2089c7c75d3b53386f49fdc9  comfy/pinned_memory.py
 d523b099933dad858e3a9e73a567c730  comfy/model_patcher.py
-96090a01b13e1b81907152324b6430a0  comfy/ops.py
+9e3f9620541118ee30479660a9191557  comfy/ops.py   （= ComfyUI v0.39.0 原厂）
 ```
 
 ---
 
 ## 9. 真机验收结论（Intel Arc B580 / torch 2.14.0+xpu / ComfyUI v0.39.0）
+
+### 9.1 v1（带策略覆盖）—— 留档，已被 v2 取代
 
 | 项 | 判定 | 实测 |
 |---|---|---|
@@ -236,6 +274,24 @@ d523b099933dad858e3a9e73a567c730  comfy/model_patcher.py
 | hostbuf→显存 | PASS | 32 MiB 写入真机显存后**逐字节一致**（排除"拷了却没真写"的静默错误） |
 | 出图 / 出片 | PASS | PNG 375,001 B；MP4 1,120,626 B（h264 864×480，124 帧 @24fps） |
 | 回滚 | PASS | `AIMDO_XPU_RAM_CACHE_GB=0` → 退回直通且门禁不退化 |
+
+⚠️ v1 的「RAM 中间层启用 PASS」只有 **n=1** 样本，按 v2 的样本量看**不足以证明稳定**（见 9.2）。
+
+### 9.2 v2（策略对齐上游）—— 当前版本
+
+| 档 | 配置 | RAM 缓存峰值 | SD1.5 | MiniMax H3 | 判定 |
+|---|---|---|---|---|---|
+| A | **默认（无 flag）** | **0.0 MiB**（203 采样恒 0） | ✓ 375,208 B | ✓ 1,085,024 B | **PASS** |
+| C | `AIMDO_XPU_RAM_CACHE_GB=0` + `--disable-fast-disk` | 恒 0 | ✓ 375,352 B | ✓ 1,126,374 B | **PASS** |
+| E | `--high-ram`（8 GiB） | 8177.8 / 8177.8，回落 380.6 / 357.4 | ✓ | ✓（n=2 全过） | 见 §风险 |
+| F | `--high-ram` + `GB=4` | 4095.98 ×2，回落 253.5 / 352.5 | ✓ | **2 过 1 挂**（n=3） | **FAIL** |
+| B | `--disable-fast-disk` | 8109–8176，回落 379.8 / 444.9 | ✓ | **2 过 1 挂**（n=3） | **FAIL** |
+| H1/H2 | 拷贝逐字节 | — | — | — | **PASS**（无回归） |
+
+**核心对照**：默认档 RAM 缓存峰值 **8177.8 MiB → 0.0 MiB** —— 策略覆盖确已移除，与 NVIDIA 快盘行为一致。
+**汇总**：RAM 缓存**启用**的 8 次 H3 运行中 **2 次**设备级失败；**未启用**的 2 次 0 失败（样本量小，两栏都不构成统计结论）。
+
+原始日志与 CSV 在 `logs/`（文件名带 `A-default` / `B-nofastdisk` / `C-rollback` / `E-highram` / `F-gb4`），完整报告见 `docs/3tier-ram-cache/VERIFY_policy_align.md`。
 
 细节见 `docs/3tier-ram-cache/VERIFY_3tier_ram_cache.md`、`docs/3tier-ram-cache/DELIVERY_3tier_ram_cache.md`。
 

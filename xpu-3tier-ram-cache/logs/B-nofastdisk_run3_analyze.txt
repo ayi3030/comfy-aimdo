@@ -1,0 +1,13 @@
+csv              : C:/Users/HE/WorkBuddy/2026-10-08-23-50-54/aimdo-xpu/logs/B-nofastdisk_run3_pin_20261009-064000.csv
+samples          : 190
+cache_mb         : n=190 max=8176.055 min=0.0 distinct=45
+pinned_mb        : n=190 max=0.0 min=0.0 distinct=1
+loaded_ram_mb    : n=190 max=8176.055 min=0.0 distinct=45
+budget_mb        : [8178.043]
+max_cache        : 8176.055 MiB @ #53
+tail_min         : 7731.117 MiB
+drop_after_peak  : 444.938 MiB
+monotonic        : False
+first_nonzero_idx: 11  (value=234.562)
+largest_falls    : [(152, 369.571), (140, 332.801), (170, 288.129), (164, 272.896), (122, 224.315)]
+NOTE: numbers above are raw; any PASS/FAIL must be stated separately with the log line or byte that backs it.

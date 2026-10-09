@@ -1,0 +1,82 @@
+== [run2] log=C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-125719_run2.log
+== [run2] pin_csv=C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-125719_run2_pin.csv
+== [run2] sysmem_csv=C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-125719_run2_sysmem.csv
+== [run2] precheck OK: port 8196 free, no residual python.exe
+== [run2] env AIMDO_XPU_ENABLED=<stripped>; AIMDO_XPU_RAM_CACHE_GB=4
+== [run2] child: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\python.exe -s -u C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\yan_s3b_run.py --port 8196 --out-csv C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-125719_run2_pin.csv --out-json C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-125719_run2_result.json --interval 1.0 --hard-timeout 2100 -- --windows-standalone-build --disable-auto-launch --port 8196 --high-ram
+== [run2] child pid=3912
+== [run2] sysmem sampler pid=12596 watching 3912
+== [run2] child exited rc=0 after 206.7s
+== [run2] port 8196 after cleanup: FREE
+== [run2] residual python.exe after cleanup: 1
+   python.exe                   12596 Console                    1     22,708 K
+
+===== [run2] HARVEST from F-gb4_20261009-125719_run2.log =====
+  [REQUIRED] 'published 1 SYCL queue(s)': count=1  e.g. [32m[INFO][0m comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend
+  [REQUIRED] 'backend ready (mode=native_hook)': count=1  e.g. [32m[INFO][0m comfy-aimdo XPU backend ready (mode=native_hook)
+  [REQUIRED] 'DynamicVRAM support detected and enabled': count=1  e.g. [32m[INFO][0m DynamicVRAM support detected and enabled
+  [FORBID] 'XPU backend not requested': count=0  absent OK
+  [FORBID] 'No working comfy-aimdo install detected': count=0  absent OK
+  [NOTE] 'Enabled XPU RAM cache': count=1
+         | [32m[INFO][0m Enabled XPU RAM cache 4096 (AIMDO_XPU_RAM_CACHE_GB=4.0)
+  [NOTE] 'Model storage policy': count=7
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\checkpoints\\v1-5-pruned-emaonly-fp16.safetensors']
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\checkpoints\\v1-5-pruned-emaonly-fp16.safetensors']
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\checkpoints\\v1-5-pruned-emaonly-fp16.safetensors']
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\vae\\MiniMax H3\\minimax_h3_audio_vae_fp32.safetensors']
+  [NOTE] 'Requested to load': count=7
+         | [32m[INFO][0m Requested to load SD1ClipModel
+         | [32m[INFO][0m Requested to load BaseModel
+         | [32m[INFO][0m Requested to load AutoencoderKL
+         | [32m[INFO][0m Requested to load MiniMaxH3TEModel_
+  [NOTE] 'loaded partially': count=0
+  [NOTE] 'unloaded': count=0
+  ---- error scan ----
+  ok  UR_RESULT_ERROR_: 0
+  ok  Traceback: 0
+  ok  AttributeError: 0
+  ok  DEVICE_LOST: 0
+  ok  RuntimeError: 0
+  ---- result json ----
+{
+  "port": 8196,
+  "jobs": [
+    {
+      "name": "small",
+      "graph": "PROMPT_small.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "image",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_small\\p3_small_00011_.png",
+          "exists": true,
+          "size": 375017
+        }
+      ],
+      "prompt_id": "74303df4-349c-43ce-abb7-d26df6cb7c3d",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-125737_small_hist.json",
+      "status": "success"
+    },
+    {
+      "name": "h3",
+      "graph": "PROMPT_h3.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "video",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_h3\\p3_h3_00010_.mp4",
+          "exists": true,
+          "size": 1123486
+        }
+      ],
+      "prompt_id": "6c10e04c-dfab-4699-beac-18569ca4b89e",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-125749_h3_hist.json",
+      "status": "success"
+    }
+  ],
+  "ok": true,
+  "started": 1791521839.990253,
+  "finished": 1791522043.499222
+}

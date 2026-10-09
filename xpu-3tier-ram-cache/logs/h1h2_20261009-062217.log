@@ -1,0 +1,11 @@
+=== TS=20261009-062217 ===
+H1_ENV: init_devices([0]) -> True
+H1_ENV: control.lib=set host_buffer.lib=set
+H1_PAYLOAD: 33554432B sha256=d9f3d3f9210aea53c72ee45814c8c878f883a40316e180d59f6d310d9b62373a
+H1_OK (size=33554432B, hostbuf.size=33554432B) -> file->hostbuf(RAM) writes exact bytes
+H1_EXIT=0
+H2_ENV: init_devices([0]) -> True
+H2_ENV: torch=2.14.0+xpu xpu_avail=True device=Intel(R) Arc(TM) B580 Graphics
+H2_PAYLOAD: 33554432B sha256=574bf3d7c47958af103403ae09cadf8570dce8fdac73bca14c453a05ad68377a
+H2D_OK (size=33554432B, device=xpu:0) -> hostbuf(RAM)->XPU 显存 writes exact bytes
+H2_EXIT=0

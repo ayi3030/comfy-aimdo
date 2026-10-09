@@ -1,0 +1,88 @@
+== [run3] log=C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-130138_run3.log
+== [run3] pin_csv=C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-130138_run3_pin.csv
+== [run3] sysmem_csv=C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-130138_run3_sysmem.csv
+== [run3] precheck OK: port 8196 free, no residual python.exe
+== [run3] env AIMDO_XPU_ENABLED=<stripped>; AIMDO_XPU_RAM_CACHE_GB=4
+== [run3] child: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\python.exe -s -u C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\yan_s3b_run.py --port 8196 --out-csv C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-130138_run3_pin.csv --out-json C:\Users\HE\WorkBuddy\2026-10-08-23-50-54\aimdo-xpu\logs\F-gb4_20261009-130138_run3_result.json --interval 1.0 --hard-timeout 2100 -- --windows-standalone-build --disable-auto-launch --port 8196 --high-ram
+== [run3] child pid=3684
+== [run3] sysmem sampler pid=8544 watching 3684
+== [run3] child exited rc=0 after 44.2s
+== [run3] port 8196 after cleanup: FREE
+== [run3] residual python.exe after cleanup: 1
+   python.exe                    8544 Console                    1     22,804 K
+
+===== [run3] HARVEST from F-gb4_20261009-130138_run3.log =====
+  [REQUIRED] 'published 1 SYCL queue(s)': count=1  e.g. [32m[INFO][0m comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend
+  [REQUIRED] 'backend ready (mode=native_hook)': count=1  e.g. [32m[INFO][0m comfy-aimdo XPU backend ready (mode=native_hook)
+  [REQUIRED] 'DynamicVRAM support detected and enabled': count=1  e.g. [32m[INFO][0m DynamicVRAM support detected and enabled
+  [FORBID] 'XPU backend not requested': count=0  absent OK
+  [FORBID] 'No working comfy-aimdo install detected': count=0  absent OK
+  [NOTE] 'Enabled XPU RAM cache': count=1
+         | [32m[INFO][0m Enabled XPU RAM cache 4096 (AIMDO_XPU_RAM_CACHE_GB=4.0)
+  [NOTE] 'Model storage policy': count=7
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\checkpoints\\v1-5-pruned-emaonly-fp16.safetensors']
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\checkpoints\\v1-5-pruned-emaonly-fp16.safetensors']
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\checkpoints\\v1-5-pruned-emaonly-fp16.safetensors']
+         | [32m[INFO][0m Model storage policy: fast_disk=True paths=['E:\\HE\\ComfyUI模型库\\vae\\MiniMax H3\\minimax_h3_audio_vae_fp32.safetensors']
+  [NOTE] 'Requested to load': count=5
+         | [32m[INFO][0m Requested to load SD1ClipModel
+         | [32m[INFO][0m Requested to load BaseModel
+         | [32m[INFO][0m Requested to load AutoencoderKL
+         | [32m[INFO][0m Requested to load MiniMaxH3TEModel_
+  [NOTE] 'loaded partially': count=0
+  [NOTE] 'unloaded': count=0
+  ---- error scan ----
+  !! UR_RESULT_ERROR_: count=4
+     | [1m[31m[ERROR][0m !!! Exception during processing !!! level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+     | RuntimeError: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
+     | RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+     | RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+  !! Traceback: count=3
+     | [1m[31m[ERROR][0m Traceback (most recent call last):
+     | Traceback (most recent call last):
+     | Traceback (most recent call last):
+  ok  AttributeError: 0
+  !! DEVICE_LOST: count=3
+     | [1m[31m[ERROR][0m !!! Exception during processing !!! level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+     | RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+     | RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+  !! RuntimeError: count=3
+     | RuntimeError: level_zero backend failed with error: 40 (UR_RESULT_ERROR_OUT_OF_RESOURCES)
+     | RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+     | RuntimeError: level_zero backend failed with error: 20 (UR_RESULT_ERROR_DEVICE_LOST)
+  ---- result json ----
+{
+  "port": 8196,
+  "jobs": [
+    {
+      "name": "small",
+      "graph": "PROMPT_small.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "image",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_small\\p3_small_00012_.png",
+          "exists": true,
+          "size": 375368
+        }
+      ],
+      "prompt_id": "0771c475-811f-4272-8d76-9c34a7962695",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-130155_small_hist.json",
+      "status": "success"
+    },
+    {
+      "name": "h3",
+      "graph": "PROMPT_h3.json",
+      "ok": false,
+      "why": "status=error",
+      "artifacts": [],
+      "prompt_id": "6dc8b6e1-a1fc-449f-8648-337be4338cf4",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-130207_h3_hist.json",
+      "status": "error"
+    }
+  ],
+  "ok": false,
+  "started": 1791522099.3804054,
+  "finished": 1791522139.7470434
+}

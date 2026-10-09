@@ -1,0 +1,35 @@
+{
+  "port": 8196,
+  "jobs": [
+    {
+      "name": "small",
+      "graph": "PROMPT_small.json",
+      "ok": true,
+      "why": null,
+      "artifacts": [
+        {
+          "kind": "image",
+          "path": "E:\\aiwork\\ComfyUI_windows_portable_intel\\ComfyUI_windows_portable\\ComfyUI\\output\\p3_small\\p3_small_00012_.png",
+          "exists": true,
+          "size": 375368
+        }
+      ],
+      "prompt_id": "0771c475-811f-4272-8d76-9c34a7962695",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-130155_small_hist.json",
+      "status": "success"
+    },
+    {
+      "name": "h3",
+      "graph": "PROMPT_h3.json",
+      "ok": false,
+      "why": "status=error",
+      "artifacts": [],
+      "prompt_id": "6dc8b6e1-a1fc-449f-8648-337be4338cf4",
+      "history": "C:\\Users\\HE\\WorkBuddy\\2026-10-08-23-50-54\\aimdo-xpu\\logs\\s3b_20261009-130207_h3_hist.json",
+      "status": "error"
+    }
+  ],
+  "ok": false,
+  "started": 1791522099.3804054,
+  "finished": 1791522139.7470434
+}

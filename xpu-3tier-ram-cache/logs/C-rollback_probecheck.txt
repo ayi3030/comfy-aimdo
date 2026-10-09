@@ -1,0 +1,8 @@
+disabled-line present : True
+enabled-line  present : False  (must be False)
+[PASS] required  'comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend'
+[PASS] required  'comfy-aimdo XPU backend ready (mode=native_hook)'
+[PASS] required  'DynamicVRAM support detected and enabled'
+[PASS] forbidden 'XPU backend not requested' present=False
+[PASS] forbidden 'No working comfy-aimdo install detected' present=False
+ROLLBACK_OK

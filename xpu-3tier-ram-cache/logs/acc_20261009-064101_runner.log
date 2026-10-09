@@ -1,0 +1,60 @@
+== P3 acceptance run 20261009-064101  (port 8196) ==
+>> deployed _version.py: version=0.5.6.dev28 commit=gc2cf98fb9
+>> launching: E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --disable-auto-launch --port 8196
+>> ready in 15.7s via /system_stats
+>> runtime log reports: comfy-aimdo version=0.5.6.dev28
+
+== gate markers ==
+  [PASS] required:  'comfy-aimdo XPU: published 1 SYCL queue(s) to the native backend'
+  [PASS] required:  'comfy-aimdo XPU backend ready (mode=native_hook)'
+  [PASS] required:  'DynamicVRAM support detected and enabled'
+  [PASS] forbidden: 'XPU backend not requested' present=False
+  [PASS] forbidden: 'No working comfy-aimdo install detected' present=False
+   gate markers: ALL GREEN
+>> preflight PROMPT_small.json vs live /object_info:
+   [PASS] node 1:CheckpointLoaderSimple
+   [PASS] node 2:CLIPTextEncode
+   [PASS] node 3:CLIPTextEncode
+   [PASS] node 4:EmptyLatentImage
+   [PASS] node 5:KSampler
+   [PASS] node 6:VAEDecode
+   [PASS] node 7:SaveImage
+>> preflight PROMPT_h3.json vs live /object_info:
+   [PASS] node 1:UNETLoader
+   [PASS] node 2:CLIPLoader
+   [PASS] node 3:VAELoader
+   [PASS] node 4:VAELoader
+   [PASS] node 5:MiniMaxH3ImageToVideo
+   [PASS] node 6:RandomNoise
+   [PASS] node 7:KSamplerSelect
+   [PASS] node 8:BasicScheduler
+   [PASS] node 9:BasicGuider
+   [PASS] node 10:SamplerCustomAdvanced
+   [PASS] node 11:VAEDecode
+   [PASS] node 12:VAEDecodeAudio
+   [PASS] node 13:CreateVideo
+   [PASS] node 14:SaveVideo
+
+>> submitting small (PROMPT_small.json) timeout=300s
+>> small: prompt_id=a3b01ae0-27c9-40a2-94b4-7887f6b454f5
+>> small: history -> C:/Users/HE/WorkBuddy/2026-10-08-23-50-54/aimdo-xpu/logs\acc_20261009-064101_small_hist.json
+>> small: status=success
+>> small: artifact check (need a image >= 102,400B):
+  [PASS] image       374,984B exists=True  E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\output\p3_small\p3_small_00007_.png
+
+>> submitting h3 (PROMPT_h3.json) timeout=1800s
+>> h3: prompt_id=f34b7e71-20df-4152-9d80-4852b7dff1e7
+>> h3: history -> C:/Users/HE/WorkBuddy/2026-10-08-23-50-54/aimdo-xpu/logs\acc_20261009-064101_h3_hist.json
+>> h3: status=success
+>> h3: artifact check (need a video >= 1,048,576B):
+  [PASS] video     1,077,877B exists=True  E:\aiwork\ComfyUI_windows_portable_intel\ComfyUI_windows_portable\ComfyUI\output\p3_h3\p3_h3_00006_.mp4
+
+== ALL GREEN ==
+
+== aimdo lines: 17 (of 176) -> C:/Users/HE/WorkBuddy/2026-10-08-23-50-54/aimdo-xpu/logs\acc_20261009-064101_aimdo_lines.txt
+   pressure/offload-keyword lines: 5; sample:
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=81.9MiB
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=1089.0MiB
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=3310.1MiB
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=221.7MiB
+     [32m[INFO][0m [OmniXPU] AIMDO inference budget: devices=0 minimum=762.6MiB
