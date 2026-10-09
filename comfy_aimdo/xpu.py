@@ -198,6 +198,10 @@ def _install_native_hook_wrappers():
         except Exception:
             pass
         try:
+            _feed_external_vram_usage()
+        except Exception:
+            pass
+        try:
             return _torch_xpu_empty_cache_original()
         except RuntimeError as error:
             if "does not yet support emptyCache" not in str(error):
@@ -236,6 +240,12 @@ def _install_native_hook_wrappers():
     torch.xpu.memory.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     torch.xpu.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     _wrappers_installed = True
+    # Prime the native admission gate with torch's real device reservation so
+    # Book A is not undercounted from the first allocation.
+    try:
+        _feed_external_vram_usage()
+    except Exception:
+        pass
 
 
 def torch_reserved_stats(device=None):
@@ -295,6 +305,29 @@ def torch_reserved_stats_reason(device=None):
     allocated = int(stats.get("allocated_bytes.all.current", 0))
     peak = int(stats.get("reserved_bytes.all.peak", 0))
     return (reserved, allocated, peak), None
+
+
+# Feed torch's real device reservation into the native admission gate so Book A
+# (total_vram_usage) is not undercounted on XPU (the M2 wrapper masks the true
+# reserved/allocated -- see torch_reserved_stats). The native setter only exists
+# in aimdo_xpu.dll builds that include the RAM-layer root-cause fix
+# (RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13); probe once and skip cleanly on older
+# DLLs so a version mismatch never crashes the runtime.
+_xpu_external_usage_supported = None
+
+def _feed_external_vram_usage():
+    global _xpu_external_usage_supported
+    if _xpu_external_usage_supported is None:
+        _xpu_external_usage_supported = hasattr(control.lib, "aimdo_set_external_vram_usage")
+    if not _xpu_external_usage_supported:
+        return
+    stats = torch_reserved_stats()
+    if stats is None:
+        return
+    try:
+        control.lib.aimdo_set_external_vram_usage(stats[0])
+    except Exception:
+        pass
 
 
 def teardown_backend() -> None:

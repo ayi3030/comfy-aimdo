@@ -105,6 +105,20 @@ jobs:
           cp -r aimdo/src-xpu/. native/src-xpu/
           echo "Overlaid src-xpu into native/src-xpu/:"; ls -1 native/src-xpu/
 
+      - name: Apply RAM-layer root-cause native patch (B580 sysmem fallback)
+        # The B580 DEVICE_LOST root-cause fix lives in src/plat.h, src/control.c
+        # and src-win/shmem-detect.c, but the build only overlays THIS repo's
+        # src-xpu/ onto the community fork. This step surgically re-applies the
+        # same 5 edits onto the community-fork checkout (native/) using stable
+        # anchor strings, so the fix reaches the DLL WITHOUT replacing the fork's
+        # L2/L3 unload layer (src/model-vbar.c) -- the overlay-contract gate
+        # below still proves those symbols are exported. If an anchor ever
+        # drifts, the script fails loudly and the build goes red rather than
+        # shipping a silently incomplete DLL. See RAM_LAYER_CRASH_ROOTCAUSE.md
+        # sec.12-17.
+        shell: bash
+        run: python aimdo/.github/scripts/apply-ram-rootcause-patch.py native
+
       - name: Install Intel oneAPI DPC++/C++ Compiler (offline installer)
         shell: cmd
         run: |

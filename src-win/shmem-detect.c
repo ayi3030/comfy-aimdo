@@ -124,6 +124,28 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
     if (g_wddm_adapter) {
         if (SUCCEEDED(g_wddm_adapter->lpVtbl->QueryVideoMemoryInfo(g_wddm_adapter, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
             effective_budget = info.Budget;
+            /* Intel Arc / Battlemage default sysmem fallback lets the OS report a
+             * DXGI LOCAL Budget larger than the physical VRAM. That "extra" is
+             * system RAM, not VRAM, and a device tensor still has to fit in
+             * physical VRAM -- so it must NOT be treated as headroom for device
+             * allocations. Clamp the VRAM-admission budget at the physical
+             * capacity so the admission gate (plat.h:budget_deficit) is never
+             * lulled into over-admitting when sysmem fallback inflates the
+             * reported Budget.
+             *
+             * Without this clamp, deficit_sync = (BookA + 512MiB) - Budget becomes
+             * a large negative (optimistic) value; MAX() in budget_deficit then
+             * selects the physical-capacity path while still trusting Book A
+             * (total_vram_usage), which on XPU undercounts torch's real device
+             * usage -> torch exceeds physical VRAM -> UR_OUT_OF_RESOURCES(40) ->
+             * DEVICE_LOST. See RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13. */
+            if (effective_budget > vram_capacity) {
+                log(DEBUG,
+                    "%s: sysmem fallback detected (DXGI budget %zu MB > physical VRAM %zu MB); "
+                    "clamping VRAM-admission budget to physical capacity\n",
+                    __func__, (size_t)(info.Budget / M), (size_t)(vram_capacity / M));
+                effective_budget = vram_capacity;
+            }
             log(DEBUG,
                 "%s: WDDM budget=%zu MB usage=%zu MB reservation=%zu MB available=%zu MB\n",
                 __func__, (size_t)(info.Budget / M), (size_t)(info.CurrentUsage / M),
@@ -134,7 +156,7 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
         }
     }
 
-    deficit_sync = (ssize_t)(total_vram_usage + WDDM_BUDGET_HEADROOM) - (ssize_t)effective_budget;
+    deficit_sync = (ssize_t)(effective_book_a() + WDDM_BUDGET_HEADROOM) - (ssize_t)effective_budget;
     *prevailing_deficit_method = "WDDM budget";
 
 #if defined(AIMDO_CUDA)

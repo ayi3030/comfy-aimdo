@@ -208,6 +208,17 @@ uint64_t get_total_vram_usage(void *devctx) {
     return total_vram_usage;
 }
 
+/* Torch real-device usage fed from the Python/XPU layer (see plat.h:
+ * external_vram_usage). Zero by default; the Python side calls
+ * aimdo_set_external_vram_usage() with torch's true reserved bytes so the
+ * admission gate stops undercounting the XPU device footprint. */
+uint64_t external_vram_usage = 0;
+
+SHARED_EXPORT
+void aimdo_set_external_vram_usage(uint64_t usage) {
+    external_vram_usage = usage;
+}
+
 SHARED_EXPORT
 void cleanup(void) {
     for (size_t i = 0; i < g_all_devctx_count; i++) {
