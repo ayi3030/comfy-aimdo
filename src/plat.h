@@ -45,6 +45,12 @@ typedef SSIZE_T ssize_t;
 bool aimdo_wddm_init(CUdevice dev);
 void aimdo_wddm_cleanup();
 bool poll_budget_deficit(const char **prevailing_deficit_method);
+/* RAM-layer real-free fit check, defined in the compiled src-win/shmem-detect.c
+   translation unit (see RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13). Returns 0
+   while no successful device poll has happened, or when the request fits in
+   real free memory. Windows only -- see the #else stub below. */
+ssize_t real_free_fit_deficit(uint64_t size);
+
 /* cuda-detour.c */
 bool aimdo_setup_hooks();
 void aimdo_teardown_hooks();
@@ -60,6 +66,15 @@ void aimdo_teardown_hooks(void);
 
 static inline bool poll_budget_deficit(const char **prevailing_deficit_method) {
     return cuda_budget_deficit(prevailing_deficit_method);
+}
+
+/* No real free reading is available on this platform (the definition lives in
+   src-win/shmem-detect.c), so the fit check has no opinion and contributes
+   nothing to the admission decision. Same shape as the other non-Windows stubs
+   above. */
+static inline ssize_t real_free_fit_deficit(uint64_t size) {
+    (void)size;
+    return 0;
 }
 
 #endif
@@ -160,16 +175,13 @@ static inline size_t effective_book_a(void) {
     return total_vram_usage > external_vram_usage ? total_vram_usage : external_vram_usage;
 }
 
-/* RAM-layer real-free fit check (see RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13). */
-ssize_t real_free_fit_deficit(uint64_t size);
-
 static inline ssize_t budget_deficit(size_t size) {
-    ssize_t deficit_simple, deficit_delta, deficit_fit;
+    ssize_t deficit_simple, deficit_delta;
     ssize_t deficit;
     const char *prevailing_deficit_method = "unknown";
 
     poll_budget_deficit(&prevailing_deficit_method);
-    size_t book_a = effective_book_a();
+    uint64_t book_a = effective_book_a();
     deficit_simple = (ssize_t)(book_a + size) + (ssize_t)simple_vram_headroom -
                      (ssize_t)vram_capacity;
     deficit_delta = deficit_sync + (ssize_t)total_vram_usage -

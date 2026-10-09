@@ -161,8 +161,8 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
         int64_t shortfall = (int64_t)real_free_fit_deficit((uint64_t)(deficit < 0 ? 0 : deficit));
         log(DEBUG,
             "%s: Windows shortage=%zd bytes; true device free=%zu MB total=%zu MB; %s\n",
-            __func__, (ssize_t)deficit, last_free_vram / (1024 * 1024),
-            last_total_vram / (1024 * 1024),
+            __func__, (ssize_t)deficit, (size_t)last_free_vram / M,
+            (size_t)last_total_vram / M,
             shortfall > 0 ? "request does not fit, denying" : "reclaim only, admitting");
         vbars_request_reclaim((ssize_t)deficit);
         return shortfall <= 0;

@@ -28,6 +28,7 @@ Usage: python apply-ram-rootcause-patch.py <community-checkout-dir>
   e.g. python apply-ram-rootcause-patch.py native
 """
 import os
+import re
 import sys
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "native"
@@ -393,7 +394,12 @@ def main():
             "\n"
             "/* Deliberately NOT SHARED_EXPORT: this is internal to the DLL and\n"
             " * nothing outside links against it. Keeping it out of the export\n"
-            " * table avoids spending an export slot on a private helper. */\n"
+            " * table avoids spending an export slot on a private helper.\n"
+            " *\n"
+            " * It MUST keep external linkage (no `static`): src-xpu/stubs.c\n"
+            " * calls it via an `extern` declaration, and both translation\n"
+            " * units are linked into the same DLL. Marking it static would\n"
+            " * break that call with a link error. */\n"
             "ssize_t real_free_fit_deficit(uint64_t size) {\n"
             "    uint64_t capacity, reserve, available;\n"
             "    if (last_free_vram == 0) {\n"
@@ -442,19 +448,83 @@ def main():
     #    the gate for a request that genuinely does not fit -- it can never
     #    make a healthy request fail, and it cannot alter the NVIDIA/ROCm
     #    outcome for any request that already passed.
-    insert_before(
-        "plat.h:declare real_free_fit_deficit",
+    #
+    #    PLATFORM PLACEMENT (LNK2019 on non-Windows). real_free_fit_deficit is
+    #    defined only in src-win/shmem-detect.c, which is compiled into the
+    #    Windows build only. A declaration placed out here -- after the
+    #    _WIN32/#endif block that ends around line 74 -- is visible to EVERY
+    #    platform, so the Linux, ROCm and macOS builds would reference a symbol
+    #    nothing defines and fail at link time with an undefined reference.
+    #    src-posix/ has no shmem-detect.c at all, confirming there is no other
+    #    definition to rely on.
+    #
+    #    So the declaration goes INSIDE the _WIN32 branch, next to
+    #    poll_budget_deficit which has the same split, and the #else branch
+    #    gets a static inline stub returning 0 -- "no real free reading, so no
+    #    opinion". That matches how this header already handles
+    #    aimdo_wddm_init / aimdo_wddm_cleanup / aimdo_wddm_force_poll /
+    #    poll_budget_deficit, and it means the admission behaviour on those
+    #    platforms is exactly what it was before this patch: the stub returns
+    #    0, so the new term never contributes and cannot change any existing
+    #    outcome. The `(void)size` keeps the unused-parameter warning quiet.
+    #
+    #    ANCHOR SHAPE (why these anchors are single-line). The *_before /
+    #    *_after helpers locate their anchor with _find_line(), which tests one
+    #    LINE AT A TIME (`anchor_substr in line`). A multi-line anchor is
+    #    therefore unsatisfiable by construction, and the run dies with
+    #    "anchor line not found" on a pristine community checkout. The previous
+    #    revision of this edit used a two-line anchor ("/* cuda-detour.c */\n
+    #    bool aimdo_setup_hooks();"), which reproduced exactly that: verified
+    #    FAIL on a fresh checkout of COMMUNITY_FORK_SHA. Anchors here must stay
+    #    single-line, and must be strings that cannot match anywhere else.
+    #
+    #    "bool poll_budget_deficit(const char **prevailing_deficit_method);"
+    #    (with the trailing semicolon) matches ONLY the _WIN32 declaration: the
+    #    #else definition of the same function ends in "{" on its opening line,
+    #    so it can never match. _find_line returns the first hit, which is the
+    #    declaration inside the _WIN32 branch -- the intended insertion point.
+    insert_after(
+        "plat.h:declare real_free_fit_deficit (Windows)",
         FILES["plat_h"],
-        "static inline ssize_t budget_deficit(size_t size)",
+        "bool poll_budget_deficit(const char **prevailing_deficit_method);",
         (
             "/* RAM-layer real-free fit check, defined in the compiled\n"
             "   src-win/shmem-detect.c translation unit (see\n"
             "   RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13). Returns 0 while no\n"
             "   successful device poll has happened, or when the request fits\n"
-            "   in real free memory. No-op on builds without that TU. */\n"
+            "   in real free memory. Windows only -- see the #else stub below. */\n"
             "ssize_t real_free_fit_deficit(uint64_t size);\n"
         ),
-        already_marker="real_free_fit_deficit(uint64_t size);",
+        already_marker="ssize_t real_free_fit_deficit(uint64_t size);",
+    )
+    # The non-Windows stub rides along on the SAME edit as the #else
+    # poll_budget_deficit definition it follows, because that whole definition
+    # is a multi-line construct and only apply_edit() (plain substring replace
+    # over the whole text, no line splitting) can rewrite it. Splitting this
+    # into a second positional edit would need a file-scope anchor, and the only
+    # candidate in that branch is "#endif", which also terminates the
+    # unmap_workaround block near the top of the file and is therefore
+    # ambiguous. Keeping the two #else pieces in one edit avoids that trap
+    # entirely and makes the stub's position structural rather than incidental.
+    apply_edit(
+        "plat.h:real_free_fit_deficit stub (non-Windows)",
+        FILES["plat_h"],
+        "static inline bool poll_budget_deficit(const char **prevailing_deficit_method) {\n"
+        "    return cuda_budget_deficit(prevailing_deficit_method);\n"
+        "}",
+        "static inline bool poll_budget_deficit(const char **prevailing_deficit_method) {\n"
+        "    return cuda_budget_deficit(prevailing_deficit_method);\n"
+        "}\n"
+        "\n"
+        "/* No real free reading is available on this platform (the definition\n"
+        " * lives in src-win/shmem-detect.c), so the fit check has no opinion\n"
+        " * and contributes nothing to the admission decision. Same shape as\n"
+        " * the other non-Windows stubs above. */\n"
+        "static inline ssize_t real_free_fit_deficit(uint64_t size) {\n"
+        "    (void)size;\n"
+        "    return 0;\n"
+        "}",
+        already_marker="static inline ssize_t real_free_fit_deficit(uint64_t size)",
     )
     apply_edit(
         "plat.h:budget_deficit include fit check",
@@ -465,13 +535,12 @@ def main():
         "               (ssize_t)extra_vram_headroom;",
         already_marker="MAX(MAX(deficit_simple, deficit_delta), deficit_fit)",
     )
-    apply_edit(
-        "plat.h:budget_deficit declare deficit_fit",
-        FILES["plat_h"],
-        "    ssize_t deficit_simple, deficit_delta;",
-        "    ssize_t deficit_simple, deficit_delta, deficit_fit;",
-        already_marker="deficit_simple, deficit_delta, deficit_fit",
-    )
+    # NOTE: there is deliberately NO "declare deficit_fit" edit. deficit_fit is
+    # introduced by the typed definition emitted above, which is the shape this
+    # function already uses for mid-function locals (`ssize_t deficit;`,
+    # `uint64_t book_a = ...`). Declaring it in the `deficit_simple,
+    # deficit_delta` list AND defining it with a type is a redefinition
+    # (MSVC C2086) and was removed -- see commit history for run 37996829467.
     apply_edit(
         "plat.h:budget_deficit log fit term",
         FILES["plat_h"],
@@ -482,7 +551,82 @@ def main():
         already_marker="\"real-free-fit\"",
     )
 
+    verify_injected_shape()
+
     print("RAM-layer root-cause patch applied successfully.")
+
+
+def verify_injected_shape():
+    """Post-patch self-check on the RESULT, not on the edits.
+
+    Every edit above is checked against an anchor string, so a successful run
+    only proves the text was found -- not that the resulting C is valid. That
+    distinction is not academic: run 37996829467 got all 13 "[ok]"s and still
+    died at compile time with
+
+        plat.h(182): error C2086: 'ssize_t deficit_fit': redefinition
+        plat.h(172): note: see declaration of 'deficit_fit'
+
+    because one edit declared the variable in an existing declaration list
+    while another defined it with a type. Both anchors matched, so both edits
+    reported success. The failure surfaced ~6 minutes later, in a different
+    step, on a machine with no way to iterate quickly.
+
+    These checks are cheap and run on the real product of the patch, so a
+    malformed shape fails here in under a second with a pointed message
+    instead of turning the build red somewhere downstream. Keep them focused
+    on failure modes this script can actually introduce.
+    """
+    plat = read(FILES["plat_h"])
+    shmem = read(FILES["shmem_c"])
+
+    # 1. No variable may be named twice inside a function when one occurrence
+    #    is part of a declaration list and another carries its own type: that
+    #    is MSVC C2086.
+    for path, src in ((FILES["plat_h"], plat), (FILES["shmem_c"], shmem)):
+        for m in re.finditer(r"ssize_t\s+(\w+)\s*,\s*(\w+)\s*(?:,\s*(\w+))?\s*;", src):
+            declared = [g for g in m.groups() if g]
+            body_start = src.rfind("\n}\n", 0, m.start())
+            body_end = src.find("\n}\n", m.end())
+            body = src[body_start:body_end if body_end > 0 else len(src)]
+            for name in declared:
+                if re.search(r"(?<![\w])ssize_t\s+%s\s*=" % re.escape(name), body):
+                    sys.exit(
+                        "[FAIL] C2086 guard: '%s' is declared in a declaration list "
+                        "and then defined with a type in the same function (%s). "
+                        "MSVC rejects this at compile time." % (name, path))
+
+    # 2. real_free_fit_deficit must be declared where it is used, defined
+    #    exactly once in a compiled translation unit, and carry a matching
+    #    signature. A mismatch here is LNK2019 at link time.
+    decl = "ssize_t real_free_fit_deficit(uint64_t size);"
+    if decl not in plat:
+        sys.exit("[FAIL] real_free_fit_deficit is not declared in src/plat.h; "
+                 "budget_deficit() would fail to compile.")
+    if len(re.findall(r"ssize_t\s+real_free_fit_deficit\s*\(\s*uint64_t\s+size\s*\)\s*\{",
+                      shmem)) != 1:
+        sys.exit("[FAIL] real_free_fit_deficit must be defined exactly once in "
+                 "src-win/shmem-detect.c (the translation unit that is actually "
+                 "compiled into the DLL).")
+
+    # 3. The symbol is internal to the DLL. A stray dllexport would add an
+    #    export-table entry for a private helper and, because no declaration
+    #    carries the matching dllimport, risks a link-time diagnostic.
+    if re.search(r"SHARED_EXPORT\s*\n?\s*ssize_t\s+real_free_fit_deficit", shmem):
+        sys.exit("[FAIL] real_free_fit_deficit must not be SHARED_EXPORT: it is "
+                 "internal to the DLL and no declaration carries a dllimport.")
+
+    # 4. The community's own signal must survive intact. Losing it would
+    #    silently change NVIDIA/ROCm behaviour on this shared Windows path.
+    if "deficit_cuda" not in shmem:
+        sys.exit("[FAIL] deficit_cuda is missing from src-win/shmem-detect.c; the "
+                 "vendor headroom signal must be preserved verbatim.")
+    if "ssize_t deficit_cuda = headroom - (ssize_t)free_vram;" not in shmem:
+        sys.exit("[FAIL] the deficit_cuda expression was altered; the vendor "
+                 "headroom term must keep its original meaning and precedence.")
+
+    print("  [ok]   post-patch shape verified (no C2086, symbols consistent, "
+          "vendor signal intact)")
 
 
 if __name__ == "__main__":
