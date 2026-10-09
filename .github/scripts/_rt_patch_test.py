@@ -65,10 +65,10 @@ def main():
                     fails.append(f"{os.path.basename(path)}: order wrong ({a!r} should precede {b!r})")
 
     check(os.path.join(NATIVE, "src", "plat.h"),
-          ["effective_book_a(void)", "extern uint64_t external_vram_usage;",
-           "size_t book_a = effective_book_a();", "book_a + size", "book_a -"],
-          order=[("effective_book_a(void)", "budget_deficit(size_t size)"),
-                 ("effective_book_a(void)", "size_t book_a = effective_book_a();")])
+          ["uint64_t effective_book_a(void)", "extern uint64_t external_vram_usage;",
+           "uint64_t book_a = effective_book_a();", "book_a + size", "book_a -"],
+          order=[("uint64_t effective_book_a(void)", "budget_deficit(size_t size)"),
+                 ("uint64_t effective_book_a(void)", "uint64_t book_a = effective_book_a();")])
 
     check(os.path.join(NATIVE, "src", "control.c"),
           ["aimdo_set_external_vram_usage", "uint64_t external_vram_usage = 0;",

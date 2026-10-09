@@ -75,6 +75,31 @@ def insert_before(label, path, anchor_substr, block, already_marker=None):
     print(f"  [ok]   {label}: patched {path}")
 
 
+def insert_before_skip_prev(label, path, anchor_substr, block, prev_marker=None,
+                            already_marker=None):
+    """Insert `block` BEFORE `anchor_substr`, but if the line immediately
+    preceding the anchor starts with `prev_marker`, insert before THAT line
+    instead. Needed when a storage-class marker (e.g. SHARED_EXPORT) sits on its
+    own line directly above the anchor and would otherwise be wrongly attached to
+    our inserted definition."""
+    s = read(path)
+    if already_marker is not None and already_marker in s:
+        print(f"  [skip] {label}: already applied in {path}")
+        return
+    idx = _find_line(s, anchor_substr)
+    if idx is None:
+        print(f"  [FAIL] {label}: anchor line not found in {path}\n"
+              f"         expected substring:\n{anchor_substr!r}", file=sys.stderr)
+        sys.exit(1)
+    insert_at = idx
+    lines = s.split("\n")
+    if prev_marker is not None and idx > 0 and lines[idx - 1].strip().startswith(prev_marker):
+        insert_at = idx - 1
+    lines.insert(insert_at, block.rstrip("\n"))
+    write(path, "\n".join(lines))
+    print(f"  [ok]   {label}: patched {path}")
+
+
 def insert_after(label, path, anchor_substr, block, already_marker=None):
     """Insert `block` (string ending in newline) immediately AFTER the first
     line containing `anchor_substr` (in-function insertions)."""
@@ -108,11 +133,48 @@ def apply_edit(label, path, old, new, already_marker=None):
     print(f"  [ok]   {label}: patched {path}")
 
 
+def guard_no_preexisting_symbols(base):
+    """Fail early if the community checkout already defines our injected symbols
+    (would otherwise become a duplicate-definition link error)."""
+    patterns = [
+        ("uint64_t external_vram_usage =", "definition of external_vram_usage"),
+        ("void aimdo_set_external_vram_usage", "definition of aimdo_set_external_vram_usage"),
+    ]
+    exts = (".c", ".h", ".cpp", ".hpp", ".cc")
+    hits = []
+    for root, _dirs, files in os.walk(base):
+        for f in files:
+            if not f.lower().endswith(exts):
+                continue
+            p = os.path.join(root, f)
+            try:
+                data = open(p, "r", encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            for pat, desc in patterns:
+                if pat in data:
+                    hits.append((p, desc))
+    if hits:
+        print("[FAIL] pre-existing root-cause symbols found in community checkout "
+              "-- the patch would create a duplicate definition (link error). "
+              "Refusing to patch.", file=sys.stderr)
+        for p, desc in hits:
+            print(f"         {desc} already present in {p}", file=sys.stderr)
+        sys.exit(1)
+    print("  [ok]   no pre-existing root-cause symbols in community checkout")
+
+
 def main():
     for p in FILES.values():
         if not os.path.isfile(p):
             print(f"[FAIL] community checkout file missing: {p}", file=sys.stderr)
             sys.exit(1)
+
+    # Guard (review finding I-1): the anchor check only inspects 3 files, so a
+    # pre-existing definition of our symbols elsewhere in the full community
+    # checkout would slip through and cause a duplicate-definition link error.
+    # Fail loudly -- and early -- if either symbol is already defined.
+    guard_no_preexisting_symbols(BASE)
 
     print(f"Applying RAM-layer root-cause patch onto '{BASE}/' ...")
 
@@ -128,7 +190,7 @@ def main():
             "   device usage into the admission gate via effective_book_a(). See\n"
             "   RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13. */\n"
             "extern uint64_t external_vram_usage;\n"
-            "static inline size_t effective_book_a(void) {\n"
+            "static inline uint64_t effective_book_a(void) {\n"
             "    return total_vram_usage > external_vram_usage ? total_vram_usage : external_vram_usage;\n"
             "}\n"
         ),
@@ -139,7 +201,7 @@ def main():
         "plat.h:book_a var",
         FILES["plat_h"],
         "poll_budget_deficit(&prevailing_deficit_method)",
-        "    size_t book_a = effective_book_a();\n",
+        "    uint64_t book_a = effective_book_a();\n",
         already_marker="size_t book_a = effective_book_a();",
     )
     # 3) Use book_a in deficit_simple.
@@ -160,8 +222,13 @@ def main():
     )
 
     # ---- src/control.c ----------------------------------------------------
-    # Setter at FILE SCOPE, before cleanup().
-    insert_before(
+    # Setter at FILE SCOPE, before cleanup(). The community base has a lone
+    # `SHARED_EXPORT` line directly above `void cleanup(void)`; insert BEFORE
+    # that marker (prev_marker) so SHARED_EXPORT stays attached to cleanup and is
+    # NOT wrongly applied to our variable definition (which would make the
+    # definition's storage class (dllexport) differ from the `extern` declaration
+    # in plat.h and trigger MSVC C2370 "redefinition; different storage class").
+    insert_before_skip_prev(
         "control.c:setter",
         FILES["control_c"],
         "void cleanup(void)",
@@ -175,6 +242,7 @@ def main():
             "    external_vram_usage = usage;\n"
             "}\n"
         ),
+        prev_marker="SHARED_EXPORT",
         already_marker="aimdo_set_external_vram_usage",
     )
 
