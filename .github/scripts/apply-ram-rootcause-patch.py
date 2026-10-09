@@ -11,8 +11,8 @@ The root-cause fix for the B580 crash lives in src/plat.h, src/control.c and
 src-win/shmem-detect.c -- NONE of which are overlaid today. Instead of widening
 the overlay to the whole src/ tree (which would silently drop the fork's L2/L3
 unload layer, src/model-vbar.c, and break the overlay-contract gate), this
-script surgically re-applies the exact 5 edits onto the freshly-checked-out
-community files using stable anchor strings.
+script surgically re-applies the RAM-layer root-cause edits onto the
+freshly-checked-out community files using stable anchor strings.
 
 SAFETY
 ------
@@ -200,13 +200,23 @@ def main():
         ),
         already_marker="sysmem fallback detected (DXGI budget",
     )
-    # B) Account for torch's real usage in deficit_sync.
+    # B) Feed torch's real device usage (external_vram_usage) into the WDDM
+    #    usage term so the gate never undercounts the XPU footprint. The
+    #    community fork already prefers WDDM CurrentUsage over Book A; we take
+    #    the max of that and the externally-fed torch reserved bytes.
     apply_edit(
-        "shmem-detect.c:deficit_sync",
+        "shmem-detect.c:effective_usage init",
         FILES["shmem_c"],
-        "total_vram_usage + WDDM_BUDGET_HEADROOM",
-        "effective_book_a() + WDDM_BUDGET_HEADROOM",
-        already_marker="effective_book_a() + WDDM_BUDGET_HEADROOM",
+        "uint64_t effective_usage = total_vram_usage;",
+        "uint64_t effective_usage = effective_book_a();",
+        already_marker="effective_usage = effective_book_a()",
+    )
+    apply_edit(
+        "shmem-detect.c:effective_usage WDDM",
+        FILES["shmem_c"],
+        "effective_usage = info.CurrentUsage;",
+        "effective_usage = (info.CurrentUsage > external_vram_usage ? info.CurrentUsage : external_vram_usage);",
+        already_marker="info.CurrentUsage > external_vram_usage",
     )
 
     print("RAM-layer root-cause patch applied successfully.")

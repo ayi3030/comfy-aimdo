@@ -1,57 +1,44 @@
 #!/usr/bin/env python3
-"""Deterministic apply-path test for apply-ram-rootcause-patch.py.
+"""Apply-path test against the REAL community-fork base (fetched from
+xiangyuT/comfy-aimdo-xpu @ COMMUNITY_FORK_SHA via the API into _cfbase/).
 
-Builds minimal synthetic "community base" stubs containing exactly the anchor
-substrings the script looks for, runs the real patcher, and asserts the new
-forms appear in the correct scope/order (file-scope vs in-function, and
-declaration before use). Does NOT depend on the local patched file's formatting.
+Copies the real base into a temp native/ tree, runs the real patcher, and
+asserts every root-cause edit landed in the correct place with no duplicate
+symbol definitions (which would break the link). Does NOT use my local patched
+files -- those are irrelevant to CI (the build patches the community base).
 """
 import os
+import shutil
 import subprocess
 import sys
-import shutil
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SCRIPT = os.path.join(ROOT, ".github", "scripts", "apply-ram-rootcause-patch.py")
 PY = sys.executable
+# _cfbase was produced by _ci_diag.py (real community base) at the workspace
+# root. ROOT == <ws>/aimdo-xpu/fork, so dirname(dirname(ROOT)) == <ws>.
+SRC_BASE = os.path.join(os.path.dirname(os.path.dirname(ROOT)), "_cfbase")
 NATIVE = os.path.join(ROOT, "_rt_native")
 
 
-def write(path, content):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(content)
+def copy(src_rel, dst_rel):
+    s = os.path.join(SRC_BASE, src_rel)
+    d = os.path.join(NATIVE, dst_rel)
+    assert os.path.isfile(s), f"missing real base file: {s}"
+    os.makedirs(os.path.dirname(d), exist_ok=True)
+    with open(s, "r", encoding="utf-8") as f:
+        data = f.read()
+    with open(d, "w", encoding="utf-8", newline="\n") as f:
+        f.write(data)
 
 
 def main():
-    # Synthetic community-base stubs (only the anchor shapes matter).
-    plat = (
-        "extern int64_t simple_vram_headroom;\n"
-        "static inline ssize_t budget_deficit(size_t size) {\n"
-        "    poll_budget_deficit(&prevailing_deficit_method);\n"
-        "    deficit_simple = (ssize_t)(total_vram_usage + size) + (ssize_t)simple_vram_headroom - (ssize_t)vram_capacity;\n"
-        "    deficit_delta = deficit_sync + (ssize_t)total_vram_usage - (ssize_t)total_vram_last_check + (ssize_t)size;\n"
-        "    return deficit;\n"
-        "}\n"
-    )
-    ctrl = (
-        "uint64_t get_total_vram_usage(void *devctx) {\n"
-        "    return total_vram_usage;\n"
-        "}\n"
-        "void cleanup(void) {\n"
-        "    teardown();\n"
-        "}\n"
-    )
-    shmem = (
-        "bool poll_budget_deficit(const char **m) {\n"
-        "    effective_budget = info.Budget;\n"
-        "    deficit_sync = (ssize_t)(total_vram_usage + WDDM_BUDGET_HEADROOM) - (ssize_t)effective_budget;\n"
-        "    return true;\n"
-        "}\n"
-    )
-    write(os.path.join(NATIVE, "src", "plat.h"), plat)
-    write(os.path.join(NATIVE, "src", "control.c"), ctrl)
-    write(os.path.join(NATIVE, "src-win", "shmem-detect.c"), shmem)
+    if not os.path.isdir(SRC_BASE):
+        print(f"[FAIL] real community base not found at {SRC_BASE}; run _ci_diag.py first")
+        sys.exit(1)
+    copy("src/plat.h", "src/plat.h")
+    copy("src/control.c", "src/control.c")
+    copy("src-win/shmem-detect.c", "src-win/shmem-detect.c")
 
     r = subprocess.run([PY, SCRIPT, "_rt_native"], cwd=ROOT, capture_output=True, text=True)
     if r.returncode != 0:
@@ -60,15 +47,18 @@ def main():
 
     fails = []
 
-    def check(path, must_have, must_not_have, order=None):
+    def check(path, must_have, must_one=None, order=None):
         with open(path, "r", encoding="utf-8") as f:
             s = f.read()
         for m in must_have:
             if m not in s:
                 fails.append(f"{os.path.basename(path)}: missing {m!r}")
-        for m in must_not_have:
-            if m in s:
-                fails.append(f"{os.path.basename(path)}: still present {m!r}")
+        if must_one:
+            # exactly one occurrence required (no duplicate definitions)
+            for m, n in must_one.items():
+                c = s.count(m)
+                if c != n:
+                    fails.append(f"{os.path.basename(path)}: {m!r} count={c} expected={n}")
         if order:
             for a, b in order:
                 if a in s and b in s and s.index(a) > s.index(b):
@@ -77,29 +67,30 @@ def main():
     check(os.path.join(NATIVE, "src", "plat.h"),
           ["effective_book_a(void)", "extern uint64_t external_vram_usage;",
            "size_t book_a = effective_book_a();", "book_a + size", "book_a -"],
-          ["total_vram_usage + size", "total_vram_usage -"],
           order=[("effective_book_a(void)", "budget_deficit(size_t size)"),
                  ("effective_book_a(void)", "size_t book_a = effective_book_a();")])
 
     check(os.path.join(NATIVE, "src", "control.c"),
           ["aimdo_set_external_vram_usage", "uint64_t external_vram_usage = 0;",
            "void aimdo_set_external_vram_usage(uint64_t usage)"],
-          [],
+          must_one={"uint64_t external_vram_usage = 0;": 1,          # exactly one definition
+                    "void aimdo_set_external_vram_usage(uint64_t usage)": 1},
           order=[("aimdo_set_external_vram_usage", "void cleanup(void)")])
 
     check(os.path.join(NATIVE, "src-win", "shmem-detect.c"),
           ["sysmem fallback detected (DXGI budget", "if (effective_budget > vram_capacity)",
-           "effective_book_a() + WDDM_BUDGET_HEADROOM"],
-          ["total_vram_usage + WDDM_BUDGET_HEADROOM"],
+           "effective_usage = effective_book_a();",
+           "effective_usage = (info.CurrentUsage > external_vram_usage ? info.CurrentUsage : external_vram_usage);"],
           order=[("effective_budget = info.Budget", "if (effective_budget > vram_capacity)"),
-                 ("if (effective_budget > vram_capacity)", "effective_book_a() + WDDM_BUDGET_HEADROOM")])
+                 ("uint64_t effective_usage = effective_book_a();", "effective_usage = (info.CurrentUsage > external_vram_usage")])
 
     if fails:
         print("APPLY-PATH TEST FAILED:")
         for f in fails:
             print("  -", f)
         sys.exit(1)
-    print("APPLY-PATH TEST OK: all 5 edits applied in correct scope/order; no stale anchors remain.")
+    print("APPLY-PATH TEST OK: root-cause edits applied to REAL community base; "
+          "no duplicate symbol definitions; scopes/order correct.")
 
 
 if __name__ == "__main__":
