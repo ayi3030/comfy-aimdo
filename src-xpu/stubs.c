@@ -1,5 +1,10 @@
 #include "plat.h"
 
+/* True device free captured by poll_budget_deficit() in src-win/shmem-detect.c.
+ * Exposed here so the Windows eviction path can reason about the real physical
+ * free. Read-only; never written from this translation unit. */
+extern uint64_t last_free_vram;
+
 /* The XPU allocator does not record or replay allocation graphs. Keep the
  * shared allocator/VBAR call sites on their ordinary allocation and
  * synchronization paths without linking the CUDA/HIP memory compiler. */
@@ -121,9 +126,18 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
     if (deficit > 0) {
 #if defined(_WIN32) || defined(_WIN64)
         /* The UR hook is above the driver call but remains inside the native
-         * allocation stack.  Publish the shortage and let WDDM place this
-         * request; the next VBAR fault drains it outside allocator locks. */
+         * allocation stack.  Best-effort reclaim of VBAR pages, THEN DENY the
+         * allocation so the caller's hard-deny branch (ur-usm-detour.c:608)
+         * fires the synthetic OOM -> torch releases its cache -> retry. The old
+         * code returned true here unconditionally, so over-admission was never
+         * actually denied and R2 crashed with OUT_OF_RESOURCES(40). The retry
+         * path at ur-usm-detour.c:568 does not check this return value, so
+         * there is no double-deny. */
+        log(DEBUG,
+            "%s: Windows reclaiming %zd bytes; true device free=%zu MB; denying allocation\n",
+            __func__, (ssize_t)deficit, last_free_vram / (1024 * 1024));
         vbars_request_reclaim((ssize_t)deficit);
+        return false;
 #else
         vbars_free((ssize_t)deficit);
 #endif

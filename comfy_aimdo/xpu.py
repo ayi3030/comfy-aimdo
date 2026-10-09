@@ -198,6 +198,10 @@ def _install_native_hook_wrappers():
         except Exception:
             pass
         try:
+            _feed_external_vram_usage()
+        except Exception:
+            pass
+        try:
             return _torch_xpu_empty_cache_original()
         except RuntimeError as error:
             if "does not yet support emptyCache" not in str(error):
@@ -212,6 +216,15 @@ def _install_native_hook_wrappers():
             except RuntimeError:
                 return {}
         active, reserved, peak_active, peak_reserved = stats
+        # P2: refresh the external VRAM ledger on every memory-stats query.
+        # Sampling steps and VBAR faults query stats frequently, so this keeps
+        # Book A from going stale by the ~940 MB window that previously only
+        # closed on empty_cache() calls. Same try/except style as the
+        # empty_cache wrapper above.
+        try:
+            _feed_external_vram_usage()
+        except Exception:
+            pass
         return {
             "active_bytes.all.current": active,
             "active_bytes.all.peak": peak_active,
@@ -236,6 +249,12 @@ def _install_native_hook_wrappers():
     torch.xpu.memory.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     torch.xpu.reset_peak_memory_stats = aimdo_xpu_reset_peak_memory_stats
     _wrappers_installed = True
+    # Prime the native admission gate with torch's real device reservation so
+    # Book A is not undercounted from the first allocation.
+    try:
+        _feed_external_vram_usage()
+    except Exception:
+        pass
 
 
 def torch_reserved_stats(device=None):
@@ -295,6 +314,75 @@ def torch_reserved_stats_reason(device=None):
     allocated = int(stats.get("allocated_bytes.all.current", 0))
     peak = int(stats.get("reserved_bytes.all.peak", 0))
     return (reserved, allocated, peak), None
+
+
+# Feed torch's real device reservation into the native admission gate so Book A
+# (total_vram_usage) is not undercounted on XPU (the M2 wrapper masks the true
+# reserved/allocated -- see torch_reserved_stats). The native setter only exists
+# in aimdo_xpu.dll builds that include the RAM-layer root-cause fix
+# (RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13); probe once and skip cleanly on older
+# DLLs so a version mismatch never crashes the runtime.
+_xpu_external_usage_supported = None
+_external_usage_feed_warned = set()
+# Every successfully fed value, for post-run forensics (bounded).
+_external_usage_feed_trace = []
+
+
+def _warn_external_usage_feed_once(key, detail):
+    """Rate-limited warning for the external-VRAM feed.
+
+    This call site used to be a bare `except Exception: pass`. That is exactly
+    how a ctypes ABI mismatch stayed invisible for a whole release: with no
+    `argtypes` declared, ctypes passes a Python int as the platform default
+    C int (32-bit), so any reservation >= 4 GiB raised
+    ``ArgumentError: int too long to convert`` and was swallowed -- i.e. the
+    feed died silently precisely when VRAM pressure made it matter.
+    Never swallow this again: warn once per distinct failure.
+    """
+    if key in _external_usage_feed_warned:
+        return
+    _external_usage_feed_warned.add(key)
+    try:
+        logging.getLogger("comfy_aimdo.xpu").warning(
+            "aimdo: external VRAM usage feed %s (%s); the native admission gate "
+            "will undercount torch's device reservation", key, detail)
+    except Exception:
+        pass
+
+
+def _feed_external_vram_usage():
+    """Push torch's true device reservation (bytes) into the native gate.
+
+    ABI contract (src/control.c:218):
+        ``void aimdo_set_external_vram_usage(uint64_t usage)``
+    The parameter is **bytes**, not MiB. ctypes cannot infer that: with no
+    ``argtypes`` a Python int is marshalled as a 32-bit C int, so byte counts
+    above 4 GiB raise and are lost. Declare the contract explicitly, at the
+    only call site, before every call.
+    """
+    global _xpu_external_usage_supported
+    if _xpu_external_usage_supported is None:
+        _xpu_external_usage_supported = hasattr(control.lib, "aimdo_set_external_vram_usage")
+    if not _xpu_external_usage_supported:
+        return
+    stats = torch_reserved_stats()
+    if stats is None:
+        _warn_external_usage_feed_once("unavailable",
+                                       "torch_reserved_stats() returned None")
+        return
+    try:
+        setter = control.lib.aimdo_set_external_vram_usage
+        if not getattr(setter, "argtypes", None):
+            setter.argtypes = [ctypes.c_uint64]
+            setter.restype = None
+        value = int(stats[0])
+        setter(value)
+        if len(_external_usage_feed_trace) < 4096:
+            _external_usage_feed_trace.append(value)
+    except Exception as exc:
+        _warn_external_usage_feed_once(
+            "failed", "%s: %s (value=%s bytes)"
+            % (type(exc).__name__, exc, stats[0]))
 
 
 def teardown_backend() -> None:

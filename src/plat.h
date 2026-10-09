@@ -146,15 +146,30 @@ void aimdo_log(int level, const char *file, int line, const char *format, ...);
 #define VRAM_HEADROOM (256 * 1024 * 1024)
 extern int64_t simple_vram_headroom;
 
+/* External VRAM usage estimate fed from the Python/XPU layer (torch's real
+ * device reserved/allocated). On XPU the M2 wrapper masks torch's true
+ * reserved/allocated, so the native ledger (total_vram_usage, "Book A")
+ * undercounts the real device footprint; feeding the real value here lets the
+ * admission gate (budget_deficit) stop over-admitting. See
+ * RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13. */
+extern uint64_t external_vram_usage;
+
+/* Effective Book A for the admission gate: the larger of aimdo's own ledger and
+ * the torch real-device usage fed from the Python/XPU layer. */
+static inline size_t effective_book_a(void) {
+    return total_vram_usage > external_vram_usage ? total_vram_usage : external_vram_usage;
+}
+
 static inline ssize_t budget_deficit(size_t size) {
     ssize_t deficit_simple, deficit_delta;
     ssize_t deficit;
     const char *prevailing_deficit_method = "unknown";
 
     poll_budget_deficit(&prevailing_deficit_method);
-    deficit_simple = (ssize_t)(total_vram_usage + size) + (ssize_t)simple_vram_headroom -
+    size_t book_a = effective_book_a();
+    deficit_simple = (ssize_t)(book_a + size) + (ssize_t)simple_vram_headroom -
                      (ssize_t)vram_capacity;
-    deficit_delta = deficit_sync + (ssize_t)total_vram_usage -
+    deficit_delta = deficit_sync + (ssize_t)book_a -
                     (ssize_t)total_vram_last_check + (ssize_t)size;
     deficit = MAX(deficit_simple, deficit_delta) + (ssize_t)extra_vram_headroom;
     if (deficit > 0) {
