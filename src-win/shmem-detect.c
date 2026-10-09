@@ -139,7 +139,9 @@ fail:
 uint64_t last_free_vram = 0;
 uint64_t last_total_vram = 0;
 
-SHARED_EXPORT
+/* Deliberately NOT SHARED_EXPORT: this is internal to the DLL and
+ * nothing outside links against it. Keeping it out of the export
+ * table avoids spending an export slot on a private helper. */
 ssize_t real_free_fit_deficit(uint64_t size) {
     uint64_t capacity, reserve, available;
     if (last_free_vram == 0) {
