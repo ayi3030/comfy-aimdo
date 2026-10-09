@@ -286,6 +286,58 @@ def main():
         "effective_usage = (info.CurrentUsage > external_vram_usage ? info.CurrentUsage : external_vram_usage);",
         already_marker="info.CurrentUsage > external_vram_usage",
     )
+    # C) P0 real-free admission guard (Arc B580 fix, corrected over-restriction).
+    #    The community's original 'deficit_cuda = headroom - free_vram' is
+    #    structurally negative on B580 (Book A ~6500 MB, free 3000-5500 MB) and
+    #    never denies -- torch over-commits and crashes (error:40 -> DEVICE_LOST
+    #    at model.py:777 torch.lerp; free=3221 MB at the observed crash). Replace
+    #    it with a SAFE_FREE_FLOOR guard that denies ONLY when true device free
+    #    drops below 4096 MiB. Keep the most-restrictive (largest) selection so
+    #    the WDDM-budget and real-free methods still race to the tighter signal.
+    insert_before(
+        "shmem-detect.c:SAFE_FREE_FLOOR define",
+        FILES["shmem_c"],
+        "#define WDDM_BUDGET_HEADROOM",
+        (
+            "/* RAM-layer P0 fix: real-free admission guard. Deny (deficit>0) only\n"
+            " * when the TRUE Level-Zero device free drops below this floor. On Arc\n"
+            " * B580 the model pins Book A ~6500 MB so free normally sits 3000-5500\n"
+            " * MB; the old 'headroom - free' form was structurally negative and\n"
+            " * never tripped. 4096 MiB catches the observed crash (free=3221 MB at\n"
+            " * model.py:777 torch.lerp -> +1875 -> gate trips -> P1 hard-deny).\n"
+            " * Do NOT exceed 4096 MiB. See RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13. */\n"
+            "#define SAFE_FREE_FLOOR (4096ULL * 1024 * 1024)\n"
+        ),
+        already_marker="SAFE_FREE_FLOOR (4096",
+    )
+    apply_edit(
+        "shmem-detect.c:real-free deficit (P0 SAFE_FREE_FLOOR)",
+        FILES["shmem_c"],
+        "        ssize_t headroom = used_nvml ? NVML_BUDGET_HEADROOM : CUDA_BUDGET_HEADROOM / 2;\n"
+        "        ssize_t deficit_cuda = headroom - (ssize_t)free_vram;",
+        "        ssize_t deficit_real = (ssize_t)SAFE_FREE_FLOOR - (ssize_t)free_vram;",
+        already_marker="deficit_real = (ssize_t)SAFE_FREE_FLOOR",
+    )
+    apply_edit(
+        "shmem-detect.c:real-free deficit log",
+        FILES["shmem_c"],
+        "            \"%s: device memory free=%zu MB total=%zu MB deficit_cuda=%zd MB\\n\",\n"
+        "            __func__, free_vram / M, total_vram / M, deficit_cuda / (ssize_t)M);",
+        "            \"%s: device memory free=%zu MB total=%zu MB deficit_real=%zd MB\\n\",\n"
+        "            __func__, free_vram / M, total_vram / M, deficit_real / (ssize_t)M);",
+        already_marker="deficit_real=%zd",
+    )
+    apply_edit(
+        "shmem-detect.c:real-free selection",
+        FILES["shmem_c"],
+        "        if (deficit_cuda > deficit_sync) {\n"
+        "            deficit_sync = deficit_cuda;\n"
+        "            *prevailing_deficit_method = used_nvml ? \"NVML (Windows)\" : \"cuMemGetInfo (Windows)\";",
+        "        if (deficit_real > deficit_sync) {\n"
+        "            deficit_sync = deficit_real;\n"
+        "            *prevailing_deficit_method = used_nvml ? \"NVML real-free\" : \"cuMemGetInfo real-free\";",
+        already_marker="deficit_real > deficit_sync",
+    )
 
     print("RAM-layer root-cause patch applied successfully.")
 
