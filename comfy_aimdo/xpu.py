@@ -314,8 +314,43 @@ def torch_reserved_stats_reason(device=None):
 # (RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13); probe once and skip cleanly on older
 # DLLs so a version mismatch never crashes the runtime.
 _xpu_external_usage_supported = None
+_external_usage_feed_warned = set()
+# Every successfully fed value, for post-run forensics (bounded).
+_external_usage_feed_trace = []
+
+
+def _warn_external_usage_feed_once(key, detail):
+    """Rate-limited warning for the external-VRAM feed.
+
+    This call site used to be a bare `except Exception: pass`. That is exactly
+    how a ctypes ABI mismatch stayed invisible for a whole release: with no
+    `argtypes` declared, ctypes passes a Python int as the platform default
+    C int (32-bit), so any reservation >= 4 GiB raised
+    ``ArgumentError: int too long to convert`` and was swallowed -- i.e. the
+    feed died silently precisely when VRAM pressure made it matter.
+    Never swallow this again: warn once per distinct failure.
+    """
+    if key in _external_usage_feed_warned:
+        return
+    _external_usage_feed_warned.add(key)
+    try:
+        logging.getLogger("comfy_aimdo.xpu").warning(
+            "aimdo: external VRAM usage feed %s (%s); the native admission gate "
+            "will undercount torch's device reservation", key, detail)
+    except Exception:
+        pass
+
 
 def _feed_external_vram_usage():
+    """Push torch's true device reservation (bytes) into the native gate.
+
+    ABI contract (src/control.c:218):
+        ``void aimdo_set_external_vram_usage(uint64_t usage)``
+    The parameter is **bytes**, not MiB. ctypes cannot infer that: with no
+    ``argtypes`` a Python int is marshalled as a 32-bit C int, so byte counts
+    above 4 GiB raise and are lost. Declare the contract explicitly, at the
+    only call site, before every call.
+    """
     global _xpu_external_usage_supported
     if _xpu_external_usage_supported is None:
         _xpu_external_usage_supported = hasattr(control.lib, "aimdo_set_external_vram_usage")
@@ -323,11 +358,22 @@ def _feed_external_vram_usage():
         return
     stats = torch_reserved_stats()
     if stats is None:
+        _warn_external_usage_feed_once("unavailable",
+                                       "torch_reserved_stats() returned None")
         return
     try:
-        control.lib.aimdo_set_external_vram_usage(stats[0])
-    except Exception:
-        pass
+        setter = control.lib.aimdo_set_external_vram_usage
+        if not getattr(setter, "argtypes", None):
+            setter.argtypes = [ctypes.c_uint64]
+            setter.restype = None
+        value = int(stats[0])
+        setter(value)
+        if len(_external_usage_feed_trace) < 4096:
+            _external_usage_feed_trace.append(value)
+    except Exception as exc:
+        _warn_external_usage_feed_once(
+            "failed", "%s: %s (value=%s bytes)"
+            % (type(exc).__name__, exc, stats[0]))
 
 
 def teardown_backend() -> None:
