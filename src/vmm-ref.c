@@ -23,14 +23,14 @@ VirtualRange *virtual_range_ref(VirtualRange *range) {
     return range;
 }
 
-CUresult virtual_range_unref(VirtualRange *range) {
+gpu_result_t virtual_range_unref(VirtualRange *range) {
     allocations_lock();
     if (--range->refs) {
         allocations_unlock();
-        return CUDA_SUCCESS;
+        return GPU_SUCCESS;
     }
 
-    CUresult result = cuMemAddressFree(range->address, range->bytes);
+    gpu_result_t result = cuMemAddressFree(range->address, range->bytes);
     if (result) {
         range->refs++;
     } else {
@@ -40,19 +40,19 @@ CUresult virtual_range_unref(VirtualRange *range) {
     return result;
 }
 
-CUresult physical_page_alloc(PhysicalPage **page, size_t bytes, int device) {
+gpu_result_t physical_page_alloc(PhysicalPage **page, size_t bytes, int device) {
     PhysicalPage *reference = malloc(sizeof(*reference));
     PhysicalAllocation *allocation = malloc(sizeof(*allocation));
 
     if (!reference || !allocation) {
         free(reference);
         free(allocation);
-        return CUDA_ERROR_OUT_OF_MEMORY;
+        return GPU_ERROR_OUT_OF_MEMORY;
     }
 
-    CUmemAllocationProp prop = {.type = CU_MEM_ALLOCATION_TYPE_PINNED,
-        .location = {CU_MEM_LOCATION_TYPE_DEVICE, device}};
-    CUresult result = cuMemCreate(&allocation->handle, bytes, &prop, 0);
+    gpu_mem_prop_t prop = {.type = GPU_MEM_ALLOCATION_TYPE_PINNED,
+        .location = {GPU_MEM_LOCATION_TYPE_DEVICE, device}};
+    gpu_result_t result = cuMemCreate(&allocation->handle, bytes, &prop, 0);
     if (result) {
         free(reference);
         free(allocation);
@@ -67,10 +67,10 @@ CUresult physical_page_alloc(PhysicalPage **page, size_t bytes, int device) {
     allocations_lock();
     total_vram_usage += bytes;
     allocations_unlock();
-    return CUDA_SUCCESS;
+    return GPU_SUCCESS;
 }
 
-PhysicalPage *physical_page_ref(PhysicalPage *page, CUdeviceptr address) {
+PhysicalPage *physical_page_ref(PhysicalPage *page, gpu_deviceptr_t address) {
     PhysicalPage *reference = malloc(sizeof(*reference));
 
     if (!reference) {
@@ -85,11 +85,11 @@ PhysicalPage *physical_page_ref(PhysicalPage *page, CUdeviceptr address) {
     return reference;
 }
 
-CUresult physical_page_unref(PhysicalPage *page) {
-    CUresult result = CUDA_SUCCESS;
+gpu_result_t physical_page_unref(PhysicalPage *page) {
+    gpu_result_t result = GPU_SUCCESS;
 
     if (!page) {
-        return CUDA_SUCCESS;
+        return GPU_SUCCESS;
     }
 
     allocations_lock();
@@ -127,5 +127,5 @@ CUresult physical_page_unref(PhysicalPage *page) {
     }
     free(page);
     allocations_unlock();
-    return CUDA_SUCCESS;
+    return GPU_SUCCESS;
 }

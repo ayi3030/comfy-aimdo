@@ -3,13 +3,13 @@
 #include "plat.h"
 
 typedef struct VramBuffer {
-    CUdeviceptr base_ptr;
+    gpu_deviceptr_t base_ptr;
     size_t max_size;
     size_t allocated;
     size_t handle_count;
     int device;
     struct VramBuffer *next;
-    CUmemGenericAllocationHandle handles[1];
+    gpu_mem_handle_t handles[1];
 } VramBuffer;
 
 SHARED_EXPORT
@@ -22,4 +22,4 @@ SHARED_EXPORT
 bool vrambuf_destroy(void *arg);
 
 SHARED_EXPORT
-CUdeviceptr vrambuf_get(void *arg);
+gpu_deviceptr_t vrambuf_get(void *arg);

@@ -109,3 +109,65 @@ typedef enum CUdriverProcAddressQueryResult_enum {
     CU_GET_PROC_ADDRESS_SYMBOL_NOT_FOUND = 1,
     CU_GET_PROC_ADDRESS_VERSION_NOT_SUFFICIENT = 2,
 } CUdriverProcAddressQueryResult;
+
+/* ============================================================================
+ * 后端无关中性类型（XPU 适配新增）
+ *
+ * 目的：让共享的 src/*.c 在不改动逻辑的前提下同时服务 CUDA / HIP / XPU。
+ *  - AIMDO_XPU 构建：真中性类型，完全不依赖任何 CUDA 类型（Level Zero 后端填充 g_gpu）。
+ *  - CUDA/HIP 构建：typedef 回原 CUDA 类型（HIP 的驱动 API 与 CUDA ABI 兼容），
+ *                  因此既有调用点语义与字节级行为完全不变。
+ *
+ * 注意：gpu_mem_prop_t 的字段布局对齐 CUDA 的 CUmemAllocationProp 的三个关键字段
+ *       （type / location.type / location.id），以便 three_stooges() 用同一份字面量
+ *       初始化语法在两种后端下都能编译。
+ * ==========================================================================*/
+#if defined(AIMDO_XPU)
+typedef int    gpu_result_t;
+typedef void  *gpu_device_t;
+typedef void  *gpu_deviceptr_t;
+typedef void  *gpu_mem_handle_t;
+typedef void  *gpu_stream_t;   /* Level Zero 无 CUDA stream 概念，占位 */
+typedef void  *gpu_event_t;    /* Level Zero 事件用占位实现 */
+
+typedef struct gpu_mem_location_st {
+    int type;
+    int id;
+} gpu_mem_location_t;
+
+typedef struct gpu_mem_access_desc_st {
+    gpu_mem_location_t location;
+    int flags;
+} gpu_mem_access_desc_t;
+
+typedef struct gpu_mem_prop_st {
+    int type;
+    int requestedHandleTypes;
+    gpu_mem_location_t location;
+} gpu_mem_prop_t;
+
+#define GPU_SUCCESS                          0
+#define GPU_ERROR_OUT_OF_MEMORY              2
+#define GPU_MEM_ALLOCATION_TYPE_PINNED       1
+#define GPU_MEM_LOCATION_TYPE_DEVICE         1
+#define GPU_MEM_ACCESS_FLAGS_PROT_READWRITE  3
+#define GPU_EVENT_DISABLE_TIMING             0x2
+#define GPU_DEVICE_ATTRIBUTE_INTEGRATED      18
+#else
+typedef CUresult                        gpu_result_t;
+typedef CUdevice                        gpu_device_t;
+typedef CUdeviceptr                     gpu_deviceptr_t;
+typedef CUmemGenericAllocationHandle    gpu_mem_handle_t;
+typedef CUstream                        gpu_stream_t;
+typedef CUevent                         gpu_event_t;
+typedef CUmemAllocationProp             gpu_mem_prop_t;
+typedef CUmemAccessDesc                 gpu_mem_access_desc_t;
+
+#define GPU_SUCCESS                          CUDA_SUCCESS
+#define GPU_ERROR_OUT_OF_MEMORY              CUDA_ERROR_OUT_OF_MEMORY
+#define GPU_MEM_ALLOCATION_TYPE_PINNED       CU_MEM_ALLOCATION_TYPE_PINNED
+#define GPU_MEM_LOCATION_TYPE_DEVICE         CU_MEM_LOCATION_TYPE_DEVICE
+#define GPU_MEM_ACCESS_FLAGS_PROT_READWRITE  CU_MEM_ACCESS_FLAGS_PROT_READWRITE
+#define GPU_EVENT_DISABLE_TIMING             CU_EVENT_DISABLE_TIMING
+#define GPU_DEVICE_ATTRIBUTE_INTEGRATED      CU_DEVICE_ATTRIBUTE_INTEGRATED
+#endif

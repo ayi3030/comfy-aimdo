@@ -37,6 +37,9 @@ void allocations_analyze(bool only_dirty) {
     log(DEBUG, "%d Active Allocations for a total of %7zu MB\n", count, total_size / M);
 }
 
+#if !defined(AIMDO_XPU)
+/* XPU 构建下不定义 CUDA 可插拔分配器入口 alloc_fn/free_fn；
+ * XPU 版入口见 src-xpu/dispatch.c（PyTorch XPUPluggableAllocator 用）。 */
 SHARED_EXPORT
 void *alloc_fn(size_t size, int device, cudaStream_t stream) {
     VramBuffer *entry;
@@ -90,3 +93,4 @@ void free_fn(void* ptr, size_t size, int device, cudaStream_t stream) {
 
     log(AIMDO_LOG_ERROR, "%s could not find VRAM@%p\n", __func__, ptr);
 }
+#endif /* !AIMDO_XPU */

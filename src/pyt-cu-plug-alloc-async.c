@@ -6,6 +6,8 @@
  */
 #define CUDA_MALLOC_HEADROOM (128 * M)
 
+#if !defined(AIMDO_XPU)
+/* SizeEntry/size_hash 仅用于 CUDA 分配记账，XPU 构建下不需要。 */
 typedef struct SizeEntry {
     CUdeviceptr ptr;
     size_t size;
@@ -15,6 +17,7 @@ typedef struct SizeEntry {
 static inline unsigned int size_hash(CUdeviceptr ptr) {
     return ((uintptr_t)ptr >> 10 ^ (uintptr_t)ptr >> 21) % SIZE_HASH_SIZE;
 }
+#endif /* !AIMDO_XPU */
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -85,6 +88,10 @@ void allocations_cleanup(void) {
     st_cleanup();
 }
 
+#if !defined(AIMDO_XPU)
+/* 以下全部为 CUDA 专属：显存分配记账（account_alloc/free）与 CUDA 分配器钩子
+ * 实现（aimdo_cuda_malloc/free[_async]）。XPU 构建下由 PyTorch
+ * XPUPluggableAllocator + src-xpu/dispatch.c 接管，故整段守卫掉。 */
 static inline size_t accounted_alloc_size(size_t size) {
     size_t rounded = size;
 
@@ -281,3 +288,4 @@ int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
     account_free(devPtr, hStream);
     return status;
 }
+#endif /* !AIMDO_XPU */

@@ -6,13 +6,13 @@
 #define VBAR_GET_PAGE_NR_UP(x) VBAR_GET_PAGE_NR((x) + VBAR_PAGE_SIZE - 1)
 
 typedef struct ResidentPage {
-    CUmemGenericAllocationHandle handle;
+    gpu_mem_handle_t handle;
     uint32_t pin_count;
     size_t serial;
 } ResidentPage;
 
 typedef struct ModelVBAR {
-    CUdeviceptr vbar;
+    gpu_deviceptr_t vbar;
     size_t nr_pages;
     size_t watermark;
     size_t watermark_limit;
@@ -93,7 +93,7 @@ uint64_t vbars_analyze(void *devctx, bool only_dirty) {
 
 static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unpin) {
     ResidentPage *rp = &mv->residency_map[page_nr];
-    CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
+    gpu_deviceptr_t vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
 
     do_free = do_free && rp->handle && (do_unpin || rp->pin_count == 0);
     if (do_free) {
@@ -368,8 +368,8 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
     }
 
     for (uint64_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end; page_nr++) {
-        CUresult err = CUDA_ERROR_OUT_OF_MEMORY;
-        CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
+        gpu_result_t err = GPU_ERROR_OUT_OF_MEMORY;
+        gpu_deviceptr_t vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
         ResidentPage *rp = &mv->residency_map[page_nr];
 
         if (rp->handle) {
@@ -394,8 +394,8 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
         log(VERBOSE, "VBAR needs to allocate VRAM for page %d\n", (int)page_nr);
 
         if (budget_deficit(VBAR_PAGE_SIZE) > 0 ||
-            (err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != CUDA_SUCCESS) {
-            if (err != CUDA_ERROR_OUT_OF_MEMORY) {
+            (err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != GPU_SUCCESS) {
+            if (err != GPU_ERROR_OUT_OF_MEMORY) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
                 return VBAR_FAULT_ERROR;
             }
@@ -405,7 +405,7 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
                 log(DEBUG, "VBAR allocation cancelled due to backup-free watermark reduction\n");
                 return VBAR_FAULT_OOM;
             }
-            if ((err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != CUDA_SUCCESS) {
+            if ((err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != GPU_SUCCESS) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed\n");
                 return VBAR_FAULT_ERROR;
             }

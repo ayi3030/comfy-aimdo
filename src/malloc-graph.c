@@ -73,7 +73,7 @@ typedef struct {
 struct SmallRange {
     size_t offset;
     size_t bytes;
-    CUdeviceptr rogue_ptr;
+    gpu_deviceptr_t rogue_ptr;
     uint32_t owner_depth;
     Event *allocation;
 
@@ -88,7 +88,7 @@ struct AllocationState {
 typedef struct {
     VirtualRange *base;
     VirtualRange *small_base;
-    CUstream stream;
+    gpu_stream_t stream;
     int device;
     void *owner_thread;
 
@@ -99,7 +99,7 @@ typedef struct {
     AllocationState allocations;
     SmallRange *small_ranges;
     SmallRange *small_unusable;
-    CUdeviceptr black_holes[MG_PAGES];
+    gpu_deviceptr_t black_holes[MG_PAGES];
     int va_phys[MG_PAGES];
     PhysicalPage *physical_pages[MG_PAGES];
     PhysicalPage *mapped_pages[MG_PAGES];
@@ -128,10 +128,10 @@ static _Thread_local MallocGraph *active_graph;
 static bool rogue_va(MallocGraph *g, size_t va);
 static bool rogue_phys(MallocGraph *g, size_t phys);
 static bool small_unavailable(MallocGraph *g, size_t offset, size_t bytes);
-static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
+static gpu_result_t map_reference(MallocGraph *g, gpu_deviceptr_t address,
                               PhysicalPage *page, PhysicalPage **mapping);
 
-static CUdeviceptr candidate_ptr(MallocGraph *g, Event *candidate) {
+static gpu_deviceptr_t candidate_ptr(MallocGraph *g, Event *candidate) {
     VirtualRange *range = candidate->type == EV_ALLOC_SMALL ? g->small_base : g->base;
     return virtual_range_get(range) + candidate->value *
            (candidate->type == EV_ALLOC_SMALL ? 1 : MG_PAGE);
@@ -329,7 +329,7 @@ static bool is_rogue_candidate(MallocGraph *g, Event *event) {
 }
 
 static bool rogue_va(MallocGraph *g, size_t va) {
-    CUdeviceptr ptr = g->black_holes[va];
+    gpu_deviceptr_t ptr = g->black_holes[va];
     if (ptr && !rogue_exists(ptr)) {
         if (map_reference(g, virtual_range_get(g->base) + va * MG_PAGE,
                           g->physical_pages[g->va_phys[va]], &g->mapped_pages[va])) {
@@ -420,28 +420,28 @@ static bool push_stack(MallocGraph *g, Event *scope, bool recording) {
     return true;
 }
 
-static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
-    CUresult r;
+static gpu_result_t create_page(MallocGraph *g, PhysicalPage **page) {
+    gpu_result_t r;
 
     vbars_free(budget_deficit(MG_PAGE));
     r = physical_page_alloc(page, MG_PAGE, g->device);
-    if (r == CUDA_ERROR_OUT_OF_MEMORY) {
+    if (r == GPU_ERROR_OUT_OF_MEMORY) {
         vbars_free(MG_PAGE);
         r = physical_page_alloc(page, MG_PAGE, g->device);
     }
     return r;
 }
 
-static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
+static gpu_result_t map_reference(MallocGraph *g, gpu_deviceptr_t address,
                               PhysicalPage *page, PhysicalPage **mapping) {
-    CUmemAccessDesc access = {.location = {CU_MEM_LOCATION_TYPE_DEVICE, g->device},
-                              .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE};
+    gpu_mem_access_desc_t access = {.location = {GPU_MEM_LOCATION_TYPE_DEVICE, g->device},
+                              .flags = GPU_MEM_ACCESS_FLAGS_PROT_READWRITE};
     PhysicalPage *reference = physical_page_ref(page, 0);
     if (!reference) {
-        return CUDA_ERROR_OUT_OF_MEMORY;
+        return GPU_ERROR_OUT_OF_MEMORY;
     }
 
-    CUresult result = cuMemMap(address, MG_PAGE, 0, physical_page_get(page), 0);
+    gpu_result_t result = cuMemMap(address, MG_PAGE, 0, physical_page_get(page), 0);
     if (!result) {
         reference->address = address;
         result = cuMemSetAccess(address, MG_PAGE, &access, 1);
@@ -455,8 +455,8 @@ static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
 }
 
 static int map_page(MallocGraph *g, size_t va, size_t phys) {
-    CUdeviceptr addr = virtual_range_get(g->base) + va * MG_PAGE;
-    CUresult r;
+    gpu_deviceptr_t addr = virtual_range_get(g->base) + va * MG_PAGE;
+    gpu_result_t r;
 
     if (phys == g->phys_count) {
         r = create_page(g, &g->physical_pages[phys]);
@@ -601,7 +601,7 @@ static bool handoff_rogues(MallocGraph *g) {
         }
 
         VirtualRange *range;
-        CUdeviceptr ptr;
+        gpu_deviceptr_t ptr;
         size_t count;
 
         if (candidate->type == EV_ALLOC_SMALL) {
@@ -861,7 +861,7 @@ static size_t small_allocation_offset(MallocGraph *g, size_t bytes) {
     return offset;
 }
 
-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+bool malloc_graph_alloc(gpu_deviceptr_t *ptr, size_t size, gpu_stream_t stream) {
     MallocGraph *g = active_graph;
 
     if (!g || graph_failed(g) || g->paused || stream != g->stream) {
@@ -900,8 +900,8 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
 
             if (g->small_pages < pages) {
                 PhysicalPage **page = &g->small_physical_pages[g->small_pages];
-                CUdeviceptr addr = virtual_range_get(g->small_base) + g->small_pages * MG_PAGE;
-                CUresult r = create_page(g, page);
+                gpu_deviceptr_t addr = virtual_range_get(g->small_base) + g->small_pages * MG_PAGE;
+                gpu_result_t r = create_page(g, page);
                 RETURN_G_FAILED(r, true);
                 g->small_pages++;
                 RETURN_G_FAILED(map_reference(g, addr, *page,
@@ -982,15 +982,15 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
     return true;
 }
 
-bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
+bool malloc_graph_free(gpu_deviceptr_t ptr, gpu_stream_t stream, int *result) {
     MallocGraph *g = active_graph;
 
     if (!g || graph_failed(g) || g->paused || stream != g->stream) {
         return false;
     }
 
-    CUdeviceptr base = virtual_range_get(g->base);
-    CUdeviceptr small_base = virtual_range_get(g->small_base);
+    gpu_deviceptr_t base = virtual_range_get(g->base);
+    gpu_deviceptr_t small_base = virtual_range_get(g->small_base);
     bool small = ptr >= small_base && ptr < small_base + MG_SMALL_PAGES * MG_PAGE;
     if (!small && (ptr < base || ptr >= base + MG_PAGES * MG_PAGE)) {
         return false;
@@ -1038,7 +1038,7 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     return true;
 }
 
-SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool assert_breaks) {
+SHARED_EXPORT void *malloc_graph_create(void *devctx, gpu_stream_t stream, bool assert_breaks) {
     MallocGraph *g = calloc(1, sizeof(*g));
 
     if (!g || active_graph) {
@@ -1093,7 +1093,7 @@ SHARED_EXPORT bool malloc_graph_pause(void *handle, bool paused, bool sync) {
     return true;
 }
 
-SHARED_EXPORT bool malloc_graph_set_stream(void *handle, CUstream stream) {
+SHARED_EXPORT bool malloc_graph_set_stream(void *handle, gpu_stream_t stream) {
     MallocGraph *g = handle;
 
     if (!g || g != active_graph || graph_failed(g)) {

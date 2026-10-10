@@ -78,6 +78,14 @@ jobs:
             /Isrc /Isrc-win /IC:/Detours/include /FIcompiler.h /Fe:comfy_aimdo/aimdo_rocm.dll ^
             /link /LIBPATH:%DETOURS_LIB_DIR% ^
             cfgmgr32.lib dxgi.lib dxguid.lib setupapi.lib detours.lib onecore.lib
+
+          rem XPU（Intel Arc / Level Zero）后端：不含 CUDA detour / WDDM 检测，故显式列出 win 源文件。
+          cl.exe /LD /O2 /DAIMDO_XPU ^
+            src/*.c src-xpu/dispatch.c ^
+            src-win/disk-id.c src-win/hostbuf-plat.c src-win/model-mmap.c src-win/module-load.c ^
+            src-win/thread-plat.c src-win/xfer-file-plat.c ^
+            /Isrc /Isrc-win /FIcompiler.h /Fe:comfy_aimdo/aimdo_xpu.dll ^
+            /link cfgmgr32.lib setupapi.lib onecore.lib
         shell: cmd
 
       - name: Build default Stub Wheel

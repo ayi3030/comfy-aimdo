@@ -20,11 +20,11 @@ static bool hostbuf_file_reader_retire_active(void) {
             g_devctx->_hostbuf_file_reader_active);
         return false;
     }
-    return CHECK_CU(cuEventCreate(&slot->event, CU_EVENT_DISABLE_TIMING)) &&
-           CHECK_CU(cuEventRecord(slot->event, (CUstream)slot->stream));
+    return CHECK_CU(cuEventCreate(&slot->event, GPU_EVENT_DISABLE_TIMING)) &&
+           CHECK_CU(cuEventRecord(slot->event, (gpu_stream_t)slot->stream));
 }
 
-static HostbufFileReaderSlot *hostbuf_file_reader_next(cudaStream_t stream) {
+static HostbufFileReaderSlot *hostbuf_file_reader_next(gpu_stream_t stream) {
     HostbufFileReaderSlot *slot;
 
     g_devctx->_hostbuf_file_reader_active =
@@ -45,13 +45,13 @@ static HostbufFileReaderSlot *hostbuf_file_reader_next(cudaStream_t stream) {
     }
 
     slot->offset = 0;
-    slot->stream = (CUstream)stream;
+    slot->stream = (gpu_stream_t)stream;
     return slot;
 }
 
 SHARED_EXPORT
 bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_offset,
-                              uint64_t size, cudaStream_t stream,
+                              uint64_t size, gpu_stream_t stream,
                               uint64_t device_ptr, bool mark_cold) {
     if (size == 0) {
         return true;
@@ -67,7 +67,7 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             &g_devctx->_hostbuf_file_reader_slots[g_devctx->_hostbuf_file_reader_active];
         size_t chunk;
 
-        if (!slot || slot->stream != (CUstream)stream ||
+        if (!slot || slot->stream != (gpu_stream_t)stream ||
             (slot->offset + size >= HOSTBUF_FILE_READER_WINDOW &&
              slot->offset >= LEAD_IN_THRESHOLD)) {
             if (!hostbuf_file_reader_retire_active() ||
@@ -83,9 +83,9 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
                 __func__, (ull)file_handle, (ull)file_offset, chunk);
             return false;
         }
-        CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)device_ptr,
+        gpu_result_t copy_result = cuMemcpyHtoDAsync((gpu_deviceptr_t)device_ptr,
                                                  slot->buffer + slot->offset,
-                                                 chunk, (CUstream)stream);
+                                                 chunk, (gpu_stream_t)stream);
         if (!CHECK_CU(copy_result)) {
             log(AIMDO_LOG_ERROR, "%s: device copy failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
                 __func__, (int)copy_result, (void *)(uintptr_t)device_ptr, device,

@@ -52,6 +52,15 @@ def detect_vendor():
     if cuda:
         return "cuda"
 
+    # Intel XPU（Arc 显卡，torch-xpu wheel）：torch.version.cuda/hip 均为空，
+    # 但 torch.xpu 可用。放在版本号后缀回退之前判断。
+    try:
+        import torch
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+    except Exception:
+        pass
+
     if '+cu' in version:
         return "cuda"
     if '+rocm' in version:
@@ -72,12 +81,15 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         implementation = detect_vendor()
 
     if implementation is None:
-        logging.warning("Could not autodetect AIMDO implementation, assuming Nvidia")
-        implementation = "cuda"
+        # 不再默认假设 Nvidia：无法识别后端时干净地禁用自身（尤其对 XPU 环境，
+        # 避免去加载并不存在的 CUDA 扩展并抛出误导性日志）。
+        logging.warning("comfy-aimdo: could not detect a supported GPU backend; aimdo disabled")
+        return False
 
     impl = {
         "cuda": "aimdo",
         "rocm": "aimdo_rocm",
+        "xpu": "aimdo_xpu",
     }[implementation]
 
     try:
@@ -96,7 +108,8 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
     except Exception as e:
         logging.info(f"comfy-aimdo failed to load: {e}")
-        logging.info(f"NOTE: comfy-aimdo currently only supports Nvidia and AMD GPUs")
+        logging.info("NOTE: comfy-aimdo supports Nvidia (CUDA), AMD (ROCm) and Intel (XPU); "
+                     "the XPU backend requires a locally built aimdo_xpu.{so,dll}")
         return False
 
     lib.set_log_callback.argtypes = [_LOG_CALLBACK]

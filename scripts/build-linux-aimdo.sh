@@ -6,6 +6,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 BUILD_DIR="$ROOT_DIR/build"
 CUDA_OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo.so"
 ROCM_OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo_rocm.so"
+XPU_OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo_xpu.so"
 FUNCHOOK_VERSION=1.1.3
 FUNCHOOK_SRC="$BUILD_DIR/funchook-$FUNCHOOK_VERSION"
 FUNCHOOK_TARBALL="$BUILD_DIR/funchook-$FUNCHOOK_VERSION.tar.gz"
@@ -106,4 +107,16 @@ gcc -shared -o "$ROCM_OUTPUT_PATH" -fPIC -O2 -g -pthread \
     "$ROOT_DIR"/src/*.c "$ROOT_DIR"/src-hip/dispatch.c "$ROOT_DIR"/src-posix/*.c \
     -I"$ROOT_DIR/src" -I"$FUNCHOOK_SRC/include" \
     $FUNCHOOK_LIBS \
+    -ldl
+
+# XPU（Intel Arc / oneAPI Level Zero）后端：不链接 funchook，且排除 CUDA 专属的
+# cuda-funchooks.c（XPU 通过 PyTorch XPUPluggableAllocator 注册 alloc_fn/free_fn）。
+XPU_POSIX_SOURCES=$(ls "$ROOT_DIR"/src-posix/*.c | grep -v '/cuda-funchooks\.c$')
+
+# shellcheck disable=SC2086
+gcc -shared -o "$XPU_OUTPUT_PATH" -fPIC -O2 -g -pthread \
+    -DAIMDO_XPU \
+    ${AIMDO_EXTRA_CFLAGS:-} \
+    "$ROOT_DIR"/src/*.c "$ROOT_DIR"/src-xpu/dispatch.c $XPU_POSIX_SOURCES \
+    -I"$ROOT_DIR/src" \
     -ldl

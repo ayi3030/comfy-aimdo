@@ -48,6 +48,9 @@ if lib is not None:
 
 class ModelVBAR:
     def __init__(self, size, device):
+        # 守卫：XPU 等未启用/未构建后端时，给出明确错误而不是 AttributeError。
+        if control.lib is None:
+            raise RuntimeError("comfy-aimdo 未初始化或当前后端(XPU 等)未启用；ModelVBAR 不可用")
         self._devctx = control.get_devctx(device)
         self._ptr = lib.vbar_allocate(self._devctx, int(size), device)
         if not self._ptr:

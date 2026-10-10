@@ -26,6 +26,9 @@ if lib is not None:
 
 class VRAMBuffer:
     def __init__(self, max_size, device):
+        # 守卫：XPU 等未启用/未构建后端时，给出明确错误而不是 AttributeError。
+        if control.lib is None:
+            raise RuntimeError("comfy-aimdo 未初始化或当前后端(XPU 等)未启用；VRAMBuffer 不可用")
         self._devctx = control.get_devctx(device)
         self.device = device
         self.max_size = max_size

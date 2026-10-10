@@ -21,8 +21,8 @@ typedef struct ModelVBAR ModelVBAR;
 typedef struct HostbufFileReaderSlot {
     uint8_t *buffer;
     uint64_t offset;
-    CUstream stream;
-    CUevent event;
+    gpu_stream_t stream;
+    gpu_event_t event;
 } HostbufFileReaderSlot;
 
 typedef struct AimdoContext {

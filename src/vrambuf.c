@@ -68,7 +68,7 @@ void *vrambuf_create(int device, size_t max_size) {
     mutex_unlock((Mutex)va_pool_lock);
 #endif
 
-    buf = (VramBuffer *)calloc(1, sizeof(*buf) + sizeof(CUmemGenericAllocationHandle) * max_size / VRAM_CHUNK_SIZE);
+    buf = (VramBuffer *)calloc(1, sizeof(*buf) + sizeof(gpu_mem_handle_t) * max_size / VRAM_CHUNK_SIZE);
     if (!buf) {
         return NULL;
     }
@@ -88,8 +88,8 @@ SHARED_EXPORT
 bool vrambuf_grow(void *arg, size_t required_size) {
     VramBuffer *buf = (VramBuffer *)arg;
     size_t grow_to;
-    CUmemGenericAllocationHandle handle;
-    CUresult err;
+    gpu_mem_handle_t handle;
+    gpu_result_t err;
 
     if (!buf) {
         return false;
@@ -115,15 +115,15 @@ bool vrambuf_grow(void *arg, size_t required_size) {
         if (to_allocate > VRAM_CHUNK_SIZE) {
             to_allocate = VRAM_CHUNK_SIZE;
         }
-        if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != CUDA_SUCCESS) {
-            if (err != CUDA_ERROR_OUT_OF_MEMORY) {
+        if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != GPU_SUCCESS) {
+            if (err != GPU_ERROR_OUT_OF_MEMORY) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
                 return false;
             }
             log(DEBUG, "Pytorch allocator attempt exceeds available VRAM ...\n");
             vbars_free(VRAM_CHUNK_SIZE);
-            if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != CUDA_SUCCESS) {
-                bool is_oom = err == CUDA_ERROR_OUT_OF_MEMORY;
+            if ((err = three_stooges(buf->base_ptr + buf->allocated, to_allocate, buf->device, &handle)) != GPU_SUCCESS) {
+                bool is_oom = err == GPU_ERROR_OUT_OF_MEMORY;
                 log(is_oom ? INFO : AIMDO_LOG_ERROR, "VRAM Allocation failed (%s)\n", is_oom ? "OOM" : "error");
                 return false;
             }
@@ -137,7 +137,7 @@ bool vrambuf_grow(void *arg, size_t required_size) {
 }
 
 SHARED_EXPORT
-CUdeviceptr vrambuf_get(void *arg) {
+gpu_deviceptr_t vrambuf_get(void *arg) {
     VramBuffer *buf = (VramBuffer *)arg;
 
     if (!buf) {

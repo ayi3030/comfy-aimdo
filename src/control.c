@@ -20,10 +20,10 @@ static size_t calculate_integrated_ram_headroom(size_t total_bytes) {
     return headroom;
 }
 
-static bool is_integrated_cuda_device(CUdevice dev) {
+static bool is_integrated_cuda_device(gpu_device_t dev) {
     int integrated = 0;
 
-    return CHECK_CU(cuDeviceGetAttribute(&integrated, CU_DEVICE_ATTRIBUTE_INTEGRATED, dev)) &&
+    return CHECK_CU(cuDeviceGetAttribute(&integrated, GPU_DEVICE_ATTRIBUTE_INTEGRATED, dev)) &&
            integrated;
 }
 
@@ -97,7 +97,7 @@ bool set_devctx_for_device(int device_id) {
 }
 
 bool set_devctx_for_current_cuda_device(void) {
-    CUdevice device;
+    gpu_device_t device;
 
     if (!CHECK_CU(cuCtxGetDevice(&device))) {
         set_devctx(NULL);
@@ -237,7 +237,7 @@ bool init(const int *cuda_device_ids, const uint64_t *extra_vram_headrooms, size
     g_all_devctx_count = num_devices;
 
     for (i = 0; i < num_devices; i++) {
-        CUdevice dev;
+        gpu_device_t dev;
         char dev_name[256];
         AimdoContext *devctx = &g_all_devctxs[i];
 

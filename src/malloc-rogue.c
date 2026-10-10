@@ -3,7 +3,7 @@
 
 typedef struct Rogue {
     VirtualRange *range;
-    CUdeviceptr ptr;
+    gpu_deviceptr_t ptr;
     PhysicalPage **pages;
     size_t page_count;
     bool freeing;
@@ -12,13 +12,13 @@ typedef struct Rogue {
 } Rogue;
 
 typedef struct RogueCandidate {
-    CUdeviceptr ptr;
+    gpu_deviceptr_t ptr;
     bool freed;
 
     struct RogueCandidate *next;
 } RogueCandidate;
 
-static void unregister_candidate(CUdeviceptr ptr) {
+static void unregister_candidate(gpu_deviceptr_t ptr) {
     RogueCandidate **entry = (RogueCandidate **)&global_rogue_candidates;
     while (*entry && (*entry)->ptr != ptr) {
         entry = &(*entry)->next;
@@ -30,7 +30,7 @@ static void unregister_candidate(CUdeviceptr ptr) {
     }
 }
 
-bool register_rogue_candidate(CUdeviceptr ptr) {
+bool register_rogue_candidate(gpu_deviceptr_t ptr) {
     RogueCandidate *candidate = malloc(sizeof(*candidate));
     if (!candidate) {
         return false;
@@ -44,13 +44,13 @@ bool register_rogue_candidate(CUdeviceptr ptr) {
     return true;
 }
 
-void unregister_rogue_candidate(CUdeviceptr ptr) {
+void unregister_rogue_candidate(gpu_deviceptr_t ptr) {
     allocations_lock();
     unregister_candidate(ptr);
     allocations_unlock();
 }
 
-bool rogue_candidate_freed(CUdeviceptr ptr) {
+bool rogue_candidate_freed(gpu_deviceptr_t ptr) {
     allocations_lock();
     RogueCandidate *candidate = global_rogue_candidates;
     while (candidate && candidate->ptr != ptr) {
@@ -61,7 +61,7 @@ bool rogue_candidate_freed(CUdeviceptr ptr) {
     return freed;
 }
 
-RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
+RogueHandoff handoff_rogue(VirtualRange *range, gpu_deviceptr_t ptr,
                            PhysicalPage **pages, size_t page_count) {
     Rogue *rogue = malloc(sizeof(*rogue));
     PhysicalPage **references = calloc(page_count, sizeof(*references));
@@ -73,7 +73,7 @@ RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
     }
 
     size_t page_bytes = pages[0]->allocation->bytes;
-    CUdeviceptr address = ptr - (ptr - virtual_range_get(range)) % page_bytes;
+    gpu_deviceptr_t address = ptr - (ptr - virtual_range_get(range)) % page_bytes;
     for (size_t i = 0; i < page_count; i++) {
         references[i] = physical_page_ref(pages[i], 0);
         if (!references[i]) {
@@ -123,7 +123,7 @@ RogueHandoff handoff_rogue(VirtualRange *range, CUdeviceptr ptr,
     return result;
 }
 
-bool rogue_exists(CUdeviceptr ptr) {
+bool rogue_exists(gpu_deviceptr_t ptr) {
     allocations_lock();
     Rogue *rogue = rogues;
     while (rogue && rogue->ptr != ptr) {
@@ -133,7 +133,7 @@ bool rogue_exists(CUdeviceptr ptr) {
     return rogue != NULL;
 }
 
-bool free_rogue(CUdeviceptr ptr, int *result) {
+bool free_rogue(gpu_deviceptr_t ptr, int *result) {
     allocations_lock();
     Rogue **entry = (Rogue **)&rogues;
     while (*entry && (*entry)->ptr != ptr) {
@@ -149,14 +149,14 @@ bool free_rogue(CUdeviceptr ptr, int *result) {
             return false;
         }
         candidate->freed = true;
-        *result = CUDA_SUCCESS;
+        *result = GPU_SUCCESS;
         allocations_unlock();
         return true;
     }
 
     Rogue *rogue = *entry;
     if (rogue->freeing) {
-        *result = CUDA_SUCCESS;
+        *result = GPU_SUCCESS;
         allocations_unlock();
         return true;
     }
@@ -165,12 +165,12 @@ bool free_rogue(CUdeviceptr ptr, int *result) {
 
     *result = cuCtxSynchronize();
     for (size_t i = 0; i < rogue->page_count; i++) {
-        CUresult status = physical_page_unref(rogue->pages[i]);
+        gpu_result_t status = physical_page_unref(rogue->pages[i]);
         if (!*result) {
             *result = status;
         }
     }
-    CUresult status = virtual_range_unref(rogue->range);
+    gpu_result_t status = virtual_range_unref(rogue->range);
     if (!*result) {
         *result = status;
     }

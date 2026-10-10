@@ -238,7 +238,7 @@ SHARED_EXPORT
 bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
                              uint64_t file_handle, uint64_t file_offset,
                              uint64_t size, uint64_t offset,
-                             cudaStream_t stream, uint64_t device_ptr) {
+                             gpu_stream_t stream, uint64_t device_ptr) {
     HostBuffer *hostbuf = (HostBuffer *)hostbuf_ptr;
     char *host;
 
@@ -275,8 +275,8 @@ bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
                 (ull)(offset + done));
             return false;
         }
-        CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)(device_ptr + done),
-                                                 host + done, chunk, (CUstream)stream);
+        gpu_result_t copy_result = cuMemcpyHtoDAsync((gpu_deviceptr_t)(device_ptr + done),
+                                                 host + done, chunk, (gpu_stream_t)stream);
         if (!CHECK_CU(copy_result)) {
             log(AIMDO_LOG_ERROR, "%s: device copy failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
                 __func__, (int)copy_result, (void *)(uintptr_t)(device_ptr + done),
