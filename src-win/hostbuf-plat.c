@@ -47,8 +47,9 @@ size_t hostbuf_reserve_granularity(void) {
  *       * g_hostbuf_pinned == 1  ⇔  xpu_host_alloc_is_pinned()==1  →  全程 zeMemAllocHost/zeMemFree
  *       * g_hostbuf_pinned == 0             →  全程 VirtualAlloc（与改前逐字节等价）
  *   - 若某次「超大整块」zeMemAllocHost 失败（如系统无法锁页 reserved_size），reserve
- *     返回 NULL，让 hostbuf_grow 走 OOM 失败路径（RAM 缓存优雅退回磁盘直通），
- *     不回退 VirtualAlloc，避免释放时 zeMemFree/free 混用。
+ *     返回 NULL，使 hostbuf 分配失败（hostbuf_grow 返回 false -> host_buffer.py 抛
+ *     RuntimeError，该 buffer 的 RAM 层缓存不可用）；此路径并不"优雅退回磁盘直通"。
+ *     不回退 VirtualAlloc，避免释放时 zeMemFree/free 混用（严慎微判定：宁失败不混用）。
  *
  * 注意：此分支仅当 AIMDO_XPU 构建（aimdo_xpu.dll）激活；CUDA/ROCm 走下方 #else，
  *       字节级保持不变。
@@ -116,7 +117,16 @@ void hostbuf_release_address_space(void *ptr, size_t size) {
         return;
     }
     if (g_hostbuf_pinned == 1) {
-        cuMemFreeHost(ptr);
+        /* AIMDO_XPU: cuMemFreeHost 在此展开为 g_gpu.p_mem_free_host。
+         * aimdo_cuda_runtime_cleanup() 会 memset(&g_gpu, 0) 把该指针清零；异步释放
+         * 工作线程或 Python GC 触发的 HostBuffer.__del__ 都可能在清零后调用本函数。
+         * 指针在"调用时刻"解引用，故仅在非空时才调用；为空说明 cleanup 已发生，
+         * 直接跳过——严禁回退 VirtualFree（该指针由 zeMemAllocHost 分配，是 L0 USM，
+         * 非 VirtualAlloc 管理，VirtualFree 在其上是未定义行为，即 compat-reviewer
+         * 否决的 candidate-A）。进程退出时跳过的这次释放是无害泄漏，由 OS 回收。 */
+        if (cuMemFreeHost) {
+            cuMemFreeHost(ptr);
+        }
         return;
     }
     VirtualFree(ptr, 0, MEM_RELEASE);

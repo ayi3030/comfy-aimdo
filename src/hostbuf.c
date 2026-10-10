@@ -108,7 +108,8 @@ static bool hostbuf_truncate_impl(HostBuffer *hostbuf, uint64_t size, bool do_un
         (ull)hostbuf->size, (ull)old_committed, (ull)new_committed);
     if (size >= hostbuf->size ||
         !hostbuf_prewarm_join() ||
-        (do_unregister && !CHECK_CU(cuMemHostUnregister((char *)hostbuf->base_address + size)))) {
+        (do_unregister && cuMemHostUnregister &&
+         !CHECK_CU(cuMemHostUnregister((char *)hostbuf->base_address + size)))) {
         return false;
     }
     if (new_committed < old_committed) {

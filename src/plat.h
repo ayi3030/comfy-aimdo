@@ -204,11 +204,11 @@ static inline int check_cu_impl(gpu_result_t res, const char *label, int oom_lev
     if (res != GPU_SUCCESS) {
         const char* desc;
         if (cuGetErrorString(res, &desc) != GPU_SUCCESS) {
-            desc = "<FATAL - CANNOT PARSE GPU ERROR CODE>";
+            desc = "<FATAL - CANNOT PARSE CUDA ERROR CODE>";
 
         }
         log(res == GPU_ERROR_OUT_OF_MEMORY ? oom_level : error_level,
-            "GPU API FAILED (%d): %s: %s\n", (int)res, label, desc);
+            "CUDA API FAILED (%d): %s: %s\n", (int)res, label, desc);
     }
     return (res == GPU_SUCCESS);
 }
