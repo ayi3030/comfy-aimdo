@@ -141,9 +141,11 @@ static ze_result_t (*p_zeDeviceGetMemoryProperties)(ze_device_handle_t, uint32_t
                                                     ze_device_memory_properties_t *);
 /* 页锁定宿主 USM（zeMemAllocHost）：XPU 等价 cudaHostRegister 的分配侧。
  * 设备可见、可被 GPU 直接 DMA，避免可分页宿主内存的暂存拷贝。可选符号：
- * 缺失或失败时回退 malloc（见 xpu_mem_alloc_host）。 */
-static ze_result_t (*p_zeMemAllocHost)(ze_context_handle_t, const void *, size_t, size_t,
-                                       ze_device_handle_t, void **);
+ * 缺失或失败时回退 malloc（见 xpu_mem_alloc_host）。
+ * 注：宿主 USM 与设备无关，zeMemAllocHost 真实签名为 5 参（无 device 参数）；
+ *     带 device 的是 zeMemAllocDevice（6 参）。此前误声明为 6 参会导致调用成功
+ *     但输出指针保持 NULL，使 L0 路径静默回退 malloc。 */
+static ze_result_t (*p_zeMemAllocHost)(ze_context_handle_t, const void *, size_t, size_t, void **);
 static ze_result_t (*p_zeMemFree)(ze_context_handle_t, void *);
 
 /* ---- 运行时状态 ---- */
@@ -303,8 +305,7 @@ static gpu_result_t xpu_mem_alloc_host(void **pp, size_t bytesize) {
         desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
         desc.flags = ZE_HOST_MEM_ALLOC_FLAG_DEFAULT;
         if (p_zeMemAllocHost &&
-            p_zeMemAllocHost(g_ze_ctx, &desc, 1, 0,
-                             g_ze_dev_count ? g_ze_devs[0] : NULL, &probe) == ZE_SUCCESS &&
+            p_zeMemAllocHost(g_ze_ctx, &desc, 1, 0, &probe) == ZE_SUCCESS &&
             probe != NULL) {
             if (p_zeMemFree) {
                 p_zeMemFree(g_ze_ctx, probe);
@@ -313,6 +314,8 @@ static gpu_result_t xpu_mem_alloc_host(void **pp, size_t bytesize) {
         } else {
             g_host_use_l0 = 0;
         }
+        log(INFO, "comfy-aimdo XPU: hostbuf alloc path = %s\n",
+            g_host_use_l0 == 1 ? "L0 page-locked USM (zeMemAllocHost)" : "malloc fallback");
     }
     if (g_host_use_l0 == 1) {
         ze_host_mem_alloc_desc_t desc;
@@ -321,8 +324,7 @@ static gpu_result_t xpu_mem_alloc_host(void **pp, size_t bytesize) {
         memset(&desc, 0, sizeof(desc));
         desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
         desc.flags = ZE_HOST_MEM_ALLOC_FLAG_DEFAULT;
-        if (p_zeMemAllocHost(g_ze_ctx, &desc, bytesize ? bytesize : 1, 0,
-                             g_ze_dev_count ? g_ze_devs[0] : NULL, &p) == ZE_SUCCESS &&
+        if (p_zeMemAllocHost(g_ze_ctx, &desc, bytesize ? bytesize : 1, 0, &p) == ZE_SUCCESS &&
             p != NULL) {
             *pp = p;
             return GPU_SUCCESS;
