@@ -125,7 +125,12 @@ typedef enum CUdriverProcAddressQueryResult_enum {
 #if defined(AIMDO_XPU)
 typedef int    gpu_result_t;
 typedef void  *gpu_device_t;
-typedef void  *gpu_deviceptr_t;
+/* XPU 分支的 gpu_deviceptr_t 必须是整型而非 void*：共享的 src/*.c（malloc-graph /
+ * vrambuf / model-vbar 等）对设备地址做指针偏移算术（如 ptr + value * MG_PAGE），
+ * 在 MSVC 上 void* 算术会报 C2036（'void *': unknown size）；CUDA 分支的
+ * gpu_deviceptr_t = CUdeviceptr = unsigned long long 本就是整型，语义一致。
+ * 改用 uintptr_t 既支持算术、又能无损承载 64 位地址，CUDA/ROCm 分支不受影响。 */
+typedef uintptr_t gpu_deviceptr_t;
 typedef void  *gpu_mem_handle_t;
 typedef void  *gpu_stream_t;   /* Level Zero 无 CUDA stream 概念，占位 */
 typedef void  *gpu_event_t;    /* Level Zero 事件用占位实现 */
