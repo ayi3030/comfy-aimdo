@@ -1,6 +1,9 @@
 LIBRARY ze_loader.dll
 EXPORTS
     zeInit
+    zeMemAllocHost
+    zeMemFree
+    zeMemGetAllocProperties
     zePhysicalMemCreate
     zePhysicalMemDestroy
     zeVirtualMemFree
