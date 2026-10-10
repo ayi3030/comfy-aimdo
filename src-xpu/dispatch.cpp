@@ -615,19 +615,88 @@ CUresult xpu_free_async(CUdeviceptr pointer, CUstream stream) {
     }
 }
 
+/* Process-wide host-allocation path decision, resolved once on the first host
+ * allocation: -1 = not yet decided, 0 = CRT malloc (pageable), 1 = Level Zero
+ * page-locked USM. The RAM layer's HostBuffer reaches here through cuMemAllocHost
+ * -> g_cuda.p_cuMemAllocHost, so this single decision makes ALL hostbuf memory
+ * either page-locked USM or pageable malloc -- never a mix. Mixing the two is
+ * UB (std::free on a USM block, or zeMemFree on a CRT block). */
+std::atomic<int> g_host_use_l0{-1};
+
 CUresult xpu_host_alloc(void **pointer, size_t size) {
     if (!pointer) {
         return kCudaErrorUnknown;
     }
-    /* Reverted: backing this with sycl::malloc_host made the failure worse,
-     * turning a 64 MiB copy's OUT_OF_DEVICE_MEMORY into DEVICE_LOST and
-     * moving it 56 seconds earlier. Keep pageable staging until the copy
-     * failure itself is understood. */
+    auto *state = current_device();
+    if (g_host_use_l0 < 0) {
+        /* One-time capability probe: allocate and immediately release one byte
+         * of host USM. Doing it once here (rather than per call) keeps the whole
+         * process on a single, self-consistent free path. */
+        g_host_use_l0 = 0;
+        if (state && state->context) {
+            ze_host_mem_alloc_desc_t probe_desc = {};
+            probe_desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+            void *probe = nullptr;
+            if (zeMemAllocHost(state->context, &probe_desc, 1, 0, &probe) ==
+                    ZE_RESULT_SUCCESS && probe) {
+                zeMemFree(state->context, probe);
+                g_host_use_l0 = 1;
+            }
+        }
+        std::fprintf(stderr,
+                     "[aimdo] comfy-aimdo XPU: hostbuf alloc path = %s\n",
+                     g_host_use_l0 == 1
+                         ? "L0 page-locked USM (zeMemAllocHost)"
+                         : "malloc fallback");
+        std::fflush(stderr);
+    }
+    if (g_host_use_l0 == 1 && state && state->context) {
+        /* 5-arg zeMemAllocHost: (context, host_desc, size, alignment, pptr).
+         * Host USM is device-independent, so there is deliberately NO device
+         * argument (that belongs to zeMemAllocDevice). */
+        ze_host_mem_alloc_desc_t desc = {};
+        desc.stype = ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC;
+        void *allocated = nullptr;
+        if (zeMemAllocHost(state->context, &desc, size ? size : 1, 0,
+                           &allocated) == ZE_RESULT_SUCCESS && allocated) {
+            *pointer = allocated;
+            return CUDA_SUCCESS;
+        }
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+    /* Pageable fallback. NOT sycl::malloc_host: an earlier attempt to back this
+     * with the SYCL USM allocator made the observed failure strictly worse -- a
+     * 64 MiB copy's OUT_OF_DEVICE_MEMORY turned into DEVICE_LOST and moved 56
+     * seconds earlier -- so host memory stays on the plain CRT heap unless the
+     * L0 path above is available. */
     *pointer = std::malloc(size);
     return *pointer ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
 }
 
 CUresult xpu_host_free(void *pointer) {
+    if (!pointer) {
+        return CUDA_SUCCESS;
+    }
+    /* Pair the release with the allocation by PROPERTY, never by guess: ask
+     * Level Zero whether this address is one of its USM allocations. */
+    auto *state = current_device();
+    if (state && state->context) {
+        ze_memory_allocation_properties_t props = {};
+        props.stype = ZE_STRUCTURE_TYPE_MEMORY_ALLOCATION_PROPERTIES;
+        ze_device_handle_t owner_device = nullptr;
+        if (zeMemGetAllocProperties(state->context, pointer, &props,
+                                    &owner_device) == ZE_RESULT_SUCCESS) {
+            return from_ze(zeMemFree(state->context, pointer));
+        }
+        std::free(pointer);
+        return CUDA_SUCCESS;
+    }
+    /* No live L0 context (teardown ran). If this process chose the L0 path the
+     * address is USM and must NOT go to std::free (UB); skip -- the OS reclaims
+     * it at process exit. Otherwise it is a plain CRT block. */
+    if (g_host_use_l0 == 1) {
+        return CUDA_SUCCESS;
+    }
     std::free(pointer);
     return CUDA_SUCCESS;
 }
@@ -1535,6 +1604,15 @@ AIMDO_XPU_EXPORT void *xpu_alloc_fn(
 AIMDO_XPU_EXPORT void xpu_free_fn(
     void *pointer, size_t, int, sycl::queue *queue) {
     free_torch_block(pointer, queue);
+}
+
+/* Read-only view of the process-wide host-allocation decision, for the Windows
+ * hostbuf layer (src-win/hostbuf-plat.c). That layer must allocate host memory
+ * the same way this translation unit frees it, so it consults this instead of
+ * assuming a backend. Returns 1 (L0 page-locked USM), 0 (pageable CRT), or -1
+ * if no host allocation has happened yet. */
+AIMDO_XPU_EXPORT int xpu_host_alloc_is_pinned(void) {
+    return g_host_use_l0;
 }
 
 AIMDO_XPU_EXPORT void *xpu_raw_alloc_fn(

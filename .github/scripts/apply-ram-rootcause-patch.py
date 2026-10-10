@@ -38,7 +38,17 @@ FILES = {
     "plat_h": os.path.join(BASE, "src", "plat.h"),
     "control_c": os.path.join(BASE, "src", "control.c"),
     "shmem_c": os.path.join(BASE, "src-win", "shmem-detect.c"),
+    "hostbuf_plat_c": os.path.join(BASE, "src-win", "hostbuf-plat.c"),
 }
+
+
+# Original hostbuf-plat.c address-space functions (community cc3729f),
+# kept verbatim for the non-XPU #else branch of the injected block.
+_HB_HOSTBUF_ORIG = 'void *hostbuf_reserve_address_space(size_t size) {\n    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);\n}\n\nbool hostbuf_commit_address_space(void *ptr, size_t size) {\n    return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) == ptr;\n}\n\nbool hostbuf_decommit_address_space(void *ptr, size_t size) {\n    return VirtualFree(ptr, size, MEM_DECOMMIT);\n}\n\nvoid hostbuf_release_address_space(void *ptr, size_t size) {\n    if (ptr) {\n        VirtualFree(ptr, 0, MEM_RELEASE);\n    }\n}'
+
+# XPU page-locked host buffer branch (#if defined(AIMDO_XPU)); it wraps
+# _HB_HOSTBUF_ORIG verbatim inside the #else arm.
+_HB_HOSTBUF_NEW = '#if defined(AIMDO_XPU)\n/* ==========================================================================\n * XPU (Intel Arc / oneAPI Level Zero) RAM-layer host buffer: page-locked,\n * device-visible host USM via zeMemAllocHost, reached through the cuMemAllocHost\n * macro -> g_cuda.p_cuMemAllocHost -> xpu_host_alloc. This is the L0 equivalent\n * of NVIDIA\'s cuMemHostRegister\'d page-locked host memory, so the RAM cache is\n * genuinely pinned + DMA-visible instead of pageable.\n *\n * L0 host USM is a single "allocate = already pinned and committed" block (no\n * reserve/commit/register split), so the whole reserved_size is allocated at\n * once and commit/decommit become bookkeeping no-ops. The process-wide decision\n * (L0 USM vs pageable malloc) is made once inside xpu_host_alloc and read back\n * through xpu_host_alloc_is_pinned(), which keeps this allocation path in\n * lockstep with the release path (xpu_host_free) -- no zeMemFree/std::free mix.\n *\n * If a large whole-block zeMemAllocHost fails, reserve returns NULL so the\n * hostbuf allocation fails (hostbuf_grow -> false -> host_buffer.py raises\n * RuntimeError and that buffer\'s RAM cache is simply unavailable). This is NOT a\n * "graceful fall back to disk pass-through", and it deliberately does NOT fall\n * back to VirtualAlloc: a VirtualAlloc\'d range later released through\n * cuMemFreeHost would mix allocators. Fail, do not mix.\n *\n * src-win/ is not overlaid by the build workflow, so this reaches the DLL only\n * through apply-ram-rootcause-patch.py -- which is why the edit lives here.\n * ======================================================================== */\nextern int xpu_host_alloc_is_pinned(void);\n\nstatic int g_hostbuf_pinned = -1;  /* -1 unknown, 0 pageable, 1 L0 USM */\n\nstatic int hostbuf_xpu_probe_pinned(void) {\n    /* Force xpu_host_alloc\'s one-time decision with a 1-byte allocate/release,\n     * then read back the exact mode the free path will use. */\n    void *p = NULL;\n\n    if (cuMemAllocHost(&p, 1) == CUDA_SUCCESS && p) {\n        cuMemFreeHost(p);\n    }\n    g_hostbuf_pinned = (xpu_host_alloc_is_pinned() == 1) ? 1 : 0;\n    return g_hostbuf_pinned;\n}\n\nvoid *hostbuf_reserve_address_space(size_t size) {\n    if (g_hostbuf_pinned < 0) {\n        hostbuf_xpu_probe_pinned();\n    }\n    if (g_hostbuf_pinned == 1) {\n        void *p = NULL;\n        if (cuMemAllocHost(&p, size) == CUDA_SUCCESS && p) {\n            return p;\n        }\n        return NULL;  /* OOM: fail the hostbuf, never mix in VirtualAlloc */\n    }\n    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);\n}\n\nbool hostbuf_commit_address_space(void *ptr, size_t size) {\n    if (g_hostbuf_pinned == 1) {\n        /* zeMemAllocHost already committed and pinned the whole block. */\n        (void)ptr;\n        (void)size;\n        return true;\n    }\n    return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) == ptr;\n}\n\nbool hostbuf_decommit_address_space(void *ptr, size_t size) {\n    if (g_hostbuf_pinned == 1) {\n        /* USM cannot be partially released; the whole block is freed in\n         * hostbuf_release_address_space(). This is a no-op: pinned host memory\n         * is never returned to the OS mid-life. */\n        (void)ptr;\n        (void)size;\n        return true;\n    }\n    return VirtualFree(ptr, size, MEM_DECOMMIT);\n}\n\nvoid hostbuf_release_address_space(void *ptr, size_t size) {\n    (void)size;\n    if (!ptr) {\n        return;\n    }\n    if (g_hostbuf_pinned == 1) {\n        /* cuMemFreeHost is NULL-safe across teardown (F-1 guard in src/plat.h):\n         * the async decommit worker or a HostBuffer.__del__ can still run after\n         * aimdo_cuda_runtime_cleanup() zeroed the dispatch table. */\n        cuMemFreeHost(ptr);\n        return;\n    }\n    VirtualFree(ptr, 0, MEM_RELEASE);\n}\n#else  /* CUDA / ROCm / other Windows backends: unchanged, byte for byte */\nvoid *hostbuf_reserve_address_space(size_t size) {\n    return VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS);\n}\n\nbool hostbuf_commit_address_space(void *ptr, size_t size) {\n    return VirtualAlloc(ptr, size, MEM_COMMIT, PAGE_READWRITE) == ptr;\n}\n\nbool hostbuf_decommit_address_space(void *ptr, size_t size) {\n    return VirtualFree(ptr, size, MEM_DECOMMIT);\n}\n\nvoid hostbuf_release_address_space(void *ptr, size_t size) {\n    if (ptr) {\n        VirtualFree(ptr, 0, MEM_RELEASE);\n    }\n}\n#endif'
 
 
 def read(p):
@@ -276,6 +286,31 @@ def main():
         "deficit_sync + (ssize_t)book_a -",
         "deficit_sync + (ssize_t)total_vram_usage -",
         already_marker="deficit_sync + (ssize_t)total_vram_usage -",
+    )
+
+    # ---- src/plat.h (F-1: NULL-safe host release across teardown) ----------
+    # aimdo_cuda_runtime_cleanup() memsets g_cuda to zero. An async decommit
+    # worker (src/hostbuf-decommit.c) or a HostBuffer.__del__ can still call
+    # cuMemFreeHost / cuMemHostUnregister after that, and the macro dereferences
+    # the slot at the CALL SITE -- so a zeroed slot is a NULL function-pointer
+    # crash. Make the two release macros NULL-safe: on a torn-down table they
+    # simply skip (a harmless leak reclaimed by the OS at exit). Only the
+    # release side is guarded; allocation never runs after teardown.
+    apply_edit(
+        "plat.h:cuMemFreeHost NULL-safe",
+        FILES["plat_h"],
+        "#define cuMemFreeHost               g_cuda.p_cuMemFreeHost",
+        "#define cuMemFreeHost(ptr)          (g_cuda.p_cuMemFreeHost ? "
+        "g_cuda.p_cuMemFreeHost(ptr) : CUDA_SUCCESS)",
+        already_marker="g_cuda.p_cuMemFreeHost ? g_cuda.p_cuMemFreeHost(ptr)",
+    )
+    apply_edit(
+        "plat.h:cuMemHostUnregister NULL-safe",
+        FILES["plat_h"],
+        "#define cuMemHostUnregister         g_cuda.p_cuMemHostUnregister",
+        "#define cuMemHostUnregister(ptr)    (g_cuda.p_cuMemHostUnregister ? "
+        "g_cuda.p_cuMemHostUnregister(ptr) : CUDA_SUCCESS)",
+        already_marker="g_cuda.p_cuMemHostUnregister ? g_cuda.p_cuMemHostUnregister(ptr)",
     )
 
     # ---- src/control.c ----------------------------------------------------
@@ -551,6 +586,21 @@ def main():
         already_marker="\"real-free-fit\"",
     )
 
+    # ---- src-win/hostbuf-plat.c (XPU page-locked host buffer) -------------
+    # The RAM layer's HostBuffer reserves its address space through
+    # hostbuf_reserve_address_space(). On XPU we make that page-locked,
+    # device-visible host USM (zeMemAllocHost via the cuMemAllocHost macro ->
+    # g_cuda.p_cuMemAllocHost -> xpu_host_alloc) instead of pageable VirtualAlloc.
+    # src-win/ is NOT overlaid by build-xpu-windows.yml, so this can reach the
+    # DLL only through this patch script.
+    apply_edit(
+        "hostbuf-plat.c:XPU pinned host buffer",
+        FILES["hostbuf_plat_c"],
+        _HB_HOSTBUF_ORIG,
+        _HB_HOSTBUF_NEW,
+        already_marker="g_hostbuf_pinned",
+    )
+
     verify_injected_shape()
 
     print("RAM-layer root-cause patch applied successfully.")
@@ -579,6 +629,7 @@ def verify_injected_shape():
     """
     plat = read(FILES["plat_h"])
     shmem = read(FILES["shmem_c"])
+    hostbuf = read(FILES["hostbuf_plat_c"])
 
     # 1. No variable may be named twice inside a function when one occurrence
     #    is part of a declaration list and another carries its own type: that
@@ -625,6 +676,24 @@ def verify_injected_shape():
         sys.exit("[FAIL] the deficit_cuda expression was altered; the vendor "
                  "headroom term must keep its original meaning and precedence.")
 
+    # 5. F-1: the release macros must be NULL-safe, or an async hostbuf release
+    #    after teardown would call through a zeroed (NULL) slot and crash.
+    if "g_cuda.p_cuMemFreeHost ? g_cuda.p_cuMemFreeHost(ptr)" not in plat:
+        sys.exit("[FAIL] cuMemFreeHost is not NULL-safe in src/plat.h; an async "
+                 "release after aimdo_cuda_runtime_cleanup() would crash.")
+    if "g_cuda.p_cuMemHostUnregister ? g_cuda.p_cuMemHostUnregister(ptr)" not in plat:
+        sys.exit("[FAIL] cuMemHostUnregister is not NULL-safe in src/plat.h.")
+
+    # 6. hostbuf-plat.c must carry the XPU pinned branch AND keep the original
+    #    VirtualAlloc path for every other backend.
+    if "g_hostbuf_pinned" not in hostbuf or "cuMemAllocHost(&p, size)" not in hostbuf:
+        sys.exit("[FAIL] src-win/hostbuf-plat.c is missing the XPU page-locked "
+                 "host-buffer branch; the RAM cache would stay pageable.")
+    if "VirtualAlloc(NULL, size, MEM_RESERVE, PAGE_NOACCESS)" not in hostbuf:
+        sys.exit("[FAIL] src-win/hostbuf-plat.c lost the original VirtualAlloc "
+                 "reserve path (non-XPU branch).")
+
+    print("  [ok]   hostbuf-plat.c XPU branch + plat.h NULL-safe release present")
     print("  [ok]   post-patch shape verified (no C2086, symbols consistent, "
           "vendor signal intact)")
 
