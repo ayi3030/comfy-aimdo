@@ -759,14 +759,16 @@ def is_ready():
 # Env var OmniXPU reads at its prestartup (must match upstream exactly).
 _XPU_ALLOCATOR_CAP_ENV = "OMNIXPU_XPU_MEMORY_FRACTION"
 # Headroom left for the driver / system pool so allocation failures become clean
-# OOM, not DEVICE_LOST. We drop from 4.0 GiB to ~1.5 GiB -- about 13.5% of the
-# B580's 11.084 GiB DXGI budget -- which lifts usable VRAM from ~7.08 GiB to
-# ~9.58 GiB. The xiangyuT community fork runs a 512 MiB headroom floor, but it
-# is backed by active VBAR budget-deficit eviction our stack lacks, so we keep
-# the larger ~1.5 GiB pad. Field verifier marks 1.5 GiB as the empirical floor;
-# going lower risks device-level allocation failures.
-_XPU_ALLOCATOR_CAP_HEADROOM_GIB = 1.5
-_XPU_ALLOCATOR_CAP_FLOOR = 0.30   # safety clamp only; real value is ~0.61
+# OOM, not DEVICE_LOST. Set to 1.0 GiB (~9% of the B580's 11.084 GiB DXGI budget),
+# lifting the per-process cap to allowed ~10.08 GiB. Intentionally permissive: the
+# real cold-start OOM fix is the DXGI budget seed (Lever A / coldstart-fit-fix
+# branch), which makes ComfyUI's dynamic-VRAM offloader aggressive during cold start
+# so the model's peak residency stays LOW -- the cap stops being the binding
+# constraint. xiangyuT runs an even smaller 512 MiB pad, but it is backed by VBAR
+# budget-deficit eviction our stack lacks, so 1.0 GiB is the conservative floor
+# pending Lever A validation on real hardware.
+_XPU_ALLOCATOR_CAP_HEADROOM_GIB = 1.0
+_XPU_ALLOCATOR_CAP_FLOOR = 0.30   # safety clamp only; real value is ~0.87
 _XPU_ALLOCATOR_CAP_CEIL = 0.90    # never exceed 0.90 (vs OmniXPU's 0.99)
 _xpu_allocator_cap_fraction = None  # cache for diagnostics / read-back
 
