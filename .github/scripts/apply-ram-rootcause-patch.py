@@ -38,6 +38,11 @@ FILES = {
     "plat_h": os.path.join(BASE, "src", "plat.h"),
     "control_c": os.path.join(BASE, "src", "control.c"),
     "shmem_c": os.path.join(BASE, "src-win", "shmem-detect.c"),
+    # USM-fragmentation recovery hook (B580): compiled from the community
+    # checkout but NOT overlaid by this repo, so the thin reclaim export is
+    # injected here for the same reason the RAM-layer fix injects into
+    # plat.h / control.c / shmem-detect.c.
+    "model_vbar_c": os.path.join(BASE, "src", "model-vbar.c"),
 }
 
 
@@ -152,12 +157,16 @@ def guard_no_preexisting_symbols(base):
     patterns = [
         ("uint64_t external_vram_usage =", "definition of external_vram_usage"),
         ("void aimdo_set_external_vram_usage", "definition of aimdo_set_external_vram_usage"),
+        ("size_t aimdo_xpu_force_vbar_reclaim(void)", "definition of aimdo_xpu_force_vbar_reclaim"),
     ]
     # Files this script edits, and the exact text it writes into each.
     ours = {
         os.path.normpath(FILES["control_c"]): (
             "uint64_t external_vram_usage = 0;",
             "void aimdo_set_external_vram_usage(uint64_t usage) {",
+        ),
+        os.path.normpath(FILES["model_vbar_c"]): (
+            "size_t aimdo_xpu_force_vbar_reclaim(void) { return vbars_free_all_retired(); }",
         ),
     }
     exts = (".c", ".h", ".cpp", ".hpp", ".cc")
@@ -551,6 +560,52 @@ def main():
         already_marker="\"real-free-fit\"",
     )
 
+    # ---- src/model-vbar.c -------------------------------------------------
+    # USM-fragmentation recovery hook (B580).  Expose a SAFE-boundary entry
+    # point that releases every RETIRED VBAR page (completed consumers only;
+    # pinned/active pages untouched; never waits; fails closed) so Python can
+    # call it at an owner boundary before retrying a large contiguous
+    # allocation that failed on fragmentation.  This is the C half of the
+    # comfy_aimdo.model_vbar.force_vbar_reclaim() path.
+    #
+    # model-vbar.c is compiled from the COMMUNITY checkout and is NOT overlaid
+    # by this repo, so the export is injected here (same reason the RAM-layer
+    # fix injects into plat.h/control.c/shmem-detect.c).  The export rides on
+    # SHARED_EXPORT (== __declspec(dllexport) on Windows, plat.h:45) exactly
+    # like every other vbar_*/aimdo_* symbol -- so it must NOT also be listed
+    # in src-xpu/ze_loader.def (that .def carries only the ze*/zel* proxy
+    # re-exports); a .def entry would be a duplicate export.
+    #
+    # ANCHOR (uniqueness): the tail of vbars_free_all_retired(),
+    #     "    return freed_total;\n}\n#endif"
+    # is the ONLY such run in the file -- the other "return freed_total;" sits
+    # in the earlier vbars_free_*_except helper and is followed by a comment,
+    # not #endif.  Placing the definition here keeps it AFTER its callee and
+    # INSIDE the same `#if defined(AIMDO_XPU) && (Windows)` block (which closes
+    # at this #endif), so it needs no forward declaration and is a no-op off
+    # the XPU/Windows build (matching SHARED_EXPORT's empty form there).
+    apply_edit(
+        "model-vbar.c:force_vbar_reclaim export",
+        FILES["model_vbar_c"],
+        "    return freed_total;\n}\n#endif",
+        (
+            "    return freed_total;\n"
+            "}\n"
+            "\n"
+            "/* USM-fragmentation recovery hook (B580): release every retired\n"
+            " * VBAR page from a SAFE Python owner boundary. Only retired\n"
+            " * (completed-consumer) pages are freed; pinned/active pages are\n"
+            " * never touched, it never waits, and it fails closed -- exactly\n"
+            " * vbars_free_all_retired()'s contract. Reached from\n"
+            " * comfy_aimdo.model_vbar.force_vbar_reclaim() before retrying a\n"
+            " * large contiguous allocation that failed on fragmentation. */\n"
+            "SHARED_EXPORT\n"
+            "size_t aimdo_xpu_force_vbar_reclaim(void) { return vbars_free_all_retired(); }\n"
+            "#endif"
+        ),
+        already_marker="aimdo_xpu_force_vbar_reclaim",
+    )
+
     verify_injected_shape()
 
     print("RAM-layer root-cause patch applied successfully.")
@@ -579,6 +634,7 @@ def verify_injected_shape():
     """
     plat = read(FILES["plat_h"])
     shmem = read(FILES["shmem_c"])
+    mvb = read(FILES["model_vbar_c"])
 
     # 1. No variable may be named twice inside a function when one occurrence
     #    is part of a declaration list and another carries its own type: that
@@ -624,6 +680,26 @@ def verify_injected_shape():
     if "ssize_t deficit_cuda = headroom - (ssize_t)free_vram;" not in shmem:
         sys.exit("[FAIL] the deficit_cuda expression was altered; the vendor "
                  "headroom term must keep its original meaning and precedence.")
+
+    # 5. aimdo_xpu_force_vbar_reclaim (USM-fragmentation recovery hook) must be
+    #    defined exactly once, SHARED_EXPORT (so ctypes/xpu.py can bind it), and
+    #    delegate to vbars_free_all_retired() (retired-only, never-waits).  A
+    #    missing/duplicated definition is a link error or a silently-unbound
+    #    Python symbol; a wrong body would reclaim pinned pages (unsafe).  All
+    #    three must fail here rather than ship a half-working DLL.
+    reclaim_defs = re.findall(
+        r"size_t\s+aimdo_xpu_force_vbar_reclaim\s*\(\s*void\s*\)\s*\{", mvb)
+    if len(reclaim_defs) != 1:
+        sys.exit("[FAIL] aimdo_xpu_force_vbar_reclaim must be defined exactly "
+                 "once in src/model-vbar.c (got %d)" % len(reclaim_defs))
+    if not re.search(
+            r"SHARED_EXPORT\s*\n\s*size_t\s+aimdo_xpu_force_vbar_reclaim", mvb):
+        sys.exit("[FAIL] aimdo_xpu_force_vbar_reclaim must be SHARED_EXPORT so "
+                 "ctypes can bind it from the DLL export table")
+    if "return vbars_free_all_retired();" not in mvb:
+        sys.exit("[FAIL] aimdo_xpu_force_vbar_reclaim must delegate to "
+                 "vbars_free_all_retired() (retired-only, never-waits, "
+                 "fails-closed contract)")
 
     print("  [ok]   post-patch shape verified (no C2086, symbols consistent, "
           "vendor signal intact)")

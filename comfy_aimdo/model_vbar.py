@@ -102,6 +102,11 @@ _page_state_snapshot_supported = (
 )
 _prepare_allocation_supported = _has("vbars_prepare_allocation")
 _linux_consumer_queue_supported = _has("aimdo_xpu_register_consumer_queue")
+# USM-fragmentation recovery hook (B580). Optional: an older aimdo_xpu.dll
+# that predates this export simply reports False here, and force_vbar_reclaim()
+# degrades to a no-op (throttled warning) instead of raising -- so deploying
+# this Python against an old DLL, or rolling the DLL back, stays safe.
+_force_vbar_reclaim_supported = _has("aimdo_xpu_force_vbar_reclaim")
 
 _live_vbars = weakref.WeakSet()
 _CONSUMER_HOLD_EXTERNAL = 1
@@ -271,6 +276,13 @@ _bind(
     [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64],
 )
 
+# USM-fragmentation recovery hook: safe-boundary release of every RETIRED VBAR
+# page. Guarded by _force_vbar_reclaim_supported so an old DLL neither binds a
+# missing symbol nor litters _missing_symbols; force_vbar_reclaim() below is the
+# only caller and it re-checks the flag at call time.
+if _force_vbar_reclaim_supported:
+    _bind("aimdo_xpu_force_vbar_reclaim", [], ctypes.c_size_t)
+
 _linux_native_cache_trim_signature = {}
 
 # 限流告警：只提醒一次，避免在每权重热路径上刷屏。
@@ -289,6 +301,46 @@ def _warn_once(message):
         return
     _warned_messages.add(message)
     print(f"[AIMDO XPU] WARNING: {message}", file=sys.stderr, flush=True)
+
+
+def force_vbar_reclaim():
+    """Release every RETIRED VBAR page from a SAFE Python owner boundary.
+
+    USM-fragmentation recovery (B580). When a large contiguous allocation
+    fails on fragmentation -- device reports ample free VRAM but the driver
+    cannot place the block because resident VBAR pages + torch's cached blocks
+    have sliced the pool -- a caller at a Python boundary (NOT inside the
+    allocator/UR hook, where synchronous Level-Zero virtual-memory mutation
+    re-enters the SYCL queue and corrupts WDDM) calls this to hand the retired
+    VBAR pages back to the driver before retrying.
+
+    Only pages whose recorded consumers have completed are freed; pinned /
+    active pages are never touched, the call never waits on the compute queue,
+    and it fails closed -- exactly the vbars_free_all_retired() contract that
+    aimdo_xpu_force_vbar_reclaim() wraps. Returns the number of bytes freed.
+
+    Graceful degradation (rollback-safe): if the loaded aimdo_xpu.dll predates
+    this export, _force_vbar_reclaim_supported is False and this returns 0 with
+    a single throttled warning instead of raising. The retry path then proceeds
+    with only torch's empty_cache() half of the reclaim -- never a crash, and a
+    rolled-back old DLL keeps working.
+    """
+    if not _force_vbar_reclaim_supported:
+        _warn_once(
+            "aimdo_xpu.dll lacks aimdo_xpu_force_vbar_reclaim; VBAR reclaim "
+            "skipped (upgrade aimdo_xpu.dll to enable USM-fragmentation "
+            "recovery)"
+        )
+        return 0
+    try:
+        freed = int(lib.aimdo_xpu_force_vbar_reclaim())
+    except Exception as error:  # never let a reclaim probe break sampling
+        _warn_once(f"aimdo_xpu_force_vbar_reclaim failed: {error}")
+        return 0
+    print(f"[AIMDO XPU] force_vbar_reclaim: freed {freed} bytes "
+          f"({freed // (1024 * 1024)} MiB) of retired VBAR pages",
+          file=sys.stderr, flush=True)
+    return freed
 
 
 # 失败原因 -> 排查方向。三种原因若混成一句告警，真机排查会被引向错误方向
