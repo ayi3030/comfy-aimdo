@@ -759,13 +759,9 @@ def is_ready():
 # Env var OmniXPU reads at its prestartup (must match upstream exactly).
 _XPU_ALLOCATOR_CAP_ENV = "OMNIXPU_XPU_MEMORY_FRACTION"
 # Headroom left for the driver / system pool so allocation failures become clean
-# OOM, not DEVICE_LOST. We drop from 4.0 GiB to ~1.5 GiB -- about 13.5% of the
-# B580's 11.084 GiB DXGI budget -- which lifts usable VRAM from ~7.08 GiB to
-# ~9.58 GiB. The xiangyuT community fork runs a 512 MiB headroom floor, but it
-# is backed by active VBAR budget-deficit eviction our stack lacks, so we keep
-# the larger ~1.5 GiB pad. Field verifier marks 1.5 GiB as the empirical floor;
-# going lower risks device-level allocation failures.
-_XPU_ALLOCATOR_CAP_HEADROOM_GIB = 1.5
+# OOM, not DEVICE_LOST. 4 GiB mirrors Intel's own OMNI_COMFYUI_RESERVE_VRAM_GB
+# default reserve for DynamicVRAM -- a policy number, not the fraction itself.
+_XPU_ALLOCATOR_CAP_HEADROOM_GIB = 4.0
 _XPU_ALLOCATOR_CAP_FLOOR = 0.30   # safety clamp only; real value is ~0.61
 _XPU_ALLOCATOR_CAP_CEIL = 0.90    # never exceed 0.90 (vs OmniXPU's 0.99)
 _xpu_allocator_cap_fraction = None  # cache for diagnostics / read-back
