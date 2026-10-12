@@ -426,6 +426,74 @@ def _apply_extra_reserved_vram_override():
     )
 
 
+def _patch_get_free_memory_for_real_free():
+    """Lever A (coldstart-fit-fix, ROOT CAUSE): make ComfyUI's get_free_memory
+    report the REAL device free VRAM on XPU so the dynamic-VRAM offloader is
+    conservative during cold start.
+
+    ROOT CAUSE (traced this session, not assumed): comfy.model_management.
+    get_free_memory's XPU branch (mm:1933-1939) computes free as
+    device_total - torch_reserved. But in comfy_aimdo native_hook mode the model
+    weights live in AIMDO USM allocated OUTSIDE torch's caching allocator, so
+    torch_reserved sees only ~15 MiB while the device actually holds ~7.4 GiB.
+    get_free_memory therefore over-reports free by ~7.4 GiB -> load_models_gpu
+    (mm:1043 `current_free_mem = get_free_memory(torch_dev)`) computes an
+    inflated lowvram_model_memory (mm:1046) -> model_patcher.load keeps too much
+    weight in VRAM (mm:1004 `lowvram_fits`) -> cold-start device OOM. Every OTHER
+    backend branch (CUDA mm:1958 / NPU mm:1944 / MLU mm:1951) already uses
+    *_mem_get_info (real OS-level free); ONLY the XPU branch uses the torch-blind
+    path. This is why total_vram / EXTRA_RESERVED_VRAM overrides were no-ops: the
+    offloader's free-VRAM INPUT was itself fake.
+
+    FIX: when enabled, wrap get_free_memory so the XPU branch returns
+    torch.xpu.mem_get_info(dev)[0] (real device free, includes AIMDO USM),
+    matching the CUDA approach. lowvram_model_memory becomes realistic and the
+    offloader keeps LESS weight in VRAM -> lower cold-start peak.
+
+    Gated by AIMDO_XPU_REAL_FREE_VRAM (any non-empty value). Unset => get_free_
+    memory is NOT touched (fails closed, reversible). Non-XPU devices and any
+    error fall through to the original function unchanged. Idempotent (won't
+    double-wrap).
+    """
+    if not os.environ.get("AIMDO_XPU_REAL_FREE_VRAM"):
+        return
+    mm = sys.modules.get("comfy.model_management")
+    if mm is None or not hasattr(mm, "get_free_memory"):
+        logging.warning(
+            "comfy-aimdo XPU [Lever A]: comfy.model_management.get_free_memory "
+            "not available; skipping real-free patch"
+        )
+        return
+    if getattr(mm, "_aimdo_real_free_patched", False):
+        return
+    orig = mm.get_free_memory
+
+    def _real_free_get_free_memory(dev=None, torch_free_too=False):
+        try:
+            import torch
+            if dev is None:
+                dev = mm.get_torch_device()
+            if getattr(dev, "type", None) == "xpu":
+                free_bytes, _total = torch.xpu.mem_get_info(dev)  # real OS-level free, incl. AIMDO USM
+                if torch_free_too:
+                    stats = torch.xpu.memory_stats(dev)
+                    torch_free = int(stats["reserved_bytes.all.current"]) - int(stats["active_bytes.all.current"])
+                    return (int(free_bytes), torch_free)
+                return int(free_bytes)
+        except Exception as error:
+            logging.warning(
+                f"comfy-aimdo XPU [Lever A]: real-free get_free_memory fell back to original ({error})"
+            )
+        return orig(dev, torch_free_too)
+
+    mm.get_free_memory = _real_free_get_free_memory
+    mm._aimdo_real_free_patched = True
+    logging.info(
+        "comfy-aimdo XPU [Lever A]: get_free_memory patched to report REAL XPU "
+        "device free (torch.xpu.mem_get_info); offloader now sees true free VRAM."
+    )
+
+
 def init_devices(device_ids):
     global devctxs
 
@@ -463,6 +531,7 @@ def init_devices(device_ids):
     if lib.init(device_array, headroom_array, len(requested)):
         devctxs = [get_devctx(device_id) for device_id in requested]
         _apply_extra_reserved_vram_override()
+        _patch_get_free_memory_for_real_free()
         _register_atexit()
         return True
 
