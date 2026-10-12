@@ -367,57 +367,62 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
 
     return True
 
-def _apply_total_vram_override():
-    """Lever A (coldstart-fit-fix): optionally shrink ComfyUI's view of total VRAM
-    so its dynamic-VRAM offloader stays AGGRESSIVE during cold start and the
-    model's peak device residency stays LOW -- the true cold-start OOM root cause.
+def _apply_extra_reserved_vram_override():
+    """Lever A (coldstart-fit-fix): raise ComfyUI's EXTRA_RESERVED_VRAM so the
+    dynamic-VRAM offloader stays CONSERVATIVE during cold start and the model's
+    peak device residency stays LOW -- the true cold-start OOM root cause.
 
-    Background: the per-process allocator cap (xpu.py) only converts an
-    unrecoverable DEVICE_LOST into a clean, recoverable OOM; it cannot make H3
-    fit (peak ~7.66 GiB + ~2 GiB overhead ~= 9.86 GiB sits at the B580's edge).
-    Making ComfyUI's offloader conservative is what actually lowers peak
-    residency. NOTE: this is a different code path from shmem-detect.c, which
-    only drives AIMDO's OWN eviction (real_free_fit_deficit -> vbars_request_
-    reclaim) and never touches model_management.total_vram.
+    VERIFIED CONSUMER PATH (traced this session, not assumed): unlike
+    model_management.total_vram -- which is baked at import (mm:364/366/901) and
+    has ZERO post-import readers, so overriding it is a no-op (compat-reviewer-lva
+    RISK-1) -- EXTRA_RESERVED_VRAM is read LIVE via extra_reserved_memory() ->
+    minimum_inference_memory() (model_management.py:908-912) at every offloader
+    decision: lowvram weight budget (mm:1046), dynamic-VRAM MemoryCounter minimum
+    (model_patcher.py:1603), and load math (mm:964-965). Raising it makes the
+    offloader keep LESS in VRAM. This is exactly the lever the existing
+    --reserve-vram CLI flag drives (model_management.py:904-905).
 
-    Gated by AIMDO_XPU_TOTAL_VRAM_OVERRIDE_GIB (GiB). Unset / <= 0 => NO CHANGE
-    (reversible, fails closed). model_management.total_vram is expressed in MiB.
-    Suggested experimental value: 9.5 GiB (B580 DXGI budget 11.084 GiB minus a
-    ~1.6 GiB cold-start headroom) -- tune on real hardware.
+    Applied in init_devices (main.py:285, AFTER comfy.model_management is
+    imported), so the raised value is in effect before the first model load.
+
+    Gated by AIMDO_XPU_EXTRA_RESERVED_VRAM_GIB (GiB). Unset / <=0 / invalid /
+    non-finite => NO CHANGE (reversible, fails closed). EXTRA_RESERVED_VRAM is in
+    bytes. Suggested experimental value: 2.0 GiB (Windows default is 0.6 GiB);
+    tune on real hardware -- too high can push the whole model off-device.
     """
-    env = os.environ.get("AIMDO_XPU_TOTAL_VRAM_OVERRIDE_GIB")
+    env = os.environ.get("AIMDO_XPU_EXTRA_RESERVED_VRAM_GIB")
     if not env:
         return
     try:
-        override_gib = float(env)
+        reserve_gib = float(env)
     except ValueError:
         logging.warning(
-            "comfy-aimdo XPU [Lever A]: invalid AIMDO_XPU_TOTAL_VRAM_OVERRIDE_GIB="
-            f"{env!r}; ignoring total_vram override"
+            "comfy-aimdo XPU [Lever A]: invalid AIMDO_XPU_EXTRA_RESERVED_VRAM_GIB="
+            f"{env!r}; ignoring EXTRA_RESERVED_VRAM override"
         )
         return
-    if not math.isfinite(override_gib):
+    if not math.isfinite(reserve_gib):
         logging.warning(
-            "comfy-aimdo XPU [Lever A]: non-finite AIMDO_XPU_TOTAL_VRAM_OVERRIDE_GIB="
-            f"{env!r}; ignoring total_vram override"
+            "comfy-aimdo XPU [Lever A]: non-finite AIMDO_XPU_EXTRA_RESERVED_VRAM_GIB="
+            f"{env!r}; ignoring EXTRA_RESERVED_VRAM override"
         )
         return
-    if override_gib <= 0:
+    if reserve_gib <= 0:
         return
     mm = sys.modules.get("comfy.model_management")
-    if mm is None or not hasattr(mm, "total_vram"):
+    if mm is None or not hasattr(mm, "EXTRA_RESERVED_VRAM"):
         logging.warning(
-            "comfy-aimdo XPU [Lever A]: comfy.model_management.total_vram not "
-            "available yet; skipping total_vram override"
+            "comfy-aimdo XPU [Lever A]: comfy.model_management.EXTRA_RESERVED_VRAM not "
+            "available yet; skipping EXTRA_RESERVED_VRAM override"
         )
         return
-    new_total_vram_mib = int(override_gib * 1024)
-    old_mib = mm.total_vram
-    mm.total_vram = new_total_vram_mib
+    new_bytes = int(reserve_gib * 1024 ** 3)
+    old_bytes = mm.EXTRA_RESERVED_VRAM
+    mm.EXTRA_RESERVED_VRAM = new_bytes
     logging.info(
-        "comfy-aimdo XPU [Lever A]: total_vram override applied: "
-        f"{old_mib / 1024:.2f} GiB -> {override_gib:.2f} GiB ({new_total_vram_mib} MiB). "
-        "ComfyUI offloader is now conservative during cold start."
+        "comfy-aimdo XPU [Lever A]: EXTRA_RESERVED_VRAM override applied: "
+        f"{old_bytes / 1024 ** 3:.2f} GiB -> {reserve_gib:.2f} GiB. "
+        "ComfyUI offloader (minimum_inference_memory) now conservative during cold start."
     )
 
 
@@ -457,7 +462,7 @@ def init_devices(device_ids):
     headroom_array = (ctypes.c_uint64 * len(headrooms))(*headrooms)
     if lib.init(device_array, headroom_array, len(requested)):
         devctxs = [get_devctx(device_id) for device_id in requested]
-        _apply_total_vram_override()
+        _apply_extra_reserved_vram_override()
         _register_atexit()
         return True
 
