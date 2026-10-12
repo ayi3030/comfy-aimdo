@@ -793,12 +793,161 @@ class _DXGI_QUERY_VIDEO_MEMORY_INFO(ctypes.Structure):
     ]
 
 
-def _dxgi_local_budget_bytes():
-    """Return (budget_bytes, current_usage_bytes) from the DXGI LOCAL segment.
+class _CapLUID(ctypes.Structure):
+    _fields_ = [("LowPart", ctypes.c_uint32), ("HighPart", ctypes.c_int32)]
 
-    Best-effort Windows-only. Uses IDXGIAdapter3::QueryVideoMemoryInfo (vtable
-    index 14; verified on Arc B580 -- see probe_dxgi_free.py). Returns None when
-    DXGI is unavailable or the query fails so the caller can fail soft.
+
+class _DXGI_ADAPTER_DESC(ctypes.Structure):
+    """DXGI_ADAPTER_DESC (dxgi.h) -- the identity fields we match on."""
+
+    _fields_ = [
+        ("Description", ctypes.c_wchar * 128),
+        ("VendorId", ctypes.c_uint),
+        ("DeviceId", ctypes.c_uint),
+        ("SubSysId", ctypes.c_uint),
+        ("Revision", ctypes.c_uint),
+        ("DedicatedVideoMemory", ctypes.c_size_t),
+        ("DedicatedSystemMemory", ctypes.c_size_t),
+        ("SharedSystemMemory", ctypes.c_size_t),
+        ("AdapterLuid", _CapLUID),
+    ]
+
+
+# Upper bound on EnumAdapters ordinals; DXGI_ERROR_NOT_FOUND ends the walk.
+_DXGI_ADAPTER_ENUM_LIMIT = 8
+# IDXGIAdapter::GetDesc ordinal. Verified on Arc B580: it returns the real
+# adapter descriptions, which pins the chain IUnknown 0-2 / IDXGIObject 3-6 /
+# IDXGIAdapter 7-9 / IDXGIAdapter1 10 / IDXGIAdapter2 11 ...
+_DXGI_GETDESC_VTABLE_ORDINAL = 8
+# ...so IDXGIAdapter3 starts at 12 (RegisterHardwareContentProtection...)
+# and QueryVideoMemoryInfo is its third method => 14. Measured: ordinal 13
+# answers hr=0 but leaves Budget=0 for every adapter (it is
+# UnregisterHardwareContentProtectionTeardownStatusEvent), which would void
+# the cap silently via the budget<=0 fail-soft path.
+_DXGI_QVMI_VTABLE_ORDINAL = 14
+
+# Vendor/marketing tokens stripped before comparing adapter names.
+_DXGI_NAME_NOISE_TOKENS = (
+    "intel", "microsoft", "nvidia", "amd", "graphics", "gpu", "controller",
+    "adapter", "corporation", "corp", "inc", "series", "family", "r", "tm", "c",
+)
+
+
+def _normalize_adapter_name(name):
+    """Vendor-noise-free adapter name ("Intel(R) Arc(TM) B580 Graphics" ->
+    "arc b580") so a DXGI description can be compared with a torch name."""
+    words = []
+    current = []
+    for ch in str(name or "").lower():
+        if ch.isalnum():
+            current.append(ch)
+        elif current:
+            words.append("".join(current))
+            current = []
+    if current:
+        words.append("".join(current))
+    return " ".join(w for w in words if w not in _DXGI_NAME_NOISE_TOKENS)
+
+
+def _xpu_device_identity():
+    """Hardware identity of the current torch XPU device, for DXGI matching.
+
+    Returns ``{"vendor_id": int, "device_id": int, "name": str}``; unknown
+    fields stay 0 / "".
+
+    torch exposes a Level-Zero ``uuid``, NOT a Windows DXGI ``AdapterLuid``
+    (measured on B580: uuid ``86800be2-0000-0000-0800-...`` vs AdapterLuid
+    ``0x00009b9d`` -- unrelated), so a true LUID comparison is impossible
+    from Python here. What both APIs DO report identically is the PCI
+    vendor/device pair -- torch as ``device_id``, DXGI as
+    DXGI_ADAPTER_DESC.VendorId/DeviceId -- so that is the identity match.
+    """
+    ident = {"vendor_id": 0, "device_id": 0, "name": ""}
+    try:
+        import torch
+        xpu = getattr(torch, "xpu", None)
+        if xpu is None or not xpu.is_available():
+            return ident
+        idx = xpu.current_device()
+        props = xpu.get_device_properties(idx)
+        ident["device_id"] = int(getattr(props, "device_id", 0) or 0)
+        ident["name"] = str(getattr(props, "name", "") or "")
+        if not ident["name"]:
+            ident["name"] = str(xpu.get_device_name(idx) or "")
+        # Level-Zero uuid starts with the PCI vendor id + device id (LE).
+        head = str(getattr(props, "uuid", "") or "").replace("-", "")[:8]
+        if len(head) == 8:
+            try:
+                raw = bytes.fromhex(head)
+                ident["vendor_id"] = raw[0] | (raw[1] << 8)
+            except Exception:
+                ident["vendor_id"] = 0
+    except Exception:
+        return ident
+    return ident
+
+
+def _dxgi_probe_adapter(adapter):
+    """Return identity + LOCAL budget for one IDXGIAdapter, or None if unusable.
+
+    Raises on DXGI failure (ctypes turns a failure HRESULT into OSError); the
+    caller decides whether to skip the adapter or give up.
+    """
+    avt = ctypes.cast(adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+    desc = _DXGI_ADAPTER_DESC()
+    get_desc = ctypes.cast(
+        avt.contents[_DXGI_GETDESC_VTABLE_ORDINAL],
+        ctypes.CFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(_DXGI_ADAPTER_DESC)),
+    )
+    get_desc(adapter, ctypes.byref(desc))
+    query_iface = ctypes.cast(
+        avt.contents[0],
+        ctypes.CFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(_CapGUID),
+            ctypes.POINTER(ctypes.c_void_p)),
+    )
+    ad3 = ctypes.c_void_p()
+    query_iface(adapter, ctypes.byref(_IID_IDXGIAdapter3), ctypes.byref(ad3))
+    if not ad3:
+        return None
+    ad3_ptr = ctypes.cast(ad3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+    qvmi = ctypes.cast(
+        ad3_ptr.contents[_DXGI_QVMI_VTABLE_ORDINAL],
+        ctypes.CFUNCTYPE(
+            ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_uint, ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO)),
+    )
+    info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
+    qvmi(ad3, 0, 0, ctypes.byref(info))  # node 0, LOCAL segment
+    budget = int(info.Budget)
+    if budget <= 0:
+        # A zero budget means the query did not land on QueryVideoMemoryInfo
+        # (e.g. a future vtable drift); never present it as a real reading.
+        return None
+    return {
+        "description": str(desc.Description),
+        "vendor_id": int(desc.VendorId),
+        "device_id": int(desc.DeviceId),
+        "dedicated": int(desc.DedicatedVideoMemory),
+        "luid": (int(desc.AdapterLuid.LowPart), int(desc.AdapterLuid.HighPart)),
+        "budget": budget,
+        "usage": int(info.CurrentUsage),
+    }
+
+
+def _dxgi_local_budget_bytes():
+    """Return (budget_bytes, current_usage_bytes) from the DXGI LOCAL segment
+    of the adapter that matches the torch XPU device.
+
+    Best-effort Windows-only. Taking the first IDXGIAdapter3 is NOT safe: this
+    machine also exposes "Microsoft Basic Render Driver" (Budget 15.223 GiB,
+    DedicatedVideoMemory 0), and if it were picked the fraction would be
+    clamped to the 0.90 ceiling (10.44 GiB) instead of the correct ~7.08 GiB.
+
+    Matching order: PCI vendor+device id -> normalized device name -> explicit
+    loud fallback (never a silent index-0 pick). Returns None when DXGI is
+    unavailable or no usable adapter is found, so the caller can fail soft.
     """
     if platform.system() != "Windows":
         return None
@@ -806,6 +955,12 @@ def _dxgi_local_budget_bytes():
         dxgi = ctypes.windll.dxgi
     except Exception:
         return None
+    log = logging.getLogger("comfy_aimdo.xpu")
+    ident = _xpu_device_identity()
+    want_vendor = int(ident.get("vendor_id") or 0)
+    want_device = int(ident.get("device_id") or 0)
+    want_name = _normalize_adapter_name(ident.get("name"))
+    candidates = []
     try:
         create_factory = dxgi.CreateDXGIFactory1
         create_factory.argtypes = [ctypes.POINTER(_CapGUID), ctypes.c_void_p]
@@ -815,46 +970,83 @@ def _dxgi_local_budget_bytes():
         if hr < 0:
             return None
         vt = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-        enum_adapters1 = ctypes.cast(
+        enum_adapters = ctypes.cast(
             vt.contents[7],
             ctypes.CFUNCTYPE(
                 ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
                 ctypes.POINTER(ctypes.c_void_p)),
         )
-        adapter = ctypes.c_void_p()
         i = 0
-        while i <= 8:
-            hr = enum_adapters1(factory, i, ctypes.byref(adapter))
+        while i <= _DXGI_ADAPTER_ENUM_LIMIT:
+            adapter = ctypes.c_void_p()
+            try:
+                hr = enum_adapters(factory, i, ctypes.byref(adapter))
+            except OSError:
+                break  # DXGI_ERROR_NOT_FOUND: end of the adapter list
             if hr < 0:
                 break
-            ad_ptr = ctypes.cast(
-                adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-            query_iface = ctypes.cast(
-                ad_ptr.contents[0],
-                ctypes.CFUNCTYPE(
-                    ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(_CapGUID),
-                    ctypes.POINTER(ctypes.c_void_p)),
-            )
-            ad3 = ctypes.c_void_p()
-            hr = query_iface(adapter, ctypes.byref(_IID_IDXGIAdapter3),
-                             ctypes.byref(ad3))
-            if hr >= 0 and ad3:
-                ad3_ptr = ctypes.cast(
-                    ad3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-                qvmi = ctypes.cast(
-                    ad3_ptr.contents[14],
-                    ctypes.CFUNCTYPE(
-                        ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
-                        ctypes.c_uint, ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO)),
-                )
-                info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
-                hr = qvmi(ad3, 0, 0, ctypes.byref(info))  # node 0, LOCAL segment
-                if hr >= 0:
-                    return (int(info.Budget), int(info.CurrentUsage))
+            try:
+                probe = _dxgi_probe_adapter(adapter)
+            except Exception as exc:
+                probe = None
+                log.debug("comfy-aimdo XPU: DXGI adapter #%d unusable: %s", i, exc)
+            if probe is None:
+                log.debug("comfy-aimdo XPU: DXGI adapter #%d skipped "
+                          "(no usable LOCAL budget)", i)
+            else:
+                probe["index"] = i
+                candidates.append(probe)
             i += 1
     except Exception:
         return None
-    return None
+
+    if not candidates:
+        log.warning(
+            "comfy-aimdo XPU: no DXGI adapter reported a usable LOCAL budget; "
+            "allocator cap skipped (OmniXPU 0.99 retained)")
+        return None
+
+    def _fmt(c):
+        return "#%d %s vendor=0x%04x device=0x%04x budget=%.3f GiB " \
+               "dedicated=%.3f GiB" % (
+                   c["index"], c["description"], c["vendor_id"], c["device_id"],
+                   c["budget"] / 1024.0 ** 3, c["dedicated"] / 1024.0 ** 3)
+
+    picked = None
+    reason = ""
+    if want_device > 0:
+        for cand in candidates:
+            if cand["device_id"] == want_device and (
+                    want_vendor == 0 or cand["vendor_id"] == want_vendor):
+                picked, reason = cand, "pci-id"
+                break
+    if picked is None and want_name:
+        for cand in candidates:
+            cand_name = _normalize_adapter_name(cand["description"])
+            if cand_name and (cand_name in want_name or want_name in cand_name):
+                picked, reason = cand, "name"
+                break
+    if picked is None:
+        fallback = next((c for c in candidates if c["dedicated"] > 0), None)
+        reason = "fallback-dedicated-vram" if fallback is not None else "fallback-first"
+        picked = fallback if fallback is not None else candidates[0]
+        log.warning(
+            "comfy-aimdo XPU: no DXGI adapter matched the torch XPU device "
+            "(wanted name=%r vendor=0x%04x device=0x%04x); candidates=[%s]; "
+            "picked #%d %r (%s, budget=%.3f GiB) -- the allocator cap may be "
+            "based on the wrong adapter",
+            ident.get("name"), want_vendor, want_device,
+            "; ".join(_fmt(c) for c in candidates),
+            picked["index"], picked["description"], reason,
+            picked["budget"] / 1024.0 ** 3)
+    else:
+        log.info(
+            "comfy-aimdo XPU: DXGI adapter selected by %s: #%d %r "
+            "(vendor=0x%04x device=0x%04x, budget=%.3f GiB, dedicated=%.3f GiB)",
+            reason, picked["index"], picked["description"], picked["vendor_id"],
+            picked["device_id"], picked["budget"] / 1024.0 ** 3,
+            picked["dedicated"] / 1024.0 ** 3)
+    return (picked["budget"], picked["usage"])
 
 
 def recommend_xpu_allocator_fraction(
