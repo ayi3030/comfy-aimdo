@@ -27,6 +27,7 @@ import ctypes
 import logging
 import os
 import platform
+import re
 import sys
 
 import torch
@@ -820,17 +821,48 @@ _DXGI_ADAPTER_ENUM_LIMIT = 8
 # IDXGIAdapter 7-9 / IDXGIAdapter1 10 / IDXGIAdapter2 11 ...
 _DXGI_GETDESC_VTABLE_ORDINAL = 8
 # ...so IDXGIAdapter3 starts at 12 (RegisterHardwareContentProtection...)
-# and QueryVideoMemoryInfo is its third method => 14. Measured: ordinal 13
-# answers hr=0 but leaves Budget=0 for every adapter (it is
-# UnregisterHardwareContentProtectionTeardownStatusEvent), which would void
-# the cap silently via the budget<=0 fail-soft path.
+# and QueryVideoMemoryInfo is its third method => 14. Measured with a preset
+# sentinel: ordinal 13 returns hr=0 and DOES NOT TOUCH the struct at all -- the
+# sentinel survives untouched (ordinal 13 is
+# UnregisterHardwareContentProtectionTeardownStatusEvent). It only *looks* like
+# "Budget = 0" because a freshly built ctypes Structure is zero-initialised, so
+# the budget<=0 defence below clears the struct explicitly instead of relying
+# on that hidden premise. Ordinal 14 fills in 11.084 GiB / 15.223 GiB, matching
+# the differential probe.
 _DXGI_QVMI_VTABLE_ORDINAL = 14
+
+# Canonical uuid layout (8-4-4-4-12 hex). Anything else -- notably a future
+# torch that renders the type as "<torch._C._XPUuuid object at 0x...>" -- is
+# rejected explicitly rather than being swallowed as "vendor unknown".
+_UUID_RE = re.compile(r"\A[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\Z")
 
 # Vendor/marketing tokens stripped before comparing adapter names.
 _DXGI_NAME_NOISE_TOKENS = (
     "intel", "microsoft", "nvidia", "amd", "graphics", "gpu", "controller",
     "adapter", "corporation", "corp", "inc", "series", "family", "r", "tm", "c",
 )
+
+
+def _com_release(ptr):
+    """Drop one COM reference (IUnknown::Release, vtable ordinal 2).
+
+    Every pointer this module acquires -- the factory, each enumerated
+    IDXGIAdapter and each IDXGIAdapter3 from QueryInterface -- must be
+    released on every exit path. control.init()/deinit() cycling re-runs the
+    probe, so an unbalanced acquire accumulates per cycle.
+    """
+    try:
+        if ptr is None or not ptr.value:
+            return
+    except Exception:
+        return
+    try:
+        vt = ctypes.cast(ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+        ctypes.cast(
+            vt.contents[2],
+            ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p))(ptr)
+    except Exception:
+        pass
 
 
 def _normalize_adapter_name(name):
@@ -847,6 +879,22 @@ def _normalize_adapter_name(name):
     if current:
         words.append("".join(current))
     return " ".join(w for w in words if w not in _DXGI_NAME_NOISE_TOKENS)
+
+
+def _adapter_names_match(want, cand):
+    """Same device by name? Exact equality first.
+
+    Substring containment is only trusted when BOTH sides carry at least two
+    tokens: a one-token name like "arc" (from "Intel(R) Arc(TM) Graphics")
+    would otherwise be contained in "arc b580" and match the wrong adapter.
+    """
+    if not want or not cand:
+        return False
+    if want == cand:
+        return True
+    if len(want.split()) >= 2 and len(cand.split()) >= 2:
+        return want in cand or cand in want
+    return False
 
 
 def _xpu_device_identity():
@@ -874,14 +922,19 @@ def _xpu_device_identity():
         ident["name"] = str(getattr(props, "name", "") or "")
         if not ident["name"]:
             ident["name"] = str(xpu.get_device_name(idx) or "")
-        # Level-Zero uuid starts with the PCI vendor id + device id (LE).
-        head = str(getattr(props, "uuid", "") or "").replace("-", "")[:8]
-        if len(head) == 8:
-            try:
-                raw = bytes.fromhex(head)
-                ident["vendor_id"] = raw[0] | (raw[1] << 8)
-            except Exception:
-                ident["vendor_id"] = 0
+        # Level-Zero uuid starts with the PCI vendor id + device id (LE). The
+        # string is taken through str() because torch's _XPUuuid is a C++ type,
+        # so its rendering is validated before use rather than trusted -- a
+        # rejected format is logged instead of silently degrading to a
+        # device-id-only match.
+        text = str(getattr(props, "uuid", "") or "")
+        if _UUID_RE.match(text):
+            raw = bytes.fromhex(text.replace("-", "")[:8])
+            ident["vendor_id"] = raw[0] | (raw[1] << 8)
+        elif text:
+            logging.getLogger("comfy_aimdo.xpu").debug(
+                "comfy-aimdo XPU: device uuid %r is not the canonical "
+                "8-4-4-4-12 hex form; vendor id left unknown", text)
     except Exception:
         return ident
     return ident
@@ -909,31 +962,38 @@ def _dxgi_probe_adapter(adapter):
     )
     ad3 = ctypes.c_void_p()
     query_iface(adapter, ctypes.byref(_IID_IDXGIAdapter3), ctypes.byref(ad3))
-    if not ad3:
-        return None
-    ad3_ptr = ctypes.cast(ad3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-    qvmi = ctypes.cast(
-        ad3_ptr.contents[_DXGI_QVMI_VTABLE_ORDINAL],
-        ctypes.CFUNCTYPE(
-            ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
-            ctypes.c_uint, ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO)),
-    )
-    info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
-    qvmi(ad3, 0, 0, ctypes.byref(info))  # node 0, LOCAL segment
-    budget = int(info.Budget)
-    if budget <= 0:
-        # A zero budget means the query did not land on QueryVideoMemoryInfo
-        # (e.g. a future vtable drift); never present it as a real reading.
-        return None
-    return {
-        "description": str(desc.Description),
-        "vendor_id": int(desc.VendorId),
-        "device_id": int(desc.DeviceId),
-        "dedicated": int(desc.DedicatedVideoMemory),
-        "luid": (int(desc.AdapterLuid.LowPart), int(desc.AdapterLuid.HighPart)),
-        "budget": budget,
-        "usage": int(info.CurrentUsage),
-    }
+    try:
+        if not ad3.value:
+            return None
+        ad3_ptr = ctypes.cast(ad3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+        qvmi = ctypes.cast(
+            ad3_ptr.contents[_DXGI_QVMI_VTABLE_ORDINAL],
+            ctypes.CFUNCTYPE(
+                ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
+                ctypes.c_uint, ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO)),
+        )
+        info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
+        # Clear explicitly: the budget<=0 drift defence must not depend on a
+        # freshly built Structure happening to be zero-initialised.
+        ctypes.memset(ctypes.byref(info), 0, ctypes.sizeof(info))
+        qvmi(ad3, 0, 0, ctypes.byref(info))  # node 0, LOCAL segment
+        budget = int(info.Budget)
+        if budget <= 0:
+            # Nothing was written (e.g. a future vtable drift landed on an
+            # ordinal that does not touch the struct); never present it as a
+            # real reading.
+            return None
+        return {
+            "description": str(desc.Description),
+            "vendor_id": int(desc.VendorId),
+            "device_id": int(desc.DeviceId),
+            "dedicated": int(desc.DedicatedVideoMemory),
+            "luid": (int(desc.AdapterLuid.LowPart), int(desc.AdapterLuid.HighPart)),
+            "budget": budget,
+            "usage": int(info.CurrentUsage),
+        }
+    finally:
+        _com_release(ad3)
 
 
 def _dxgi_local_budget_bytes():
@@ -967,36 +1027,43 @@ def _dxgi_local_budget_bytes():
         create_factory.restype = ctypes.HRESULT
         factory = ctypes.c_void_p()
         hr = create_factory(ctypes.byref(_IID_IDXGIFactory1), ctypes.byref(factory))
-        if hr < 0:
+        if hr < 0 or not factory.value:
             return None
-        vt = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-        enum_adapters = ctypes.cast(
-            vt.contents[7],
-            ctypes.CFUNCTYPE(
-                ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
-                ctypes.POINTER(ctypes.c_void_p)),
-        )
-        i = 0
-        while i <= _DXGI_ADAPTER_ENUM_LIMIT:
-            adapter = ctypes.c_void_p()
-            try:
-                hr = enum_adapters(factory, i, ctypes.byref(adapter))
-            except OSError:
-                break  # DXGI_ERROR_NOT_FOUND: end of the adapter list
-            if hr < 0:
-                break
-            try:
-                probe = _dxgi_probe_adapter(adapter)
-            except Exception as exc:
-                probe = None
-                log.debug("comfy-aimdo XPU: DXGI adapter #%d unusable: %s", i, exc)
-            if probe is None:
-                log.debug("comfy-aimdo XPU: DXGI adapter #%d skipped "
-                          "(no usable LOCAL budget)", i)
-            else:
-                probe["index"] = i
-                candidates.append(probe)
-            i += 1
+        try:
+            vt = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+            enum_adapters = ctypes.cast(
+                vt.contents[7],
+                ctypes.CFUNCTYPE(
+                    ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
+                    ctypes.POINTER(ctypes.c_void_p)),
+            )
+            i = 0
+            while i <= _DXGI_ADAPTER_ENUM_LIMIT:
+                adapter = ctypes.c_void_p()
+                try:
+                    hr = enum_adapters(factory, i, ctypes.byref(adapter))
+                except OSError:
+                    break  # DXGI_ERROR_NOT_FOUND: end of the adapter list
+                if hr < 0 or not adapter.value:
+                    break
+                try:
+                    probe = _dxgi_probe_adapter(adapter)
+                    if probe is None:
+                        log.debug("comfy-aimdo XPU: DXGI adapter #%d skipped "
+                                  "(no usable LOCAL budget)", i)
+                    else:
+                        probe["index"] = i
+                        candidates.append(probe)
+                except Exception as exc:
+                    log.debug("comfy-aimdo XPU: DXGI adapter #%d unusable: %s",
+                              i, exc)
+                finally:
+                    # Every exit path (break / probe failure / success) drops
+                    # the reference; the enclosing finally drops the factory.
+                    _com_release(adapter)
+                i += 1
+        finally:
+            _com_release(factory)
     except Exception:
         return None
 
@@ -1021,10 +1088,18 @@ def _dxgi_local_budget_bytes():
                 picked, reason = cand, "pci-id"
                 break
     if picked is None and want_name:
+        # Exact match first...
         for cand in candidates:
-            cand_name = _normalize_adapter_name(cand["description"])
-            if cand_name and (cand_name in want_name or want_name in cand_name):
+            if _normalize_adapter_name(cand["description"]) == want_name:
                 picked, reason = cand, "name"
+                break
+    if picked is None and want_name:
+        # ...then containment, which _adapter_names_match only allows when
+        # both names carry >= 2 tokens (guards against "arc" in "arc b580").
+        for cand in candidates:
+            if _adapter_names_match(
+                    want_name, _normalize_adapter_name(cand["description"])):
+                picked, reason = cand, "name-substring"
                 break
     if picked is None:
         fallback = next((c for c in candidates if c["dedicated"] > 0), None)
