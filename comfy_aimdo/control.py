@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 import logging
 import importlib.util
+import math
 
 lib = None
 devctxs = []
@@ -392,6 +393,12 @@ def _apply_total_vram_override():
     except ValueError:
         logging.warning(
             "comfy-aimdo XPU [Lever A]: invalid AIMDO_XPU_TOTAL_VRAM_OVERRIDE_GIB="
+            f"{env!r}; ignoring total_vram override"
+        )
+        return
+    if not math.isfinite(override_gib):
+        logging.warning(
+            "comfy-aimdo XPU [Lever A]: non-finite AIMDO_XPU_TOTAL_VRAM_OVERRIDE_GIB="
             f"{env!r}; ignoring total_vram override"
         )
         return
