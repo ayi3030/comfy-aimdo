@@ -208,6 +208,20 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib.set_nvml_pressure(bool(nvml_pressure))
         return True
 
+    # Override OmniXPU's 0.99 XPU allocator cap with a DXGI real-free fraction.
+    # MUST run before the DLL load / opt-in gate AND before OmniXPU's prestartup
+    # (custom-node load, ComfyUI log ~line 25) so the OMNIXPU_XPU_MEMORY_FRACTION
+    # env var we set is visible to OmniXPU when it reads it at its own prestartup.
+    # A plain setter placed inside setup_backend() is clobbered by OmniXPU's 0.99
+    # (proven on the abandoned xpu-allocator-cap branch 06cd2d5); the env lever
+    # wins the timing race. No-op on non-XPU / non-Windows. Fail-soft.
+    try:
+        from . import xpu as _xpu_cap_backend
+        _xpu_cap_backend.apply_xpu_allocator_cap()
+    except Exception as _cap_exc:
+        logging.info(
+            f"comfy-aimdo XPU: allocator cap preload skipped (non-fatal): {_cap_exc!r}")
+
     # Remember whether the caller named the backend explicitly. This is read
     # later when handing control to the XPU backend: an explicit "xpu" request
     # must bypass the opt-in environment gate, whereas an auto-detected one

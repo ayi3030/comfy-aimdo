@@ -731,3 +731,239 @@ def get_allocator_mode():
 
 def is_ready():
     return _xpu_allocator_ready
+
+
+# ---------------------------------------------------------------------------
+# XPU allocator cap: override OmniXPU's 0.99 with a DXGI real-free fraction.
+#
+# Root cause (verified on user's Arc B580): ComfyUI-OmniXPU's prestartup calls
+# ``torch.xpu.set_per_process_memory_fraction(0.99)`` (Windows default), leaving
+# almost no driver-side headroom, so a heavy load drives the *driver* into an
+# unrecoverable DEVICE_LOST instead of a clean, recoverable PyTorch OOM.
+#
+# Timing (the trap that sank the abandoned xpu-allocator-cap branch 06cd2d5):
+# a plain ``set_per_process_memory_fraction`` placed inside setup_backend() runs
+# at ComfyUI main.py:74-84 (log ~line 12) and is CLOBBERED by OmniXPU's 0.99 at
+# custom-node load (log ~line 25). OmniXPU reads the OMNIXPU_XPU_MEMORY_FRACTION
+# env var FIRST and only falls back to 0.99 when it is unset -- so we set that
+# env var HERE, early in control.init() (before its own prestartup), and OmniXPU
+# applies OUR value at its own prestartup. We also call the direct setter as a
+# belt-and-suspenders measure (covers the OmniXPU-absent case and reinforces).
+#
+# The fraction is DERIVED from the real OS-visible free VRAM (DXGI
+# QueryVideoMemoryInfo, LOCAL segment), NOT a hardcoded constant and NOT
+# torch.xpu.mem_get_info (which is capacity-derived -- see probe_dxgi_free.py).
+# ---------------------------------------------------------------------------
+
+# Env var OmniXPU reads at its prestartup (must match upstream exactly).
+_XPU_ALLOCATOR_CAP_ENV = "OMNIXPU_XPU_MEMORY_FRACTION"
+# Headroom left for the driver / system pool so allocation failures become clean
+# OOM, not DEVICE_LOST. 4 GiB mirrors Intel's own OMNI_COMFYUI_RESERVE_VRAM_GB
+# default reserve for DynamicVRAM -- a policy number, not the fraction itself.
+_XPU_ALLOCATOR_CAP_HEADROOM_GIB = 4.0
+_XPU_ALLOCATOR_CAP_FLOOR = 0.30   # safety clamp only; real value is ~0.61
+_XPU_ALLOCATOR_CAP_CEIL = 0.90    # never exceed 0.90 (vs OmniXPU's 0.99)
+_xpu_allocator_cap_fraction = None  # cache for diagnostics / read-back
+
+
+class _CapGUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_uint32),
+        ("Data2", ctypes.c_uint16),
+        ("Data3", ctypes.c_uint16),
+        ("Data4", ctypes.c_uint8 * 8),
+    ]
+
+    def __init__(self, d1, d2, d3, *b):
+        super().__init__(d1, d2, d3, (b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]))
+
+
+_IID_IDXGIFactory1 = _CapGUID(
+    0x7b7166ec, 0x21c7, 0x44ae, 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69)
+_IID_IDXGIAdapter3 = _CapGUID(
+    0x645967a4, 0x1392, 0x4310, 0xa7, 0x98, 0x80, 0x53, 0xce, 0x3e, 0x93, 0xfd)
+
+
+class _DXGI_QUERY_VIDEO_MEMORY_INFO(ctypes.Structure):
+    _fields_ = [
+        ("Budget", ctypes.c_uint64),
+        ("CurrentUsage", ctypes.c_uint64),
+        ("AvailableForReservation", ctypes.c_uint64),
+        ("CurrentReservation", ctypes.c_uint64),
+    ]
+
+
+def _dxgi_local_budget_bytes():
+    """Return (budget_bytes, current_usage_bytes) from the DXGI LOCAL segment.
+
+    Best-effort Windows-only. Uses IDXGIAdapter3::QueryVideoMemoryInfo (vtable
+    index 14; verified on Arc B580 -- see probe_dxgi_free.py). Returns None when
+    DXGI is unavailable or the query fails so the caller can fail soft.
+    """
+    if platform.system() != "Windows":
+        return None
+    try:
+        dxgi = ctypes.windll.dxgi
+    except Exception:
+        return None
+    try:
+        create_factory = dxgi.CreateDXGIFactory1
+        create_factory.argtypes = [ctypes.POINTER(_CapGUID), ctypes.c_void_p]
+        create_factory.restype = ctypes.HRESULT
+        factory = ctypes.c_void_p()
+        hr = create_factory(ctypes.byref(_IID_IDXGIFactory1), ctypes.byref(factory))
+        if hr < 0:
+            return None
+        vt = ctypes.cast(factory, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+        enum_adapters1 = ctypes.cast(
+            vt.contents[7],
+            ctypes.CFUNCTYPE(
+                ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
+                ctypes.POINTER(ctypes.c_void_p)),
+        )
+        adapter = ctypes.c_void_p()
+        i = 0
+        while i <= 8:
+            hr = enum_adapters1(factory, i, ctypes.byref(adapter))
+            if hr < 0:
+                break
+            ad_ptr = ctypes.cast(
+                adapter, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+            query_iface = ctypes.cast(
+                ad_ptr.contents[0],
+                ctypes.CFUNCTYPE(
+                    ctypes.HRESULT, ctypes.c_void_p, ctypes.POINTER(_CapGUID),
+                    ctypes.POINTER(ctypes.c_void_p)),
+            )
+            ad3 = ctypes.c_void_p()
+            hr = query_iface(adapter, ctypes.byref(_IID_IDXGIAdapter3),
+                             ctypes.byref(ad3))
+            if hr >= 0 and ad3:
+                ad3_ptr = ctypes.cast(
+                    ad3, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
+                qvmi = ctypes.cast(
+                    ad3_ptr.contents[14],
+                    ctypes.CFUNCTYPE(
+                        ctypes.HRESULT, ctypes.c_void_p, ctypes.c_uint,
+                        ctypes.c_uint, ctypes.POINTER(_DXGI_QUERY_VIDEO_MEMORY_INFO)),
+                )
+                info = _DXGI_QUERY_VIDEO_MEMORY_INFO()
+                hr = qvmi(ad3, 0, 0, ctypes.byref(info))  # node 0, LOCAL segment
+                if hr >= 0:
+                    return (int(info.Budget), int(info.CurrentUsage))
+            i += 1
+    except Exception:
+        return None
+    return None
+
+
+def recommend_xpu_allocator_fraction(
+    headroom_gib: float = _XPU_ALLOCATOR_CAP_HEADROOM_GIB,
+    floor: float = _XPU_ALLOCATOR_CAP_FLOOR,
+    ceil: float = _XPU_ALLOCATOR_CAP_CEIL,
+):
+    """Compute the PyTorch per-process memory fraction from DXGI real-free.
+
+    PyTorch's caching-allocator upper bound = fraction * torch_total. We want
+    that bound = DXGI Budget - headroom (leave driver/system headroom, force
+    early ComfyUI RAM offload), so::
+
+        fraction = (budget_bytes - headroom_bytes) / torch_total_bytes
+
+    clamped to [floor, ceil]. Returns None when XPU / DXGI is unavailable so the
+    caller keeps OmniXPU's 0.99 (fail-soft, never worse than before). This is a
+    MEASURED value, not a hardcoded fraction.
+    """
+    try:
+        import torch
+    except Exception:
+        return None
+    xpu = getattr(torch, "xpu", None)
+    if xpu is None or not xpu.is_available():
+        return None
+    dxgi = _dxgi_local_budget_bytes()
+    if dxgi is None:
+        return None
+    budget_bytes, _usage_bytes = dxgi
+    try:
+        idx = xpu.current_device()
+        total_bytes = int(xpu.get_device_properties(idx).total_memory)
+    except Exception:
+        return None
+    if budget_bytes <= 0 or total_bytes <= 0:
+        return None
+    headroom_bytes = int(headroom_gib * 1024 ** 3)
+    allowed_bytes = budget_bytes - headroom_bytes
+    if allowed_bytes <= 0:
+        return None
+    fraction = allowed_bytes / total_bytes
+    if fraction > 1.0:
+        fraction = 1.0
+    if fraction < floor:
+        fraction = floor
+    if fraction > ceil:
+        fraction = ceil
+    return fraction
+
+
+def apply_xpu_allocator_cap(
+    headroom_gib: float = _XPU_ALLOCATOR_CAP_HEADROOM_GIB,
+) -> None:
+    """Override OmniXPU's 0.99 XPU allocator cap with a DXGI real-free fraction.
+
+    Runs EARLY in control.init() (ComfyUI main.py:74-84), BEFORE OmniXPU's
+    prestartup (custom-node load). Two channels:
+      1. Set OMNIXPU_XPU_MEMORY_FRACTION -- OmniXPU reads this env var first and
+         only falls back to 0.99 when unset, so our value wins at ITS OWN
+         prestartup (correct timing; a plain setter in setup_backend is
+         clobbered -- see the abandoned xpu-allocator-cap branch 06cd2d5).
+      2. Call torch.xpu.set_per_process_memory_fraction directly as a
+         belt-and-suspenders measure (covers the OmniXPU-absent case and
+         reinforces when OmniXPU applies the same value from the env).
+    Fail-soft: any failure is logged, never blocks ComfyUI startup.
+    """
+    global _xpu_allocator_cap_fraction
+    log = logging.getLogger("comfy_aimdo.xpu")
+    try:
+        import torch
+        xpu = getattr(torch, "xpu", None)
+        if xpu is None or not xpu.is_available():
+            _xpu_allocator_cap_fraction = None
+            return
+        fraction = recommend_xpu_allocator_fraction(headroom_gib=headroom_gib)
+        if fraction is None or fraction <= 0.0:
+            log.info(
+                "comfy-aimdo XPU: allocator cap skipped (DXGI real-free "
+                "unavailable); OmniXPU 0.99 retained")
+            _xpu_allocator_cap_fraction = None
+            return
+        # Channel 1: env var OmniXPU reads at its prestartup (correct timing).
+        os.environ[_XPU_ALLOCATOR_CAP_ENV] = "%.6f" % fraction
+        # Channel 2: direct setter (fail-soft; OmniXPU may re-apply same value).
+        try:
+            setter = getattr(xpu, "set_per_process_memory_fraction", None)
+            if callable(setter):
+                setter(fraction)
+        except Exception as _exc:
+            log.warning(
+                "comfy-aimdo XPU: direct allocator cap setter skipped "
+                "(non-fatal): %s" % _exc)
+        total_gib = (
+            xpu.get_device_properties(xpu.current_device()).total_memory
+            / (1024 ** 3))
+        allowed_gib = fraction * total_gib
+        log.info(
+            "comfy-aimdo XPU: allocator cap -> fraction=%.4f (allowed=%.2f GiB), "
+            "headroom=%.2f GiB, torch_total=%.2f GiB, env=%s set for OmniXPU "
+            "prestartup" % (fraction, allowed_gib, headroom_gib, total_gib,
+                            _XPU_ALLOCATOR_CAP_ENV))
+        _xpu_allocator_cap_fraction = fraction
+    except Exception as _exc:
+        log.warning(
+            "comfy-aimdo XPU: allocator cap skipped (non-fatal): %s" % _exc)
+        _xpu_allocator_cap_fraction = None
+
+
+def get_xpu_allocator_cap_fraction():
+    """Return the fraction applied by apply_xpu_allocator_cap(), or None."""
+    return _xpu_allocator_cap_fraction
