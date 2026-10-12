@@ -1008,6 +1008,12 @@ def _dxgi_local_budget_bytes():
     Matching order: PCI vendor+device id -> normalized device name -> explicit
     loud fallback (never a silent index-0 pick). Returns None when DXGI is
     unavailable or no usable adapter is found, so the caller can fail soft.
+
+    Not cached: every call builds a new DXGI factory and walks the full
+    adapter enumeration (one complete DXGI traversal). The COM reference leak
+    is fixed, so calling this in a loop no longer leaks -- but it still costs
+    a full traversal each time, so keep it off hot paths and out of frequent
+    loops.
     """
     if platform.system() != "Windows":
         return None
@@ -1140,6 +1146,11 @@ def recommend_xpu_allocator_fraction(
     clamped to [floor, ceil]. Returns None when XPU / DXGI is unavailable so the
     caller keeps OmniXPU's 0.99 (fail-soft, never worse than before). This is a
     MEASURED value, not a hardcoded fraction.
+
+    Not cached: each call re-reads the DXGI budget through
+    _dxgi_local_budget_bytes(), i.e. a full factory + adapter enumeration. See
+    that function's docstring -- do not call this from a hot path or a
+    frequent loop.
     """
     try:
         import torch
