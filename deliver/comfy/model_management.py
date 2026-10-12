@@ -1695,8 +1695,8 @@ if not DISABLE_PINNED_MEMORY:
         _xpu_cache_gb = _xpu_ram_cache_gb_from_env()
         if _xpu_cache_gb is None:
             ram = get_total_memory(torch.device("cpu"))
-            _xpu_cache_bytes = int(min(ram * 0.25, 16 * 1024 ** 3))
-            logging.info("Enabled XPU RAM cache {} (default = min(ram*0.25, 16GiB))".format(_xpu_cache_bytes // (1024 * 1024)))
+            _xpu_cache_bytes = int(min(ram * 0.40, 24 * 1024 ** 3))
+            logging.info("Enabled XPU RAM cache {} (default = min(ram*0.40, 24GiB))".format(_xpu_cache_bytes // (1024 * 1024)))
         elif _xpu_cache_gb > 0:
             _xpu_cache_bytes = int(_xpu_cache_gb * 1024 ** 3)
             logging.info("Enabled XPU RAM cache {} (AIMDO_XPU_RAM_CACHE_GB={})".format(_xpu_cache_bytes // (1024 * 1024), _xpu_cache_gb))
