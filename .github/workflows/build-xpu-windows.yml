@@ -62,7 +62,7 @@ env:
   # "Could not find module ... (or one of its dependencies)".
   # The "Verify SYCL runtime ABI" step below turns that class of mistake into a
   # loud CI failure instead of a broken artifact.
-  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/bae85ab1-cfcd-4251-8d42-a0c27949ea33/intel-oneapi-toolkit-2026.0.0.193_offline.exe
+  ONEAPI_INSTALLER_URL: https://registrationcenter-download.intel.com/akdlm/IRC_NAS/4144bec3-82ce-4672-bd71-5c93a79cd5e7/intel-oneapi-toolkit-2026.1.0.191_offline.exe
   ONEAPI_COMPONENTS: intel.oneapi.win.cpp-dpcpp-common
   # SYCL runtime the built DLL MUST import (keep in sync with ONEAPI_INSTALLER_URL).
   EXPECTED_SYCL_DLL: sycl9.dll
