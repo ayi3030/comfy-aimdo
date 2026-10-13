@@ -554,6 +554,24 @@ CUresult xpu_memory_info(size_t *free_bytes, size_t *total_bytes) {
     }
 }
 
+/* Fresh real-free read for the admission gate (src-xpu/stubs.c).
+ *
+ * The gate decides on last_free_vram, sampled by the throttled
+ * poll_budget_deficit(). During decode the device free swings by gigabytes
+ * within a second (observed 5531 -> 164 -> 9108 MB), so a single low sample can
+ * hard-deny a small request that actually fits. On the deny path the gate
+ * re-reads through this helper and only refuses when the FRESH value also does
+ * not fit. Same source as cuMemGetInfo (xpu_memory_info); returns 0 when no
+ * reading is available, which the gate treats as "keep the sampled decision".
+ * Internal to this DLL on purpose -- deliberately NOT exported. */
+extern "C" size_t aimdo_xpu_fresh_free_bytes(void) {
+    size_t free_bytes = 0, total_bytes = 0;
+    if (xpu_memory_info(&free_bytes, &total_bytes) != CUDA_SUCCESS) {
+        return 0;
+    }
+    return free_bytes;
+}
+
 CUresult xpu_malloc(CUdeviceptr *pointer, size_t size) {
     auto *state = current_device();
     if (!pointer || !state) {

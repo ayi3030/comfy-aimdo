@@ -9,6 +9,11 @@ extern uint64_t last_free_vram;
 extern uint64_t last_total_vram;
 extern ssize_t real_free_fit_deficit(uint64_t size);
 
+/* Fresh (unthrottled) real-free read; defined in src-xpu/dispatch.cpp, same
+ * translation unit set as this DLL. Used only to re-check a would-be denial
+ * against the CURRENT device free instead of the sampled last_free_vram. */
+extern size_t aimdo_xpu_fresh_free_bytes(void);
+
 /* The XPU allocator does not record or replay allocation graphs. Keep the
  * shared allocator/VBAR call sites on their ordinary allocation and
  * synchronization paths without linking the CUDA/HIP memory compiler. */
@@ -159,11 +164,42 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
          * owner-side VBAR boundary, unlike vbars_free() which unmaps
          * Level-Zero physical memory right here. */
         int64_t shortfall = (int64_t)real_free_fit_deficit((uint64_t)(deficit < 0 ? 0 : deficit));
-        log(DEBUG,
-            "%s: Windows shortage=%zd bytes; true device free=%zu MB total=%zu MB; %s\n",
-            __func__, (ssize_t)deficit, (size_t)last_free_vram / M,
-            (size_t)last_total_vram / M,
-            shortfall > 0 ? "request does not fit, denying" : "reclaim only, admitting");
+        if (shortfall > 0) {
+            /* The sampled last_free_vram can catch a momentary dip: during
+             * non-load phases the device free swings by gigabytes within a
+             * second (observed 5531 -> 164 -> 9108 MB), so one low sample can
+             * refuse a small request that actually fits. Re-read the device
+             * before refusing and deny only when the FRESH free also cannot
+             * satisfy the request under the SAME capacity-derived reserve the
+             * sampled check uses. A genuine persistent shortfall is unchanged
+             * (fresh is also low, or the request is large); only the
+             * transient-dip false denial is removed, matching the
+             * "tight-but-satisfiable still proceeds to the driver" intent
+             * stated above. Recomputed here rather than reusing the sampler's
+             * value so the two decisions cannot drift. */
+            uint64_t cap = last_total_vram;
+            uint64_t reserve = cap / 16;
+            uint64_t fresh = (uint64_t)aimdo_xpu_fresh_free_bytes();
+            uint64_t need = (uint64_t)(deficit < 0 ? 0 : deficit);
+            uint64_t avail;
+            if (reserve > (512ULL * 1024 * 1024)) {
+                reserve = 512ULL * 1024 * 1024;
+            }
+            avail = (fresh > reserve) ? (fresh - reserve) : 0;
+            log(DEBUG,
+                "%s: sampled free=%zu MB -> deny; fresh free=%zu MB -> %s\n",
+                __func__, (size_t)last_free_vram / M, (size_t)fresh / M,
+                (need <= avail) ? "admitting (stale/transient sample)"
+                                : "denying (real shortfall)");
+            if (fresh != 0 && need <= avail) {
+                shortfall = 0;
+            }
+        } else {
+            log(DEBUG,
+                "%s: Windows shortage=%zd bytes; true device free=%zu MB total=%zu MB; %s\n",
+                __func__, (ssize_t)deficit, (size_t)last_free_vram / M,
+                (size_t)last_total_vram / M, "reclaim only, admitting");
+        }
         vbars_request_reclaim((ssize_t)deficit);
         return shortfall <= 0;
 #else
