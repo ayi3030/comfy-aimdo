@@ -12,7 +12,8 @@
 #     (comfy_aimdo/ with our xpu.py + control.py/torch.py edits).
 #   * The DLL is torch-version agnostic at compile time (it talks to Level Zero
 #     and the Unified Runtime at runtime). The torch 2.14.0+xpu / bmg pin is a
-#     RUNTIME contract recorded in provider.json (M4), not baked into the DLL.
+#     RUNTIME contract recorded in provider.json (shipped in the wheel), not
+#     baked into the DLL; the M4-pin gate below asserts it stays in sync.
 #
 # oneAPI install note: we use Intel's OWN offline-installer recipe (component
 # intel.oneapi.win.cpp-dpcpp-common, see oneapi-src/oneapi-ci) instead of a
@@ -33,7 +34,7 @@ on:
       torch_xpu_version:
         description: >-
           Target torch+XPU runtime version, recorded in the artifact metadata.
-          The hard pin lands in provider.json at M4.
+          The hard pin is recorded in provider.json (comfy_aimdo/provider.json).
         required: false
         default: "2.14.0+xpu"
   push:
@@ -219,6 +220,86 @@ jobs:
           if stale:
               sys.exit("ABI GATE FAILED: DLL also imports stale SYCL runtime(s) %s" % stale)
           print("ABI GATE PASSED: imports %s as required." % os.environ["EXPECTED"])
+          PY
+
+      - name: Verify provider.json runtime contract (M4 pin)
+        # M4: the torch+xpu / oneAPI / SYCL pin is a RUNTIME contract, not baked
+        # into the DLL. provider.json is shipped INSIDE the wheel (the
+        # package-data "*.json" entry in pyproject.toml) and is the
+        # machine-readable record consumers read. This gate keeps it from
+        # drifting away from what this workflow actually builds. Anchor-style +
+        # fail-closed: a missing file or a missing/incorrect key exits 1; it
+        # never silently skips.
+        shell: bash
+        env:
+          EXPECTED_TORCH: ${{ inputs.torch_xpu_version }}
+          EXPECTED_SYCL_DLL: ${{ env.EXPECTED_SYCL_DLL }}
+          ONEAPI_INSTALLER_URL: ${{ env.ONEAPI_INSTALLER_URL }}
+        run: |
+          python - <<'PY'
+          import json, os, re, sys
+
+          p = "aimdo/comfy_aimdo/provider.json"
+          if not os.path.isfile(p):
+              sys.exit("PROVIDER CONTRACT FAILED: %s is missing. It is the M4 "
+                       "runtime pin shipped in the wheel; it must exist and match "
+                       "this workflow." % p)
+          try:
+              with open(p, "r", encoding="utf-8") as fh:
+                  doc = json.load(fh)
+          except Exception as exc:
+              sys.exit("PROVIDER CONTRACT FAILED: cannot parse %s: %s" % (p, exc))
+
+          def need(obj, *path):
+              cur = obj
+              for k in path:
+                  if not isinstance(cur, dict) or k not in cur:
+                      sys.exit("PROVIDER CONTRACT FAILED: %s is missing key %s"
+                               % (p, ".".join(path)))
+                  cur = cur[k]
+              return cur
+
+          rt = need(doc, "runtime")
+          # The workflow input default only applies to workflow_dispatch; on
+          # push/PR inputs.torch_xpu_version is empty, so fall back to the
+          # documented default before comparing.
+          want_torch = (os.environ.get("EXPECTED_TORCH") or "2.14.0+xpu").strip()
+          # Derive the expected oneAPI series from the installer URL the build
+          # actually uses, so a future URL bump is caught here instead of
+          # silently diverging from the recorded pin.
+          installer = os.environ["ONEAPI_INSTALLER_URL"]
+          m = re.search(r"intel-oneapi-toolkit-(\d{4}\.\d+)[._]", installer)
+          if not m:
+              sys.exit("PROVIDER CONTRACT FAILED: cannot derive the oneAPI series "
+                       "from ONEAPI_INSTALLER_URL=%r (expected "
+                       "intel-oneapi-toolkit-<YYYY>.<M>_offline.exe)." % installer)
+          want_series = m.group(1)
+          expected_dll = os.environ["EXPECTED_SYCL_DLL"]
+          base = os.path.basename(expected_dll)
+          want_abi = base[:-4] if base.lower().endswith(".dll") else base
+
+          errors = []
+          if need(rt, "torch_version") != want_torch:
+              errors.append("runtime.torch_version=%r != workflow pin %r"
+                            % (rt["torch_version"], want_torch))
+          if need(rt, "sycl_abi") != want_abi:
+              errors.append("runtime.sycl_abi=%r != %r (from EXPECTED_SYCL_DLL=%r)"
+                            % (rt["sycl_abi"], want_abi, expected_dll))
+          if need(rt, "oneapi_series") != want_series:
+              errors.append("runtime.oneapi_series=%r != %r (derived from "
+                            "ONEAPI_INSTALLER_URL)"
+                            % (rt["oneapi_series"], want_series))
+          targets = need(rt, "xpu_targets")
+          if not isinstance(targets, list) or "bmg" not in targets:
+              errors.append("runtime.xpu_targets=%r does not include 'bmg'"
+                            % (targets,))
+
+          if errors:
+              sys.exit("PROVIDER CONTRACT FAILED (M4 pin drift in %s):\n  - %s"
+                       % (p, "\n  - ".join(errors)))
+          print("PROVIDER CONTRACT PASSED: %s matches torch=%s sycl_abi=%s "
+                "oneapi_series=%s xpu_targets=%s."
+                % (p, want_torch, want_abi, want_series, targets))
           PY
 
       - name: Verify overlay contract (fork src/ provides the L2/L3 unload layer)

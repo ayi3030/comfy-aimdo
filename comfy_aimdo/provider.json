@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "provider_id": "comfy_aimdo.xpu",
+  "provider_distribution": {
+    "name": "comfy-aimdo"
+  },
+  "artifact": "aimdo_xpu.dll",
+  "runtime": {
+    "platforms": [
+      "win32"
+    ],
+    "torch_version": "2.14.0+xpu",
+    "torch_build": "xpu",
+    "xpu_targets": [
+      "bmg",
+      "dg2"
+    ],
+    "oneapi_series": "2026.1",
+    "sycl_abi": "sycl9",
+    "onednn": "2026.1.0"
+  },
+  "canonical_distribution": {
+    "name": "comfy-kitchen",
+    "compatible_versions": [
+      "0.2.37"
+    ]
+  },
+  "source": {
+    "pr": "intel/llm-scaler#748",
+    "comfyui": "0.39.0"
+  }
+}
