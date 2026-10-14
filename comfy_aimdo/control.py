@@ -427,9 +427,9 @@ def _apply_extra_reserved_vram_override():
 
 
 def _patch_get_free_memory_for_real_free():
-    """Lever A (coldstart-fit-fix, ROOT CAUSE): make ComfyUI's get_free_memory
-    report the REAL device free VRAM on XPU so the dynamic-VRAM offloader is
-    conservative during cold start.
+    """Lever A (ROOT-CAUSE FIX, now DEFAULT ON for XPU): make ComfyUI's
+    get_free_memory report the REAL device free VRAM on XPU so the dynamic-VRAM
+    offloader is conservative (cold start AND runtime fragmentation OOM).
 
     ROOT CAUSE (traced this session, not assumed): comfy.model_management.
     get_free_memory's XPU branch (mm:1933-1939) computes free as
@@ -439,23 +439,32 @@ def _patch_get_free_memory_for_real_free():
     get_free_memory therefore over-reports free by ~7.4 GiB -> load_models_gpu
     (mm:1043 `current_free_mem = get_free_memory(torch_dev)`) computes an
     inflated lowvram_model_memory (mm:1046) -> model_patcher.load keeps too much
-    weight in VRAM (mm:1004 `lowvram_fits`) -> cold-start device OOM. Every OTHER
+    weight in VRAM (mm:1004 `lowvram_fits`). On 2026-10-14 forensics (B580) this
+    was proven to be the amplifier of the runtime OOM: the offloader keeps too
+    much resident -> at ~6.65-9.44 GiB residency a 1.20 GiB contiguous block
+    cannot be satisfied despite >1.20 GiB free -> torch XPU caching allocator
+    fragmentation OOM. AIMDO's admission gate was proven NOT to reject (synthetic
+    OOM count = 0); the torch-blind free estimate is the lever. Every OTHER
     backend branch (CUDA mm:1958 / NPU mm:1944 / MLU mm:1951) already uses
-    *_mem_get_info (real OS-level free); ONLY the XPU branch uses the torch-blind
+    *_mem_get_info (real OS-level free); ONLY the XPU branch used the torch-blind
     path. This is why total_vram / EXTRA_RESERVED_VRAM overrides were no-ops: the
     offloader's free-VRAM INPUT was itself fake.
 
-    FIX: when enabled, wrap get_free_memory so the XPU branch returns
+    FIX: wrap get_free_memory so the XPU branch returns
     torch.xpu.mem_get_info(dev)[0] (real device free, includes AIMDO USM),
     matching the CUDA approach. lowvram_model_memory becomes realistic and the
-    offloader keeps LESS weight in VRAM -> lower cold-start peak.
+    offloader keeps LESS weight in VRAM -> lower residency -> no fragmentation OOM.
 
-    Gated by AIMDO_XPU_REAL_FREE_VRAM (any non-empty value). Unset => get_free_
-    memory is NOT touched (fails closed, reversible). Non-XPU devices and any
-    error fall through to the original function unchanged. Idempotent (won't
-    double-wrap).
+    DEFAULT ON for XPU (this is a correctness fix, not an opt-in experiment):
+    the torch-blind estimate is a genuine bug. Opt OUT explicitly with
+    AIMDO_XPU_REAL_FREE_VRAM=0. Non-XPU devices and any error fall through to the
+    original function unchanged. Idempotent (won't double-wrap).
     """
-    if not os.environ.get("AIMDO_XPU_REAL_FREE_VRAM"):
+    env = os.environ.get("AIMDO_XPU_REAL_FREE_VRAM")
+    if env == "0":
+        logging.info(
+            "comfy-aimdo XPU [Lever A]: real-free get_free_memory opt-out "
+            "(AIMDO_XPU_REAL_FREE_VRAM=0); keeping torch-blind estimate")
         return
     mm = sys.modules.get("comfy.model_management")
     if mm is None or not hasattr(mm, "get_free_memory"):
