@@ -168,11 +168,28 @@ extern int64_t simple_vram_headroom;
  * admission gate (budget_deficit) stop over-admitting. See
  * RAM_LAYER_CRASH_ROOTCAUSE.md sec.12-13. */
 extern uint64_t external_vram_usage;
+/* C-published complete process-local commitment (DXGI/WDDM info.CurrentUsage).
+ * Authoritative, full device footprint: AIMDO's own allocations (which ALREADY
+ * include VBAR's resident physical pages via three_stooges at plat.h:259) PLUS
+ * torch's native SYCL/Level-Zero/oneDNN/driver allocations that bypass AIMDO's
+ * wrappers and are therefore absent from total_vram_usage.  Kept in a SEPARATE
+ * global from external_vram_usage because the Python/XPU layer also writes
+ * external_vram_usage every step with torch_reserved (a torch-only subset, often
+ * ~tens of MiB, NOT the full footprint); that write must not clobber the
+ * complete DXGI figure.  effective_book_a() takes the max of all three sources
+ * so the C value always wins regardless of the per-step Python write. */
+extern uint64_t dxgi_external_vram_usage;
 
-/* Effective Book A for the admission gate: the larger of aimdo's own ledger and
- * the torch real-device usage fed from the Python/XPU layer. */
+/* Effective Book A for the admission gate: max of AIMDO's own ledger
+ * (total_vram_usage, which already contains VBAR resident pages), the
+ * C-published full DXGI commitment (dxgi_external_vram_usage), and the
+ * torch-reserved figure fed from the Python/XPU layer (external_vram_usage).
+ * The gate therefore sees the true committed device footprint and stops
+ * undercounting torch's native SYCL/oneDNN/driver usage (the part that never
+ * passes through AIMDO's wrappers). */
 static inline size_t effective_book_a(void) {
-    return total_vram_usage > external_vram_usage ? total_vram_usage : external_vram_usage;
+    size_t a = total_vram_usage > dxgi_external_vram_usage ? total_vram_usage : dxgi_external_vram_usage;
+    return a > external_vram_usage ? a : external_vram_usage;
 }
 
 static inline ssize_t budget_deficit(size_t size) {

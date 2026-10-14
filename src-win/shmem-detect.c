@@ -1,5 +1,6 @@
 #include "plat.h"
 #include "aimdo-time.h"
+#include <stdlib.h>
 
 #include <windows.h>
 #include <dxgi1_4.h>
@@ -159,6 +160,24 @@ ssize_t real_free_fit_deficit(uint64_t size) {
         reserve = REAL_FREE_RESERVE_CAP;
     }
     available = (last_free_vram > reserve) ? (last_free_vram - reserve) : 0;
+    /* Contiguous-headroom lever (XPU OOM mitigation).  last_free_vram is TOTAL
+     * free, an optimistic proxy for the largest contiguous block.  When
+     * fragmentation prevents piecing together a large contiguous request (e.g.
+     * torch's ~1.20 GiB block) even though total free looks ample, require extra
+     * slack before admitting so the gate reclaims/denies instead of letting a
+     * later copy OOM.  Off by default (0); tune via AIMDO_XPU_CONTIG_HEADROOM
+     * (bytes) on the target GPU only after confirming Lever A alone is
+     * insufficient, since a non-zero value trades throughput for safety. */
+    {
+        static int64_t contig_headroom = -1;
+        if (contig_headroom < 0) {
+            const char *e = getenv("AIMDO_XPU_CONTIG_HEADROOM");
+            contig_headroom = (e && *e) ? (int64_t)strtoull(e, NULL, 10) : 0;
+        }
+        if (contig_headroom > 0 && (uint64_t)contig_headroom < available) {
+            available -= (uint64_t)contig_headroom;
+        }
+    }
     if (size <= available) {
         return 0;
     }
@@ -210,6 +229,49 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
                 __func__, (size_t)(info.Budget / M), (size_t)(info.CurrentUsage / M),
                 (size_t)(info.CurrentReservation / M),
                 (size_t)(info.AvailableForReservation / M));
+
+        /* RAM-layer root-cause fix (Lever A, XPU cold-start OOM).
+         *
+         * effective_book_a() (plat.h) is now max(total_vram_usage,
+         * dxgi_external_vram_usage, external_vram_usage) and feeds BOTH
+         * deficit_simple and deficit_sync in budget_deficit().
+         *
+         * CORRECTION (re-verified 2026-10-15): total_vram_usage is NOT blind to
+         * VBAR. vbar_fault() calls three_stooges() (plat.h:259) which increments
+         * total_vram_usage, and unmap decrements it (model-vbar.c:103), so VBAR's
+         * resident physical pages ARE already inside the ledger. What the ledger
+         * genuinely cannot see is torch's NATIVE device footprint that bypasses
+         * AIMDO's wrappers -- the torch caching allocator, SYCL/Level-Zero
+         * buffers, oneDNN workspace, and driver pools. THAT is the real undercount.
+         *
+         * info.CurrentUsage (DXGI LOCAL segment) is the complete process-local
+         * commitment and is a SUPERSET of total_vram_usage (it already contains
+         * AIMDO's own allocations AND VBAR), so publishing it into
+         * dxgi_external_vram_usage (its OWN global, separate from
+         * external_vram_usage) makes the gate see torch's native footprint too.
+         *
+         * Why a separate global: the Python/XPU layer (comfy_aimdo/xpu.py
+         * _feed_external_vram_usage) ALSO writes external_vram_usage every step,
+         * but only with torch_reserved -- torch's own reserved subset (often only
+         * ~tens of MiB per control.py:438), NOT the full device footprint.  If we
+         * wrote CurrentUsage into external_vram_usage directly, the per-step
+         * Python write would clobber it between the 2s DXGI polls and the
+         * undercount would silently recur.  Keeping the complete DXGI figure in
+         * its own global that the gate maxes in makes it immune to that write.
+         *
+         * This closes the undercount where a later host-to-device copy OOMs
+         * because the gate admitted too much: the gate no longer trusts a ledger
+         * that misses torch's native (non-AIMDO) footprint.  vbar_fault() already
+         * gates each 32 MiB page on budget_deficit(VBAR_PAGE_SIZE) > 0, so this
+         * also throttles VBAR fault-in and reclaims residency under pressure (the
+         * contiguous-headroom pillar).
+         *
+         * Only published when the value is plausible (>0); a failed/zero query or
+         * the per-step Python torch_reserved write must not wipe the last good
+         * complete reading. */
+        if (info.CurrentUsage > 0) {
+            dxgi_external_vram_usage = info.CurrentUsage;
+        }
         } else {
             log(WARNING, "comfy-aimdo WDDM VRAM query failed. Using physical capacity as fallback\n");
         }

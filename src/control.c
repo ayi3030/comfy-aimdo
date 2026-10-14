@@ -214,6 +214,9 @@ uint64_t get_total_vram_usage(void *devctx) {
  * admission gate stops undercounting the XPU device footprint. */
 uint64_t external_vram_usage = 0;
 
+/* See plat.h dxgi_external_vram_usage: C-published full DXGI commitment. */
+uint64_t dxgi_external_vram_usage = 0;
+
 SHARED_EXPORT
 void aimdo_set_external_vram_usage(uint64_t usage) {
     external_vram_usage = usage;
