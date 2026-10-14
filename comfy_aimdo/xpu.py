@@ -33,6 +33,7 @@ import sys
 import torch
 
 from . import control
+from . import provider as _provider
 
 # XPU pluggable allocator function names exported by aimdo_xpu.{dll,so}
 _ALLOC_FN = "xpu_alloc_fn"
@@ -53,6 +54,7 @@ _wrappers_installed = False
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
+_xpu_target = None
 
 
 def is_runtime_available() -> bool:
@@ -494,6 +496,46 @@ def _publish_queues(lib) -> bool:
     return True
 
 
+def detect_xpu_target() -> str | None:
+    """Resolve the actual Intel XPU silicon family at runtime and validate it
+    against the pinned ``xpu_targets`` in provider.json.
+
+    Fail-soft: any error (no torch.xpu, no device, unreadable contract) is
+    logged and ``None`` returned. Never raises, never alters the allocation
+    path.
+    """
+    global _xpu_target
+    try:
+        if not (hasattr(torch, "xpu") and torch.xpu.is_available()
+                and torch.xpu.device_count() > 0):
+            logging.info("comfy-aimdo XPU: no XPU device available; "
+                         "silicon target not resolved")
+            _xpu_target = None
+            return None
+        name = torch.xpu.get_device_properties(0).name
+        family = _provider.map_xpu_target_name(name)
+        pinned = _provider.get_xpu_targets()
+        if family is None:
+            logging.warning(
+                f"comfy-aimdo XPU: unrecognized device name {name!r}; "
+                f"cannot map to a pinned target (pinned={pinned})")
+        elif pinned and family not in pinned:
+            logging.warning(
+                f"comfy-aimdo XPU: device {name!r} resolved to family "
+                f"{family!r} which is NOT in pinned xpu_targets {pinned}; "
+                "possible deployment/contract mismatch -- verify the wheel")
+        else:
+            logging.info(
+                f"comfy-aimdo XPU: device {name!r} resolved to family "
+                f"{family!r} (pinned={pinned})")
+        _xpu_target = family
+        return family
+    except Exception as exc:  # noqa: BLE001 - fail-soft
+        logging.info(f"comfy-aimdo XPU: target detection skipped: {exc!r}")
+        _xpu_target = None
+        return None
+
+
 def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool = False) -> bool:
     """Wire up the XPU backend. Returns False (fail-closed) if unusable.
 
@@ -523,6 +565,10 @@ def setup_backend(lib, mode: str | None, system: str, explicitly_requested: bool
         return False
 
     _declare_argtypes(lib)
+
+    # Runtime XPU silicon target resolution (makes provider.json xpu_targets
+    # real). Fail-soft: logs + stores; never affects the return value.
+    detect_xpu_target()
 
     # Publish PyTorch's SYCL queues before anything else: the native dispatch
     # table is resolved per call against this registry, so an empty table makes
