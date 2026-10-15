@@ -204,6 +204,18 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     # global. It is published to the module via globals() further down.
 
     if lib is not None:
+        try:
+            from . import xpu as _xpu_cap_backend
+        except Exception:
+            _xpu_cap_backend = None
+        if simple_vram_headroom is None and _xpu_cap_backend is not None:
+            simple_vram_headroom = _xpu_cap_backend.recommend_xpu_admission_headroom()
+            if simple_vram_headroom is not None:
+                logging.info(
+                    "comfy-aimdo XPU: admission headroom defaulted to %.2f GiB "
+                    "(gate denies at the truly-usable VRAM window; the native "
+                    "256MB default was toothless vs the ~10GiB allocator cap)"
+                    % (simple_vram_headroom / 1024 ** 3))
         if simple_vram_headroom is not None:
             lib.set_simple_vram_headroom(int(simple_vram_headroom))
         lib.set_nvml_pressure(bool(nvml_pressure))
@@ -349,6 +361,28 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
             f"({', '.join(_missing)}); continuing without graph capture"
         )
 
+    # Default the admission-gate headroom on XPU to the measured truly-usable
+    # VRAM window so the gate -- not the PyTorch per-process cap -- becomes the
+    # effective controller. The native default (256 MB) is toothless: the gate's
+    # deny threshold is capacity - 256MB (~11.34 GiB) while the torch cap sits at
+    # ~10.08 GiB, so the allocator OOMs before the gate ever denies. This is the
+    # native-gate root-cause fix (admission-headroom lever), NOT a cap clamp:
+    # the per-process cap is left untouched. Fail-soft: on non-XPU or any query
+    # failure recommend_xpu_admission_headroom() returns None and the 256 MB
+    # native default is kept (never worse than before).
+    if simple_vram_headroom is None:
+        try:
+            from . import xpu as _xpu_cap_backend
+        except Exception:
+            _xpu_cap_backend = None
+        if _xpu_cap_backend is not None:
+            simple_vram_headroom = _xpu_cap_backend.recommend_xpu_admission_headroom()
+            if simple_vram_headroom is not None:
+                logging.info(
+                    "comfy-aimdo XPU: admission headroom defaulted to %.2f GiB "
+                    "(gate denies at the truly-usable VRAM window; the native "
+                    "256MB default was toothless vs the ~10GiB allocator cap)"
+                    % (simple_vram_headroom / 1024 ** 3))
     if simple_vram_headroom is not None:
         lib.set_simple_vram_headroom(int(simple_vram_headroom))
     lib.set_nvml_pressure(bool(nvml_pressure))

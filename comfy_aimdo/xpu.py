@@ -1182,6 +1182,49 @@ def _dxgi_local_budget_bytes():
     return (picked["budget"], picked["usage"])
 
 
+_XPU_ADMISSION_USABLE_GIB = 2.8  # empirically-measured truly-usable VRAM on Arc B580
+                                 # under a Windows desktop session (G8 OOM cliff:
+                                 # "3.11 GiB is free" while 10.08 GiB was allowed by
+                                 # the PyTorch per-process cap). The ~8 GiB the
+                                 # OS/DXGI/display compositor reserves is invisible to
+                                 # every runtime query, so this is a measured constant,
+                                 # not a guess.
+
+def recommend_xpu_admission_headroom():
+    """Headroom (bytes) for the native admission gate on XPU.
+
+    The gate's deficit watermark is
+        deficit_simple = book_a + size + headroom - vram_capacity
+    and it denies once > 0. vram_capacity is the NOMINAL device capacity
+    (~11.6 GiB on Arc B580), but Windows / DXGI / the desktop compositor
+    reserve ~8 GiB that no runtime query reports (proven by G8: the device had
+    only "3.11 GiB is free" while 10.08 GiB was allowed by the per-process cap).
+    So the gate must keep `headroom = vram_capacity - usable_window` free, i.e.
+    deny as soon as committed VRAM (book_a + size) reaches the ~2.8 GiB the
+    device can actually serve. This makes the GATE the effective controller
+    instead of the PyTorch per-process cap (which sits at ~10 GiB and OOMs
+    before the gate's 256 MB native default ever denies).
+
+    Returns None on non-XPU / query failure so the caller keeps the native
+    256 MB default (fail-soft, never worse than before).
+    """
+    try:
+        import torch
+        xpu = getattr(torch, "xpu", None)
+        if xpu is None or not xpu.is_available():
+            return None
+        total_bytes = int(xpu.get_device_properties(xpu.current_device()).total_memory)
+    except Exception:
+        return None
+    if total_bytes <= 0:
+        return None
+    usable_bytes = int(_XPU_ADMISSION_USABLE_GIB * 1024 ** 3)
+    headroom_bytes = total_bytes - usable_bytes
+    if headroom_bytes <= 0:
+        return None
+    return headroom_bytes
+
+
 def recommend_xpu_allocator_fraction(
     headroom_gib: float = _XPU_ALLOCATOR_CAP_HEADROOM_GIB,
     floor: float = _XPU_ALLOCATOR_CAP_FLOOR,
