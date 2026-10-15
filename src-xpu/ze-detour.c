@@ -96,15 +96,20 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
     }
 
     if (g_ur_hook_owns_arbitration) {
-        /* The Unified Runtime hook already applied the AIMDO budget to this
-         * request one layer above, before the driver was entered. Running a
-         * second control loop here would sample and reclaim against pressure
-         * that has just been arbitrated, so this path only accounts. */
+        /* When the Unified Runtime hook owns arbitration it ALSO accounts this
+         * allocation on the USM layer (ur-usm-detour.c:494 via
+         * aimdo_xpu_account_allocation) before the driver is entered, because
+         * urUSMDeviceAlloc sits one level above zeMemAllocDevice. Counting it
+         * again here double-counts every physical allocation in
+         * total_vram_usage ("Book A") and inflates the admission deficit, which
+         * refuses requests the device could serve. The matching free still
+         * reaches the UR hook's urUSMFree, so dropping the count here leaves a
+         * single authoritative balance. This path is therefore a read-only
+         * observer: it never mutates the ledger. (When g_ur_hook_owns_arbitration
+         * is false the UR hook is not installed, and the :128/:142 branches
+         * below remain the authoritative accountants.) */
         result = true_zeMemAllocDevice(context, descriptor, size, alignment,
                                        device_handle, pointer);
-        if (result == ZE_RESULT_SUCCESS && pointer && *pointer) {
-            aimdo_xpu_note_native_allocation(*pointer, size, device);
-        }
         return result;
     }
 
