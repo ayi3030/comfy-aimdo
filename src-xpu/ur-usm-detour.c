@@ -491,7 +491,14 @@ static ur_result_t allocate_and_account(
         stat_add(kDroppedMetadataCalls, 1);
         return result;
     }
-    aimdo_xpu_account_allocation(aimdo_device, (int64_t)size);
+    /* Book A (total_vram_usage) is written by the Level Zero detour
+     * (ze-detour.c:106 -> ze-tracer.cpp:85), which sees EVERY device
+     * allocation -- including those that reach zeMemAllocDevice without
+     * passing through this UR hook. Accounting here as well double-counts the
+     * UR-visible part (measured ~1.9x); removing the Level Zero write instead
+     * (the earlier "single-count" variant) under-counts the direct-L0 part
+     * (measured ~8%). So this hook still tracks its segments for arbitration,
+     * but the ledger write is owned solely by the Level Zero detour. */
     stat_add(kTrackedAllocCalls, 1);
     stat_add(kTrackedAllocBytes, (LONG64)size);
     return result;
@@ -692,7 +699,9 @@ static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
         LeaveCriticalSection(&g_hook_lock);
         return result;
     }
-    aimdo_xpu_account_allocation(device, -(int64_t)size);
+    /* Symmetric with the alloc side: the ledger decrement is owned by the
+     * Level Zero detour free path (ze-tracer.cpp:113 via ze-detour.c), not
+     * written here. */
     if (t_retry_reason != kRetryNone &&
         t_retry_generation == InterlockedCompareExchange64(&g_generation, 0, 0)) {
         /* Released while a synthetic failure is outstanding, so this is
