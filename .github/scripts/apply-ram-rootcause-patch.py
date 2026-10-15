@@ -158,6 +158,16 @@ def guard_no_preexisting_symbols(base):
         ("uint64_t external_vram_usage =", "definition of external_vram_usage"),
         ("void aimdo_set_external_vram_usage", "definition of aimdo_set_external_vram_usage"),
         ("size_t aimdo_xpu_force_vbar_reclaim(void)", "definition of aimdo_xpu_force_vbar_reclaim"),
+        # V2 Lever A (compat-reviewer-v2b hardening): also scan for the
+        # dxgi_external_vram_usage definition we now inject into control.c, so a
+        # future community tree that defines the same symbol fails loudly here
+        # instead of at link time. Deliberately NOT added to the `ours` echo
+        # exemption below -- a genuine pre-existing community definition must
+        # stay flagged; on our own re-runs control.c is already exempted via its
+        # external_vram_usage/aimdo_set_external_vram_usage echo texts. The
+        # pattern requires the "uint64_t ... =" definition form, so it does not
+        # match the plat.h extern declaration or the shmem-detect.c assignment.
+        ("uint64_t dxgi_external_vram_usage =", "definition of dxgi_external_vram_usage"),
     ]
     # Files this script edits, and the exact text it writes into each.
     ours = {
