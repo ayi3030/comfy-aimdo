@@ -942,6 +942,18 @@ __declspec(dllexport) bool xpu_ur_hook_disable(void) {
     InterlockedExchange(&g_enabled, 0);
     InterlockedIncrement64(&g_generation);
     clear_retry();
+    /* Credit every still-tracked segment back to the native ledger before the
+     * table is dropped. xpu_ur_hook_enable() does not reset total_vram_usage,
+     * so an un-credited total leaks across a disable/enable cycle and re-inflates
+     * the admission deficit after a restart. Each entry mirrors the decrement a
+     * normal urUSMFree would have applied. */
+    for (size_t i = 0; i < POINTER_TABLE_SIZE; ++i) {
+        if (g_allocations[i].pointer &&
+            g_allocations[i].pointer != POINTER_TOMBSTONE) {
+            aimdo_xpu_account_allocation(g_allocations[i].device,
+                                         -(int64_t)g_allocations[i].size);
+        }
+    }
     live = InterlockedExchange64(&g_allocation_count, 0);
     memset(g_allocations, 0, sizeof(g_allocations));
     LeaveCriticalSection(&g_hook_lock);
