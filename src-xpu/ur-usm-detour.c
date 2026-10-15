@@ -42,6 +42,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* Minimal Unified Runtime declarations. ur_api.h is not required to build
  * AIMDO and is not assumed to be installed; only opaque handles and three
@@ -675,6 +676,19 @@ static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
     }
     if (!allocation_remove(pointer, &size, &device)) {
         stat_add(kUnknownFreeCalls, 1);
+        /* Book A over-count localization probe (default OFF, revertible).
+         * This is the free-skip path: an untracked pointer is freed, so the
+         * account_allocation(-size) decrement below is SKIPPED and Book A keeps
+         * bytes the driver already released -- the prime native-ledger over-count
+         * suspect. allocation_remove only writes size/device on success, so log
+         * the pointer (correlate against the LEDGER acct alloc lines to see what
+         * allocated it outside the hook). Gate: AIMDO_XPU_LEDGER_TRACE. */
+        if (getenv("AIMDO_XPU_LEDGER_TRACE") != NULL) {
+            aimdo_log(kAimdoUrLogInfo, __FILE__, __LINE__,
+                "%s: free-skip: untracked pointer %p freed; book_a NOT decremented "
+                "(kUnknownFreeCalls). Prime Book A over-count suspect.\n",
+                __func__, pointer);
+        }
         LeaveCriticalSection(&g_hook_lock);
         return result;
     }
