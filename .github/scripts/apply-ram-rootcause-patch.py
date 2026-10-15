@@ -231,6 +231,29 @@ def main():
         ),
         already_marker="effective_book_a(void)",
     )
+    # ---- src/plat.h (V2 Lever A: dxgi_external_vram_usage) -----------------
+    # Publish the COMPLETE DXGI commitment (info.CurrentUsage) into its OWN C
+    # global so effective_book_a() also sees torch's native (non-AIMDO) device
+    # footprint, which the per-step Python torch_reserved write would otherwise
+    # clobber. This mirrors commit 7163e13 on this repo's src/plat.h so the CI
+    # build (which patches the community checkout, NOT this repo's src/) carries
+    # the same fix. See that commit message for the full rationale. Additive
+    # (max-based): it can only tighten the gate.
+    insert_before(
+        "plat.h:declare dxgi_external_vram_usage",
+        FILES["plat_h"],
+        "extern uint64_t external_vram_usage;",
+        "extern uint64_t dxgi_external_vram_usage;\n",
+        already_marker="dxgi_external_vram_usage",
+    )
+    apply_edit(
+        "plat.h:effective_book_a include dxgi",
+        FILES["plat_h"],
+        "    return total_vram_usage > external_vram_usage ? total_vram_usage : external_vram_usage;",
+        "    size_t a = total_vram_usage > dxgi_external_vram_usage ? total_vram_usage : dxgi_external_vram_usage;\n"
+        "    return a > external_vram_usage ? a : external_vram_usage;",
+        already_marker="size_t a = total_vram_usage > dxgi_external_vram_usage",
+    )
     # 2) Introduce `book_a` right after poll_budget_deficit() (in-function).
     insert_after(
         "plat.h:book_a var",
@@ -310,6 +333,18 @@ def main():
         ),
         prev_marker="SHARED_EXPORT",
         already_marker="aimdo_set_external_vram_usage",
+    )
+
+    # ---- src/control.c (V2 Lever A: dxgi_external_vram_usage definition) ----
+    # Keep the complete DXGI commitment in its own global, separate from
+    # external_vram_usage (which the Python layer overwrites with torch_reserved
+    # every step). Mirrors 7163e13.
+    insert_before(
+        "control.c:dxgi external_vram_usage def",
+        FILES["control_c"],
+        "uint64_t external_vram_usage = 0;",
+        "uint64_t dxgi_external_vram_usage = 0;\n",
+        already_marker="dxgi_external_vram_usage = 0",
     )
 
     # ---- src-win/shmem-detect.c -------------------------------------------
@@ -440,6 +475,22 @@ def main():
         "        last_free_vram = free_vram;\n"
         "        last_total_vram = total_vram;",
         already_marker="last_total_vram = total_vram;",
+    )
+    # ---- src-win/shmem-detect.c (V2 Lever A: publish full DXGI commitment) --
+    # Publish info.CurrentUsage (the complete process-local commitment, a SUPERSET
+    # of total_vram_usage which already includes VBAR) into dxgi_external_vram_usage
+    # when plausible (>0), so a failed/zero query never wipes a good prior reading
+    # and the gate (effective_book_a, now maxed with it) sees torch's native
+    # footprint. The Python torch_reserved write must not clobber it (separate
+    # global). Mirrors 7163e13. Inserted at the end of the WDDM success branch.
+    insert_after(
+        "shmem-detect.c:publish dxgi_external_vram_usage",
+        FILES["shmem_c"],
+        "info.AvailableForReservation / M));",
+        "            if (info.CurrentUsage > 0) {\n"
+        "                dxgi_external_vram_usage = info.CurrentUsage;\n"
+        "            }\n",
+        already_marker="dxgi_external_vram_usage = info.CurrentUsage",
     )
     # The community's deficit_cuda log line and its selection against
     # deficit_sync are deliberately LEFT UNTOUCHED. An earlier revision rewrote
@@ -634,6 +685,7 @@ def verify_injected_shape():
     """
     plat = read(FILES["plat_h"])
     shmem = read(FILES["shmem_c"])
+    ctrl = read(FILES["control_c"])
     mvb = read(FILES["model_vbar_c"])
 
     # 1. No variable may be named twice inside a function when one occurrence
@@ -677,6 +729,21 @@ def verify_injected_shape():
     if "deficit_cuda" not in shmem:
         sys.exit("[FAIL] deficit_cuda is missing from src-win/shmem-detect.c; the "
                  "vendor headroom signal must be preserved verbatim.")
+
+    # 6. V2 Lever A: dxgi_external_vram_usage must be declared once in plat.h,
+    #    defined once in control.c, and published in shmem-detect.c. A
+    #    missing/duplicated symbol is a link error or a silently-unbound gate
+    #    input.
+    if "extern uint64_t dxgi_external_vram_usage;" not in plat:
+        sys.exit("[FAIL] dxgi_external_vram_usage is not declared in src/plat.h "
+                 "(effective_book_a cannot see the full DXGI commitment).")
+    _dxgi_defs = re.findall(r"uint64_t\s+dxgi_external_vram_usage\s*=\s*0\s*;", ctrl)
+    if len(_dxgi_defs) != 1:
+        sys.exit("[FAIL] dxgi_external_vram_usage must be defined exactly once in "
+                 "src/control.c (got %d)" % len(_dxgi_defs))
+    if "dxgi_external_vram_usage = info.CurrentUsage;" not in shmem:
+        sys.exit("[FAIL] dxgi_external_vram_usage is not published in "
+                 "src-win/shmem-detect.c (the gate input is never fed).")
     if "ssize_t deficit_cuda = headroom - (ssize_t)free_vram;" not in shmem:
         sys.exit("[FAIL] the deficit_cuda expression was altered; the vendor "
                  "headroom term must keep its original meaning and precedence.")
