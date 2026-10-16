@@ -1,6 +1,7 @@
 import ctypes
 import contextvars
 import itertools
+import logging
 import os
 import sys
 import time
@@ -8,6 +9,7 @@ import weakref
 from contextlib import contextmanager
 
 from . import control
+from . import _torch_stats_text as _tst
 
 lib = control.lib
 
@@ -34,6 +36,8 @@ _native_cache_trim_enabled = (
 # becoming a per-weight operation.
 _NATIVE_CACHE_TRIM_INTERVAL_SECONDS = 2.0
 _native_cache_trim_last = 0.0
+# VBAR 页大小（32 MiB），fault 签名长度与 watermark 换算共用。
+VBAR_PAGE_SIZE = 32 * 1024 ** 2
 
 # --- fail-soft 符号绑定 --------------------------------------------------------
 #
@@ -287,7 +291,7 @@ def _warn_once(message):
     if message in _warned_messages:
         return
     _warned_messages.add(message)
-    print(f"[AIMDO XPU] WARNING: {message}", file=sys.stderr, flush=True)
+    logging.getLogger("comfy-aimdo.xpu").warning("[AIMDO XPU] %s", message)
 
 
 def force_vbar_reclaim():
@@ -324,40 +328,10 @@ def force_vbar_reclaim():
     except Exception as error:  # never let a reclaim probe break sampling
         _warn_once(f"aimdo_xpu_force_vbar_reclaim failed: {error}")
         return 0
-    print(f"[AIMDO XPU] force_vbar_reclaim: freed {freed} bytes "
-          f"({freed // (1024 * 1024)} MiB) of retired VBAR pages",
-          file=sys.stderr, flush=True)
+    logging.getLogger("comfy-aimdo.xpu").info(
+        "force_vbar_reclaim: freed %d bytes (%d MiB) of retired VBAR pages",
+        freed, freed // (1024 * 1024))
     return freed
-
-
-# 失败原因 -> 排查方向。三种原因若混成一句告警，真机排查会被引向错误方向
-# （最常见的是把「torch 侧异常」误当成「M2 包装器没装」）。
-_TORCH_STATS_REASON_TEXT = {
-    "not_installed": (
-        "M2 包装器未安装（_install_native_hook_wrappers 没跑过），"
-        "拿不到包装前的 torch 原生函数"),
-    "call_failed": (
-        "torch 原生 memory_stats 调用抛异常，请检查 XPU 上下文/驱动是否可用"),
-    "empty_stats": (
-        "torch 原生 memory_stats 返回空读数，torch 侧未给出可用统计"),
-}
-
-
-def _warn_torch_stats_unavailable(reason, consequence):
-    """在拿不到 torch 原生口径时限流告警一次。返回 True 便于调用方直接返回。
-
-    统一走这里而不是各点各写告警，是为了保证「限流一次、按原因区分」这两个
-    语义在所有调用点一致 —— 否则某个点漏了告警，那个点就成了新的静默失效点。
-    """
-    detail = _TORCH_STATS_REASON_TEXT.get(reason)
-    if detail is None:
-        detail = "未知原因（%r）" % (reason,)
-    _warn_once(
-        "AIMDO XPU: 无法读取 torch 原生预留统计（%s），%s。"
-        "若未主动设置 AIMDO_XPU_NATIVE_CACHE_TRIM=0，请排查上述原因。"
-        % (detail, consequence)
-    )
-    return True
 
 
 def _release_linux_native_cache(device):
@@ -377,7 +351,7 @@ def _release_linux_native_cache(device):
         # 这里必须读 torch 原生字节口径。
         raw, reason = _xpu.torch_reserved_stats_reason(device)
         if raw is None:
-            _warn_torch_stats_unavailable(reason, "Linux 原生缓存回收已停用")
+            _tst.warn_once(reason, "Linux 原生缓存回收已停用")
             return False
         reserved, allocated, _peak = raw
         control.publish_torch_cached_bytes(device, max(0, reserved - allocated))
@@ -408,9 +382,7 @@ def _release_native_cache(device):
     """
     global _native_cache_trim_last
 
-    if (_native_cache_trim_enabled and sys.platform == "linux"
-            and control.implementation == "xpu"
-            and control.get_xpu_allocator_mode() == "native_hook"):
+    if (_native_cache_trim_enabled and control.is_native_hook_mode()):
         return _release_linux_native_cache(device)
 
     if (not _native_cache_trim_enabled
@@ -426,7 +398,6 @@ def _release_native_cache(device):
     # Throttle every attempt, including ones that find no cache or raise, and
     # time from completion: empty_cache() can itself take seconds under
     # pressure, and timing from the start would allow back-to-back calls.
-    _native_cache_trim_last = now
 
     try:
         import torch
@@ -439,14 +410,14 @@ def _release_native_cache(device):
             # 这是热路径上的静默降级点：拿不到 torch 原生口径，L3 就永不
             # 触发，且不会有任何其他症状。所以必须留一条限流告警 ——
             # 否则实机出现「采样极慢 / vbar_fault 失败」时根本无从定位。
-            _warn_torch_stats_unavailable(reason, "L3 原生缓存回收已停用")
+            _tst.warn_once(reason, "L3 原生缓存回收已停用")
             return False
         reserved, allocated, _peak = raw
         cached = max(0, reserved - allocated)
         # The allocation hook needs this figure too, and cannot derive it: a
         # cached block never reaches the driver.
         control.publish_torch_cached_bytes(device, cached)
-        if cached < 32 * 1024 ** 2:
+        if cached < VBAR_PAGE_SIZE:
             return False
         torch.xpu.empty_cache()
     except Exception:
@@ -484,8 +455,7 @@ class ModelVBAR:
                 self._devctx, self._ptr
             )
         lib.vbar_prioritize(self._devctx, self._ptr, malloc_async_clamp)
-        if (sys.platform == "linux" and control.implementation == "xpu"
-                and control.get_xpu_allocator_mode() == "native_hook"):
+        if control.is_native_hook_mode():
             control.publish_torch_cached_bytes(self.device)
         if sys.platform == "win32":
             # anticipated_growth 必须是「本次激活预计新增的驻留」这个前瞻
@@ -546,21 +516,12 @@ class ModelVBAR:
         self.offset += num_bytes
         return (self, alloc, num_bytes)
 
-    #define VBAR_PAGE_SIZE (32 << 20)
-
-    #define VBAR_FAULT_SUCCESS      0
-
-    #define VBAR_FAULT_OOM          1
-
-    #define VBAR_FAULT_ERROR        2
-
     def fault(self, alloc, size):
         offset = alloc - self.base_addr
         # +2, one for misalignment and one for rounding
-        signature = (ctypes.c_uint32 * (size // (32 * 1024 ** 2) + 2))()
+        signature = (ctypes.c_uint32 * (size // (VBAR_PAGE_SIZE) + 2))()
         native_watermark = None
-        if (sys.platform == "linux" and control.implementation == "xpu"
-                and control.get_xpu_allocator_mode() == "native_hook"):
+        if control.is_native_hook_mode():
             native_watermark = lib.vbar_get_watermark(self._devctx, self._ptr)
         res = lib.vbar_fault(self._devctx, self._ptr, offset, size, signature)
         if res == 1:
@@ -579,7 +540,7 @@ class ModelVBAR:
                     # caller watermark is preserved; no range is widened.
                     lib.vbar_set_watermark(
                         self._devctx, self._ptr,
-                        native_watermark * (32 * 1024 ** 2))
+                        native_watermark * (VBAR_PAGE_SIZE))
                 # The shortage was at least partly Torch's own dead cache,
                 # which AIMDO has no other way to reclaim. Retry once now that
                 # it is back, rather than streaming this weight from host.
@@ -637,8 +598,7 @@ class ModelVBAR:
 
     def unpin(self, alloc, size, stream=None):
         offset = alloc - self.base_addr
-        if (sys.platform == "linux" and control.implementation == "xpu"
-                and control.get_xpu_allocator_mode() == "native_hook"
+        if (control.is_native_hook_mode()
                 and _linux_consumer_queue_supported):
             # The pluggable allocator registers allocation queues itself.
             # Native Torch does not pass its queue through that allocator, so
