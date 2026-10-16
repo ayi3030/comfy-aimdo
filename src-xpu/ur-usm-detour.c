@@ -42,6 +42,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 
 /* Minimal Unified Runtime declarations. ur_api.h is not required to build
  * AIMDO and is not assumed to be installed; only opaque handles and three
@@ -675,6 +676,19 @@ static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
     }
     if (!allocation_remove(pointer, &size, &device)) {
         stat_add(kUnknownFreeCalls, 1);
+        /* Book A over-count localization probe (default OFF, revertible).
+         * This is the free-skip path: an untracked pointer is freed, so the
+         * account_allocation(-size) decrement below is SKIPPED and Book A keeps
+         * bytes the driver already released -- the prime native-ledger over-count
+         * suspect. allocation_remove only writes size/device on success, so log
+         * the pointer (correlate against the LEDGER acct alloc lines to see what
+         * allocated it outside the hook). Gate: AIMDO_XPU_LEDGER_TRACE. */
+        if (getenv("AIMDO_XPU_LEDGER_TRACE") != NULL) {
+            aimdo_log(kAimdoUrLogInfo, __FILE__, __LINE__,
+                "%s: free-skip: untracked pointer %p freed; book_a NOT decremented "
+                "(kUnknownFreeCalls). Prime Book A over-count suspect.\n",
+                __func__, pointer);
+        }
         LeaveCriticalSection(&g_hook_lock);
         return result;
     }
@@ -850,8 +864,41 @@ bool aimdo_xpu_ur_hook_install(void) {
     return true;
 }
 
+/* Credit every still-tracked segment back to the native ledger, then drop the
+ * table.
+ *
+ * Both halves matter. aimdo_xpu_ur_hook_enable() does not reset
+ * total_vram_usage, so bytes still recorded here would survive a detach/attach
+ * cycle and keep inflating the admission deficit against a ledger the new hook
+ * can no longer decrement -- each entry mirrors the decrement a normal
+ * urUSMFree would have applied. Dropping the table matters for the same reason:
+ * a stale entry would otherwise make a later allocation at a recycled address
+ * look like a duplicate and skip its own accounting.
+ *
+ * aimdo_xpu_account_allocation() resolves the device context first and returns
+ * false when no context is bound, so calling this after control.cleanup() has
+ * already released the contexts is a safe no-op rather than a bad dereference.
+ * Callers must hold g_hook_lock. Returns how many segments were still tracked,
+ * i.e. how many ledger entries were credited back. */
+static LONG64 credit_and_drop_tracked_segments(void) {
+    LONG64 live = 0;
+
+    for (size_t i = 0; i < POINTER_TABLE_SIZE; ++i) {
+        if (g_allocations[i].pointer &&
+            g_allocations[i].pointer != POINTER_TOMBSTONE) {
+            aimdo_xpu_account_allocation(g_allocations[i].device,
+                                         -(int64_t)g_allocations[i].size);
+            live++;
+        }
+    }
+    InterlockedExchange64(&g_allocation_count, 0);
+    memset(g_allocations, 0, sizeof(g_allocations));
+    return live;
+}
+
 bool aimdo_xpu_ur_hook_remove(void) {
     LONG status;
+    LONG64 live = 0;
 
     if (!InterlockedCompareExchange(&g_attached, 0, 0)) {
         return true;
@@ -880,6 +927,26 @@ bool aimdo_xpu_ur_hook_remove(void) {
     true_urUSMFree = NULL;
     true_urPhysicalMemCreate = NULL;
     InterlockedExchange(&g_attached, 0);
+
+    /* The detours are gone, so nothing can reach the table any more. This is
+     * the only path that retires it: aimdo_teardown_hooks() is what actually
+     * runs on control.deinit(), so retiring the table here is what keeps a
+     * re-initialised backend from starting with stale ledger bytes.
+     *
+     * The g_lock_ready guard matters: the table can only hold entries if the
+     * hook was enabled, and enabling is what initialises the lock. Entering an
+     * uninitialised CRITICAL_SECTION would be undefined, so skip instead. */
+    if (InterlockedCompareExchange(&g_lock_ready, 0, 0)) {
+        EnterCriticalSection(&g_hook_lock);
+        live = credit_and_drop_tracked_segments();
+        LeaveCriticalSection(&g_hook_lock);
+        if (live > 0) {
+            aimdo_log(kAimdoUrLogInfo, __FILE__, __LINE__,
+                      "%s: detached with %lld tracked PyTorch segments still "
+                      "live; their ledger bytes were credited back\n",
+                      __func__, (long long)live);
+        }
+    }
     return true;
 }
 
@@ -928,8 +995,7 @@ __declspec(dllexport) bool xpu_ur_hook_disable(void) {
     InterlockedExchange(&g_enabled, 0);
     InterlockedIncrement64(&g_generation);
     clear_retry();
-    live = InterlockedExchange64(&g_allocation_count, 0);
-    memset(g_allocations, 0, sizeof(g_allocations));
+    live = credit_and_drop_tracked_segments();
     LeaveCriticalSection(&g_hook_lock);
 
     if (live > 0) {
