@@ -961,7 +961,27 @@ __declspec(dllexport) bool xpu_ur_hook_is_interposed(void) {
     return aimdo_xpu_ur_hook_install();
 }
 
+/* Defined in src-xpu/dispatch.cpp; true once PyTorch has been routed through
+ * AIMDO's own pluggable allocator, i.e. once the SECOND ledger
+ * (g_torch_active/reserved_bytes) has started counting. */
+extern bool aimdo_xpu_pluggable_allocator_live(void);
+
 __declspec(dllexport) bool xpu_ur_hook_enable(void) {
+    /* Two-mode mutual-exclusion backstop. Both arbitration paths feed the same
+     * admission gate from SEPARATE ledgers, so enabling both would count every
+     * allocation twice and inflate the deficit. comfy_aimdo/xpu.py currently
+     * picks exactly one with a single if/else and allocate_torch_block() stays
+     * dead under native_hook, so this is defence against a future change
+     * enabling both rather than a live condition -- refuse loudly instead of
+     * shipping a double-counting build. */
+    if (aimdo_xpu_pluggable_allocator_live()) {
+        aimdo_log(kAimdoUrLogError, __FILE__, __LINE__,
+                  "%s: refusing to enable the UR hook -- AIMDO's pluggable "
+                  "allocator is already the live accounting path. Running "
+                  "both would count every allocation twice; keep exactly one "
+                  "mode.\n", __func__);
+        return false;
+    }
     if (!xpu_ur_hook_is_interposed()) {
         return false;
     }

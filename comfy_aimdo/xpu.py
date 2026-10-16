@@ -102,6 +102,14 @@ def _declare_argtypes(lib) -> None:
     lib.xpu_allocator_empty_cache.argtypes = [ctypes.c_bool]
     lib.xpu_allocator_empty_cache.restype = ctypes.c_bool
 
+    # Two-mode mutual-exclusion backstop. Declared only if the export is
+    # present, because an older DLL may not carry it;
+    # _install_global_allocator() treats the call as best-effort for the same
+    # reason.
+    if hasattr(lib, "aimdo_xpu_set_pluggable_allocator_live"):
+        lib.aimdo_xpu_set_pluggable_allocator_live.argtypes = [ctypes.c_bool]
+        lib.aimdo_xpu_set_pluggable_allocator_live.restype = None
+
     lib.xpu_allocator_get_memory_stats.argtypes = [
         ctypes.c_int,
         ctypes.POINTER(ctypes.c_uint64),
@@ -173,6 +181,15 @@ def _install_global_allocator(lib):
     if allocator is None:
         raise RuntimeError("AIMDO XPU allocator is unavailable")
     torch.xpu.memory.change_current_allocator(allocator)
+
+    # Tell the DLL that its own pluggable allocator is now the live accounting
+    # path, so xpu_ur_hook_enable() can refuse to start the UR-detour ledger on
+    # top of it. Best-effort: an older DLL has no such export, and losing this
+    # backstop must not block the (already working) Python-level choice.
+    try:
+        lib.aimdo_xpu_set_pluggable_allocator_live(True)
+    except Exception:
+        pass
 
 
 def _install_native_hook_wrappers():
@@ -433,6 +450,16 @@ def teardown_backend() -> None:
                 restore()
         except Exception as _error:
             logging.info(f"comfy-aimdo XPU: allocator restore skipped: {_error!r}")
+
+        # Clear the C-side backstop so the ledger this process gave up is not
+        # still counted as live: without this, re-initialising into native_hook
+        # afterwards would hit xpu_ur_hook_enable()'s mutual-exclusion refusal
+        # even though no second ledger remains. Best-effort -- control.lib may
+        # already be released by deinit(), and an older DLL has no such export.
+        try:
+            control.lib.aimdo_xpu_set_pluggable_allocator_live(False)
+        except Exception:
+            pass
 
     _xpu_allocator_ready = False
     _xpu_allocator_mode = None

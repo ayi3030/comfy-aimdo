@@ -137,6 +137,36 @@ std::unordered_map<int, uint64_t> g_torch_reserved_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_active_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_reserved_bytes;
 
+// Two-mode mutual-exclusion backstop -- consulted by xpu_ur_hook_enable() in
+// src-xpu/ur-usm-detour.c.
+//
+// AIMDO has exactly TWO ways to arbitrate XPU memory, and they keep SEPARATE
+// ledgers: the native-hook path accounts every allocation inside the Unified
+// Runtime detour (g_allocations / aimdo_xpu_account_allocation), while this
+// pluggable-allocator path accounts it in the g_torch_* maps above. Running
+// BOTH would count each allocation twice, and both ledgers feed the same
+// admission gate -- so the double count does not cancel out, it inflates the
+// computed deficit and makes the gate decline requests the device can serve.
+//
+// comfy_aimdo/xpu.py picks one with a single if/else at init, so the two are
+// mutually exclusive there and allocate_torch_block() stays dead under
+// native_hook. That Python-level choice is one refactor away from being
+// bypassed, so the same condition is recorded here in C as well: once PyTorch
+// has been routed through THIS allocator, the UR hook refuses to start.
+static std::atomic<bool> g_pluggable_allocator_live{false};
+
+extern "C" bool aimdo_xpu_pluggable_allocator_live(void) {
+    return g_pluggable_allocator_live.load(std::memory_order_acquire);
+}
+
+// Registration-time counterpart. Called by xpu.py the moment torch adopts the
+// pluggable allocator, so the guard can refuse at STARTUP rather than waiting
+// for the first allocation to reveal the condition.
+extern "C" AIMDO_XPU_EXPORT void aimdo_xpu_set_pluggable_allocator_live(
+    bool live) {
+    g_pluggable_allocator_live.store(live, std::memory_order_release);
+}
+
 // VBAR retirement follows the same ownership rule as a caching allocator's
 // recordStream(): a page remembers only the queues that actually consumed it,
 // and each queue advances independently.  This avoids the old process-global
@@ -1547,6 +1577,9 @@ bool aimdo_xpu_retire_reset(void) {
 
 AIMDO_XPU_EXPORT void *xpu_alloc_fn(
     size_t size, int device, sycl::queue *queue) {
+    // Torch is using AIMDO's allocator, so the g_torch_* ledger is live. Record
+    // it: xpu_ur_hook_enable() refuses to start the second ledger on top.
+    g_pluggable_allocator_live.store(true, std::memory_order_release);
     return allocate_torch_block(size, device, queue);
 }
 
@@ -1557,6 +1590,9 @@ AIMDO_XPU_EXPORT void xpu_free_fn(
 
 AIMDO_XPU_EXPORT void *xpu_raw_alloc_fn(
     size_t size, int device, sycl::queue *queue) {
+    // Same backstop as xpu_alloc_fn(): this is the segment-level entry point
+    // torch uses when it adopts AIMDO's allocator.
+    g_pluggable_allocator_live.store(true, std::memory_order_release);
     return allocate_raw_torch_segment(size, device, queue);
 }
 
