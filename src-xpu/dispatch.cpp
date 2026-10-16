@@ -637,10 +637,6 @@ CUresult xpu_host_alloc(void **pointer, size_t size) {
     if (!pointer) {
         return kCudaErrorUnknown;
     }
-    /* Reverted: backing this with sycl::malloc_host made the failure worse,
-     * turning a 64 MiB copy's OUT_OF_DEVICE_MEMORY into DEVICE_LOST and
-     * moving it 56 seconds earlier. Keep pageable staging until the copy
-     * failure itself is understood. */
     *pointer = std::malloc(size);
     return *pointer ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
 }
@@ -1378,16 +1374,13 @@ bool submit_retire_fence_locked(RetireQueue &retire_queue) {
 extern "C" {
 
 AimdoCudaDispatch g_cuda{};
-PFN_deviceGetProperties g_device_get_properties = nullptr;
 
 int aimdo_xpu_device_index_from_native(void *native_device) {
-    std::lock_guard<std::mutex> guard(g_devices_mutex);
-    for (const auto &state : g_devices) {
-        if (reinterpret_cast<void *>(state.device) == native_device) {
-            return state.id;
-        }
-    }
-    return -1;
+    // Reuse the canonical native-handle resolver; the two only differ in the
+    // pointer-width parameter type. Keep this symbol so the ze-detour /
+    // ze-tracer callers (extern) keep resolving.
+    return device_from_native_handle(
+        reinterpret_cast<uintptr_t>(native_device));
 }
 
 void aimdo_xpu_record_native_allocation(size_t size) {
