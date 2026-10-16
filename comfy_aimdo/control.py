@@ -10,6 +10,10 @@ import logging
 import importlib.util
 import math
 
+# 共享的 torch 原生口径读取失败告警（原 control/model_vbar 各抄一份；
+# 抽到 _torch_stats_text 以避环且消歧）。此处保留旧名，调用点无需改动。
+from ._torch_stats_text import warn_once as _warn_torch_stats_once
+
 lib = None
 devctxs = []
 _log_callback = None
@@ -23,11 +27,6 @@ _xpu_oom_history = []
 _XPU_OOM_HISTORY_LIMIT = 4
 _XPU_OOM_SNAPSHOT_INTERVAL_SECONDS = 2.0
 _xpu_oom_last_snapshot_monotonic = {}
-# Windows 把 SYCL 运行库放在 torch/xpu 的 bin 目录下；CDLL 之前必须让
-# Windows 知道去哪里找 syclN.dll，否则 aimdo_xpu.dll 加载失败。
-_windows_dll_directories = []
-_windows_dll_directory_paths = set()
-
 # Backend actually in use ("cuda" / "rocm" / "xpu"), resolved by init().
 # This must be module-level: torch.get_torch_allocator() and xpu.py read it
 # through the module. When it lived only as an init() local, every such read
@@ -108,13 +107,13 @@ def _pe_import_dlls(dll_path):
 
 def _available_sycl_runtimes():
     """Map lowercased sycl*.dll filenames found on this system to their path."""
-    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
-    dirs.append(os.path.join(sys.prefix, "Library", "bin"))
+    dirs = {d for d in os.environ.get("PATH", "").split(os.pathsep) if d}
+    dirs.add(os.path.join(sys.prefix, "Library", "bin"))
     try:
         import torch  # noqa: PLC0415
         torch_lib = Path(torch.__file__).parent / "lib"
-        dirs.append(str(torch_lib))
-        dirs.append(str(torch_lib.parent.parent / "Library" / "bin"))
+        dirs.add(str(torch_lib))
+        dirs.add(str(torch_lib.parent.parent / "Library" / "bin"))
     except Exception:
         pass
     found = {}
@@ -177,7 +176,7 @@ def detect_vendor():
                 version = module.__version__
                 hip = getattr(module, "hip", None)
                 cuda = getattr(module, "cuda", None)
-    except Exception as e:
+    except Exception:
         logging.warning("Failed to detect Torch version")
         pass
 
@@ -813,6 +812,19 @@ def get_xpu_allocator_mode():
         return None
 
 
+def is_native_hook_mode() -> bool:
+    """当前是否处于 XPU native_hook 模式（Linux + xpu + native_hook）。
+
+    集中表达 model_vbar.py 里重复 4 次的模式守卫，避免各点各写、出现分歧。
+    未激活 XPU 或模式未就绪时返回 False。
+    """
+    return (
+        implementation == "xpu"
+        and sys.platform == "linux"
+        and get_xpu_allocator_mode() == "native_hook"
+    )
+
+
 def get_xpu_allocator_memory_stats(device=None):
     """返回 (active, reserved, peak_active, peak_reserved)，单位字节。
 
@@ -829,35 +841,6 @@ def get_xpu_allocator_memory_stats(device=None):
     if stats is None:
         return (0, 0, 0, 0)
     return tuple(int(value) for value in stats)
-
-
-# 拿不到 torch 原生口径时的失败原因 -> 排查方向。三者若混成一句告警，
-# 真机排查会被引向错误方向（最常见的是把「torch 侧异常」误当成「M2 没装」）。
-_TORCH_STATS_REASON_TEXT = {
-    "not_installed": "M2 包装器未安装（_install_native_hook_wrappers 没跑过）",
-    "call_failed": "torch 原生 memory_stats 调用抛异常，请检查 XPU 上下文/驱动",
-    "empty_stats": "torch 原生 memory_stats 返回空读数",
-}
-_warned_torch_stats = set()
-
-
-def _warn_torch_stats_once(reason, consequence):
-    """拿不到 torch 原生口径时限流告警一次（进程内去重）。
-
-    与 model_vbar._warn_torch_stats_unavailable 刻意各有一份：本模块不能
-    import model_vbar（那是循环导入），而 model_vbar 也不能反过来依赖本模块
-    的实现细节。两份语义保持一致：同一原因只报一次，且都按原因区分。
-    """
-    detail = _TORCH_STATS_REASON_TEXT.get(reason, "未知原因(%r)" % (reason,))
-    key = (reason, consequence)
-    if key in _warned_torch_stats:
-        return
-    _warned_torch_stats.add(key)
-    logging.warning(
-        "comfy-aimdo XPU: 无法读取 torch 原生预留统计（%s），%s。"
-        "若未主动设置 AIMDO_XPU_NATIVE_CACHE_TRIM=0，请排查上述原因。",
-        detail, consequence,
-    )
 
 
 def get_xpu_torch_reserved_growth(device=None):
@@ -900,9 +883,9 @@ def get_xpu_torch_reserved_growth(device=None):
 
         raw, reason = _xpu.torch_reserved_stats_reason(device)
         if raw is None:
-            # 这里不能复用 model_vbar._warn_torch_stats_unavailable（会形成
-            # 循环导入），所以直接告警一次。L2 的失效同样静默：growth 恒 0
-            # 时 prepare_allocation 只是少一次预回收，不报错也不崩。
+            # 统一走 _torch_stats_text.warn_once（本模块以 _warn_torch_stats_once
+            # 别名引入），不再依赖 model_vbar 以免成环。L2 的失效同样静默：
+            # growth 恒 0 时 prepare_allocation 只是少一次预回收，不报错也不崩。
             _warn_torch_stats_once(
                 reason, "L2 边界预回收拿不到前瞻量（anticipated_growth 恒为 0）")
             return 0
@@ -1260,7 +1243,8 @@ def capture_xpu_oom_snapshot(
         "coalesced_events": 1,
     }
     _xpu_oom_history.append(snapshot)
-    del _xpu_oom_history[:-_XPU_OOM_HISTORY_LIMIT]
+    if len(_xpu_oom_history) > _XPU_OOM_HISTORY_LIMIT:
+        del _xpu_oom_history[:-_XPU_OOM_HISTORY_LIMIT]
     _xpu_oom_last_snapshot_monotonic[device_index] = now
     return snapshot
 

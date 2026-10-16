@@ -54,7 +54,6 @@ _wrappers_installed = False
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
-_xpu_target = None
 
 
 def is_runtime_available() -> bool:
@@ -327,8 +326,6 @@ def torch_reserved_stats_reason(device=None):
 # DLLs so a version mismatch never crashes the runtime.
 _xpu_external_usage_supported = None
 _external_usage_feed_warned = set()
-# Every successfully fed value, for post-run forensics (bounded).
-_external_usage_feed_trace = []
 
 
 def _warn_external_usage_feed_once(key, detail):
@@ -380,8 +377,6 @@ def _feed_external_vram_usage():
             setter.restype = None
         value = int(stats[0])
         setter(value)
-        if len(_external_usage_feed_trace) < 4096:
-            _external_usage_feed_trace.append(value)
     except Exception as exc:
         _warn_external_usage_feed_once(
             "failed", "%s: %s (value=%s bytes)"
@@ -504,13 +499,11 @@ def detect_xpu_target() -> str | None:
     logged and ``None`` returned. Never raises, never alters the allocation
     path.
     """
-    global _xpu_target
     try:
         if not (hasattr(torch, "xpu") and torch.xpu.is_available()
                 and torch.xpu.device_count() > 0):
             logging.info("comfy-aimdo XPU: no XPU device available; "
                          "silicon target not resolved")
-            _xpu_target = None
             return None
         name = torch.xpu.get_device_properties(0).name
         family = _provider.map_xpu_target_name(name)
@@ -528,11 +521,9 @@ def detect_xpu_target() -> str | None:
             logging.info(
                 f"comfy-aimdo XPU: device {name!r} resolved to family "
                 f"{family!r} (pinned={pinned})")
-        _xpu_target = family
         return family
     except Exception as exc:  # noqa: BLE001 - fail-soft
         logging.info(f"comfy-aimdo XPU: target detection skipped: {exc!r}")
-        _xpu_target = None
         return None
 
 
