@@ -24,9 +24,12 @@ version_file = "comfy_aimdo/_version.py"
 local_scheme = "no-local-version"
 # The repo carries stray archive/* tags (left over from archived branches) that
 # setuptools-scm cannot parse as versions, which breaks every feature-branch
-# wheel build with "Can't parse version from tag". On a release tag a real
-# version is still derived; on branches with only archive/* tags reachable this
-# fallback keeps the build green instead of failing the wheel. Works for all
-# build paths (native Windows, cibuildwheel Windows, cibuildwheel Linux/docker)
-# because setuptools-scm reads it from pyproject.toml directly.
+# wheel build with "Can't parse version from tag". With tag.strict = true,
+# setuptools-scm walks back to the nearest PARSEABLE tag (e.g. v0.5.5) and
+# derives a real dev version instead of erroring on the archive/* tag. This is
+# read from pyproject.toml directly, so it works for every build path (native
+# Windows, cibuildwheel Windows, cibuildwheel Linux/docker) with no env-var
+# propagation into cibuildwheel's Linux container. fallback_version is a safety
+# net for branches with no parseable tag reachable.
+tag.strict = true
 fallback_version = "0.0.0.dev0"
