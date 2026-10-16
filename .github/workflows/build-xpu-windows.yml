@@ -408,6 +408,13 @@ jobs:
       - name: Build wheel (setuptools-scm derives version from upstream tags)
         shell: bash
         working-directory: aimdo
+        # The repo carries stray archive/* tags (left over from archived
+        # branches) that setuptools-scm cannot parse as versions, which fails
+        # every feature-branch wheel build. On a tag (release) we keep the real
+        # version; on a branch we pin a dev version so the build still produces
+        # an artifact. This is a CI packaging workaround, not a code change.
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: ${{ github.ref_type == 'tag' && '' || '0.0.0.dev0' }}
         run: |
           python -m pip install --upgrade pip build
           python -m build --wheel --outdir wheelhouse
