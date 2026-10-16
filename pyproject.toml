@@ -22,3 +22,11 @@ packages = ["comfy_aimdo"]
 [tool.setuptools_scm]
 version_file = "comfy_aimdo/_version.py"
 local_scheme = "no-local-version"
+# The repo carries stray archive/* tags (left over from archived branches) that
+# setuptools-scm cannot parse as versions, which breaks every feature-branch and
+# mainline wheel build with "Can't parse version from tag". With tag.strict = true,
+# setuptools-scm walks back to the nearest PARSEABLE tag (e.g. v0.5.5) and derives a
+# real dev version instead of erroring on the archive/* tag. fallback_version is a
+# safety net for branches with no parseable tag reachable.
+tag.strict = true
+fallback_version = "0.0.0.dev0"
