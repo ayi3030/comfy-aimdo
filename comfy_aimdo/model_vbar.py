@@ -226,48 +226,35 @@ def current_inference_memory_budget(device):
 
 # Bindings
 #
-# 下面这一组是仓库原有绑定，已在 Arc B580 上验证存在，保持无条件绑定不动
-# （最小侵入：不为证明存在而改变已验证路径）。真正新增的符号一律走 _bind。
-if lib is not None:
-    lib.vbar_allocate.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
-    lib.vbar_allocate.restype = ctypes.c_void_p
-
-    lib.vbar_set_watermark_limit.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
-
-    lib.vbar_set_watermark.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
-
-    lib.vbars_reset_watermark_limits.argtypes = [ctypes.c_void_p]
-
-    lib.vbar_prioritize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
-
-    lib.vbar_deprioritize.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-
-    lib.vbar_get.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.vbar_get.restype = ctypes.c_uint64
-
-    lib.vbar_free.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-
-    lib.vbar_fault.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32)]
-    lib.vbar_fault.restype = ctypes.c_int
-
-    lib.vbar_unpin.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
-
-    lib.vbar_loaded_size.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.vbar_loaded_size.restype = ctypes.c_size_t
-
-    lib.vbar_free_memory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
-    lib.vbar_free_memory.restype = ctypes.c_uint64
-
-    lib.vbars_analyze.argtypes = [ctypes.c_void_p, ctypes.c_bool]
-    lib.vbars_analyze.restype = ctypes.c_uint64
-
-    lib.vbar_get_nr_pages.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.vbar_get_nr_pages.restype = ctypes.c_size_t
-
-    lib.vbar_get_watermark.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-    lib.vbar_get_watermark.restype = ctypes.c_size_t
-
-    lib.vbar_get_residency.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+# 原有 vbar_* 符号在 Arc B580 上已验证存在，但部署时 DLL 可能回退到缺少某些
+# 导出符号的旧构建。原先这里是"无条件绑定"——一旦某个符号缺失，import 期就会
+# 抛 AttributeError，整包 comfy_aimdo 导入中断、XPU 后端完全起不来。
+# 现统一改成 fail-soft 的 _bind()：缺失符号时降级为"该能力不可用"
+# （记入 _missing_symbols 供诊断），而不是让插件崩溃。这与上方较新符号的
+# 绑定策略保持一致。
+#
+# 注（部署健壮性边界）：_bind 只防住 import 期崩溃。若某核心符号（如
+# vbar_allocate）在运行时真的缺失，对应调用点仍会 AttributeError——但那属于
+# DLL 严重不兼容，已超出"旧版 DLL 个别符号缺失"的降级范围。
+for _vbar_sym, _vbar_argtypes, _vbar_restype in [
+    ("vbar_allocate", [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int], ctypes.c_void_p),
+    ("vbar_set_watermark_limit", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64], None),
+    ("vbar_set_watermark", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64], None),
+    ("vbars_reset_watermark_limits", [ctypes.c_void_p], None),
+    ("vbar_prioritize", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64], None),
+    ("vbar_deprioritize", [ctypes.c_void_p, ctypes.c_void_p], None),
+    ("vbar_get", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_uint64),
+    ("vbar_free", [ctypes.c_void_p, ctypes.c_void_p], None),
+    ("vbar_fault", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64, ctypes.POINTER(ctypes.c_uint32)], ctypes.c_int),
+    ("vbar_unpin", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64], None),
+    ("vbar_loaded_size", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_size_t),
+    ("vbar_free_memory", [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64], ctypes.c_uint64),
+    ("vbars_analyze", [ctypes.c_void_p, ctypes.c_bool], ctypes.c_uint64),
+    ("vbar_get_nr_pages", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_size_t),
+    ("vbar_get_watermark", [ctypes.c_void_p, ctypes.c_void_p], ctypes.c_size_t),
+    ("vbar_get_residency", [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t], None),
+]:
+    _bind(_vbar_sym, _vbar_argtypes, _vbar_restype)
 
 # L2 的模型边界预回收：让 native 在新的驻留窗口开始前先腾出空间。
 # 缺失时跳过即可——退回"按需 fault 回收"，只是慢一点，不会出错。

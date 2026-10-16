@@ -367,6 +367,13 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
 
     return True
 
+# Lever A 上限：EXTRA_RESERVED_VRAM 把显存"预留"给 offloader 当免费空间抹掉，
+# 设过大反而把整模型挤下设备。这里给一个硬上限，防 typo（如在 12 GiB 卡上写 20）。
+# 已知可用总显存时取 "50% 总显存"；拿不到容量时退化为 8 GiB 固定上限。
+_EXTRA_RESERVED_VRAM_GIB_MAX_FRACTION = 0.5
+_EXTRA_RESERVED_VRAM_GIB_HARD_CAP = 8.0
+
+
 def _apply_extra_reserved_vram_override():
     """Lever A (coldstart-fit-fix): raise ComfyUI's EXTRA_RESERVED_VRAM so the
     dynamic-VRAM offloader stays CONSERVATIVE during cold start and the model's
@@ -416,6 +423,20 @@ def _apply_extra_reserved_vram_override():
             "available yet; skipping EXTRA_RESERVED_VRAM override"
         )
         return
+    # 上限保护：预留不能超过安全上限，否则会把整模型挤出设备。拿不到容量时
+    # 退化为固定上限，仍能挡住明显的 typo。
+    cap_bytes = get_vram_capacity(0)
+    if cap_bytes > 0:
+        max_reserve_gib = cap_bytes / (1024 ** 3) * _EXTRA_RESERVED_VRAM_GIB_MAX_FRACTION
+    else:
+        max_reserve_gib = _EXTRA_RESERVED_VRAM_GIB_HARD_CAP
+    if reserve_gib > max_reserve_gib:
+        logging.warning(
+            "comfy-aimdo XPU [Lever A]: AIMDO_XPU_EXTRA_RESERVED_VRAM_GIB="
+            f"{reserve_gib:.2f} GiB exceeds safe cap {max_reserve_gib:.2f} GiB "
+            "(50% of total VRAM, or 8 GiB fallback); clamping to cap."
+        )
+        reserve_gib = max_reserve_gib
     new_bytes = int(reserve_gib * 1024 ** 3)
     old_bytes = mm.EXTRA_RESERVED_VRAM
     mm.EXTRA_RESERVED_VRAM = new_bytes
