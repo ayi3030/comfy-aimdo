@@ -961,10 +961,27 @@ __declspec(dllexport) bool xpu_ur_hook_is_interposed(void) {
     return aimdo_xpu_ur_hook_install();
 }
 
-/* Defined in src-xpu/dispatch.cpp; true once PyTorch has been routed through
- * AIMDO's own pluggable allocator, i.e. once the SECOND ledger
- * (g_torch_active/reserved_bytes) has started counting. */
-extern bool aimdo_xpu_pluggable_allocator_live(void);
+/* AIMDO arbitrates XPU memory in exactly two ways, each keeping a SEPARATE
+ * ledger: the native-hook path in this file and the pluggable-allocator path
+ * in dispatch.cpp (g_torch_* maps). Both feed the same admission gate, so
+ * running both would count every allocation twice. This flag records which mode
+ * is live.
+ *
+ * It is defined HERE, not in dispatch.cpp, because the no-GPU hook unit test
+ * links this file standalone (without dispatch.cpp); a definition there would
+ * leave this symbol unresolved. dispatch.cpp calls the setter at its two
+ * allocation entry points; xpu.py calls it when it adopts the pluggable
+ * allocator. */
+static volatile int g_pluggable_allocator_live = 0;
+
+bool aimdo_xpu_pluggable_allocator_live(void) {
+    return g_pluggable_allocator_live != 0;
+}
+
+/* Takes int (not bool) to match the ctypes c_bool ABI on Windows. */
+__declspec(dllexport) void aimdo_xpu_set_pluggable_allocator_live(int live) {
+    g_pluggable_allocator_live = live ? 1 : 0;
+}
 
 __declspec(dllexport) bool xpu_ur_hook_enable(void) {
     /* Two-mode mutual-exclusion backstop. Both arbitration paths feed the same
