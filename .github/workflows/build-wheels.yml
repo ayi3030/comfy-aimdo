@@ -37,6 +37,14 @@ jobs:
             platform: windows
             arch: arm64
 
+    env:
+      # setuptools-scm derives the wheel version from git tags. On PRs the only
+      # reachable tags are archive/* (leftover from archived branches), which do
+      # not match the version regex, so the build fails with "Can't parse
+      # version from tag". Pretend a dev version for PR builds; real tag pushes
+      # keep their derived version. Mirrors the fix in build-xpu-windows.yml.
+      SETUPTOOLS_SCM_PRETEND_VERSION: ${{ github.event_name == 'pull_request' && '0.0.0.dev0' || '' }}
+
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
