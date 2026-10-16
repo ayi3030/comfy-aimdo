@@ -1,4 +1,5 @@
 #include "plat.h"
+#include <stdlib.h>
 
 /* True device free / total captured by poll_budget_deficit() in the compiled
  * shmem-detect translation unit, plus the shared size-aware fit check built on
@@ -220,6 +221,30 @@ bool aimdo_xpu_account_allocation(int device, int64_t delta) {
         total_vram_usage = released < total_vram_usage
             ? total_vram_usage - released
             : 0;
+    }
+    /* Book A over-count localization probe (default OFF, revertible).
+     * Logs the authoritative ledger (total_vram_usage, "Book A") against the
+     * sampled WDDM device usage at every torch-USM accounting step, so a field
+     * run can see WHERE the recorded-vs-WDDM gap grows. Book A exceeding WDDM
+     * usage is impossible if Book A is a subset of the device footprint (the
+     * design intent, plat.h:171-193), so a growing gap is a native ledger bug.
+     * Uses the SAMPLED last_free_vram/last_total_vram (cheap globals refreshed
+     * by poll_budget_deficit), never the fresh DXGI traversal, to avoid
+     * disturbing the allocator hot path. Gate: AIMDO_XPU_LEDGER_TRACE.
+     * Read the gap branch: free with book_a NOT dropping (WDDM drops) => a free
+     * path skipped its decrement; alloc with book_a rising more than WDDM =>
+     * double-count / phantom; torch-USM balanced yet gap grows => VBAR/VMM/
+     * vrambuf (instrument those src/ paths next, via the patch script). */
+    if (getenv("AIMDO_XPU_LEDGER_TRACE") != NULL) {
+        int64_t wddm_usage = (int64_t)last_total_vram - (int64_t)last_free_vram;
+        log(DEBUG,
+            "LEDGER acct: device=%d delta=%lldMB book_a=%lluMB wddm_free=%lluMB "
+            "wddm_usage=%lldMB gap=%lldMB\n",
+            device, (long long)delta / (long long)M,
+            (unsigned long long)total_vram_usage / (unsigned long long)M,
+            (unsigned long long)last_free_vram / (unsigned long long)M,
+            (long long)wddm_usage / (long long)M,
+            ((int64_t)total_vram_usage - wddm_usage) / (long long)M);
     }
     return true;
 }
